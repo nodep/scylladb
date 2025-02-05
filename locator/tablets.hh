@@ -372,6 +372,19 @@ struct load_stats {
     }
 };
 
+struct tablet_load_stats {
+    struct disk_usage {
+        uint64_t used = 0;
+        uint64_t capacity = 0;
+    };
+
+    std::unordered_map<shard_id, disk_usage> usage_by_shard;
+
+    disk_usage get_sum() const;
+};
+
+using disk_usage_by_host = std::unordered_map<host_id, tablet_load_stats>;
+
 struct repair_scheduler_config {
     bool auto_repair_enabled = false;
     // If the time since last repair is bigger than auto_repair_threshold
@@ -722,3 +735,5 @@ template <>
 struct fmt::formatter<locator::tablet_task_type> : fmt::formatter<string_view> {
     auto format(const locator::tablet_task_type&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
+
+sstring size2gb(uint64_t size);
