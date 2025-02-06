@@ -17,8 +17,12 @@
 #include "utils/stall_free.hh"
 #include "utils/overloaded_functor.hh"
 #include "db/config.hh"
+<<<<<<< HEAD
 #include "db/tablet_options.hh"
 #include "locator/load_sketch.hh"
+=======
+#include "locator/size_load_sketch.hh"
+>>>>>>> 08773a61e1 (the journey continues...)
 #include "replica/database.hh"
 #include "gms/feature_service.hh"
 #include <iterator>
@@ -352,50 +356,9 @@ class load_balancer {
 
     using table_candidates_map = std::unordered_map<table_id, std::unordered_set<migration_tablet_set>>;
 
-    static constexpr load_type count_influence = 0.2;
-    static constexpr size_t ideal_tablet_count = 100;
-
-    static load_type interpolate(load_type in) {
-        struct point {
-            double in = 0;
-            double out = 0;
-        };
-
-        const std::vector<point> points = {
-            {0,    0},
-            {0.7,  0.7},
-            {0.75, 0.8},
-            {0.80, 0.95},
-            {0.85, 1.2},
-            {0.90, 1.8},
-            {0.95, 3},
-            {1.00, 5},
-        };
-
-        size_t idx = 1;
-        while ((idx < points.size() - 1) && (points[idx].in < in)) {
-            idx++;
-        }
-
-        const point& p = points[idx];
-        const point& last = points[idx - 1];
-
-        return last.out + (in - last.in) * (p.out - last.out)/(p.in - last.in);
-    }
-
-    static load_type compute_load(const tablet_load_stats::disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
-        load_type disk_used = load_type(disk_usage.used) / disk_usage.capacity;
-        load_type count_load = tablet_count / load_type(ideal_tablet_count * n_shards);
-        load_type size_load = interpolate(disk_used);
-
-        return size_load * (1 - count_influence) + count_load * count_influence;
-    }
-
     struct shard_load {
         size_t tablet_count = 0;
-        uint64_t disk_usage = 0;
-        uint64_t disk_capacity = 0;
-
+        disk_usage du;
         load_type load = 0;
 
         absl::flat_hash_map<table_id, size_t> tablet_count_per_table;
@@ -434,6 +397,10 @@ class load_balancer {
             }
             return result + candidates_all_tables.size();
         }
+
+        void update() {
+            load = compute_load(du, tablet_count, 1);
+        }
     };
 
     struct skipped_candidate {
@@ -446,7 +413,7 @@ class load_balancer {
         host_id id;
         uint64_t shard_count = 0;
         uint64_t tablet_count = 0;
-        tablet_load_stats::disk_usage disk_usage;
+        disk_usage du;
         bool drained = false;
         const locator::node* node; // never nullptr
 
@@ -477,10 +444,9 @@ class load_balancer {
 
         // Call when tablet_count changes.
         void update() {
-            avg_load = get_avg_load(tablet_count);
-            //avg_load = compute_load(disk_usage, tablet_count, shard_count);
-            dbglog("computed load of node {} avg_load {} usage {} capacity {} tablets {}",
-                    id, avg_load, size2gb(disk_usage.used), size2gb(disk_usage.capacity), tablet_count);
+            avg_load = compute_load(du, tablet_count, shard_count);
+            //dbglog("computed load of node {} avg_load {} usage {} capacity {} tablets {}",
+            //        id, avg_load, size2gb(disk_usage.used), size2gb(disk_usage.capacity), tablet_count);
         }
 
         load_type get_avg_load(uint64_t tablets) const {
@@ -489,7 +455,7 @@ class load_balancer {
 
         auto shards_by_load_cmp() {
             return [this] (const auto& a, const auto& b) {
-                return shards[a].tablet_count < shards[b].tablet_count;
+                return shards[a].load < shards[b].load;
             };
         }
 
@@ -656,7 +622,7 @@ class load_balancer {
 
     replica::database& _db;
     token_metadata_ptr _tm;
-    std::optional<locator::load_sketch> _load_sketch;
+    std::optional<locator::size_load_sketch> _load_sketch;
     absl::flat_hash_map<table_id, size_t> _tablet_count_per_table;
     dc_name _dc;
     size_t _total_capacity_shards; // Total number of non-drained shards in the balanced node set.
@@ -664,7 +630,7 @@ class load_balancer {
     locator::load_stats_ptr _table_load_stats;
     load_balancer_stats_manager& _stats;
     std::unordered_set<host_id> _skiplist;
-    locator::disk_usage_by_host _disk_usage;
+    locator::cluster_disk_usage _cluster_du;
     bool _use_table_aware_balancing = true;
 private:
     tablet_replica_set get_replicas_for_tablet_load(const tablet_info& ti, const tablet_transition_info* trinfo) const {
@@ -734,14 +700,14 @@ private:
     }
 public:
     load_balancer(replica::database& db, token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, load_balancer_stats_manager& stats,
-                    uint64_t target_tablet_size, std::unordered_set<host_id> skiplist, locator::disk_usage_by_host disk_usage)
+                    uint64_t target_tablet_size, std::unordered_set<host_id> skiplist, locator::cluster_disk_usage disk_usage)
         : _target_tablet_size(target_tablet_size)
         , _db(db)
         , _tm(std::move(tm))
         , _table_load_stats(std::move(table_load_stats))
         , _stats(stats)
         , _skiplist(std::move(skiplist))
-        , _disk_usage(std::move(disk_usage))
+        , _cluster_du(std::move(disk_usage))
     { }
 
     future<migration_plan> make_plan(std::optional<unsigned> initial_scale, bool test_mode) {
@@ -778,6 +744,17 @@ public:
         }
         auto it = _table_load_stats->tables.find(id);
         return (it != _table_load_stats->tables.end()) ? &it->second : nullptr;
+    }
+
+    uint64_t get_tablet_size(host_id host, const global_tablet_id& gtid) {
+        const tablet_map& tmap = _tm->tablets().get_tablet_map(gtid.table);
+        dht::token last_token = tmap.get_last_token(gtid.tablet);
+        temporal_tablet_id ttablet_id {gtid.table, last_token};
+        const host_load_stats& host_load = _cluster_du.at(host);
+        if (!host_load.tablet_sizes.contains(ttablet_id)) {
+            dbglog("table {} last_token {} not found", gtid.table, last_token);
+        }
+        return host_load.tablet_sizes.at(ttablet_id);
     }
 
     future<bool> needs_auto_repair(const locator::global_tablet_id& gid, const locator::tablet_info& info,
@@ -1545,38 +1522,59 @@ public:
     // Checks whether moving a tablet from shard A to B (intra-node) would go against convergence.
     // Returns false if the tablet should not be moved, and true if it may be moved.
     bool check_convergence(const shard_load& src_info, const shard_load& dst_info, unsigned delta = 1) {
+        // compute_load
         return src_info.tablet_count > dst_info.tablet_count + delta;
     }
 
     bool check_convergence(const shard_load& src_info, const shard_load& dst_info, const migration_tablet_set& tablet_set) {
+        // compute_load
         return check_convergence(src_info, dst_info, tablet_set.tablets().size());
     }
 
     // Adjusts the load of the source and destination shards in the host where intra-node migration happens.
     void update_node_load_on_migration(node_load& node_load, host_id host, shard_id src, shard_id dst, global_tablet_id tablet) {
+        dbglog("update_node_load_on_migration");
+
+        const uint64_t tablet_size = get_tablet_size(host, tablet);
+
+        // compute_load
         auto& src_info = node_load.shards[src];
         auto& dst_info = node_load.shards[dst];
         dst_info.tablet_count++;
         src_info.tablet_count--;
+        dst_info.du.used += tablet_size;
+        src_info.du.used -= tablet_size;
         dst_info.tablet_count_per_table[tablet.table]++;
         src_info.tablet_count_per_table[tablet.table]--;
     }
 
     // Adjusts the load of the source and destination (host:shard) that were picked for the migration.
     void update_node_load_on_migration(node_load_map& nodes, tablet_replica src, tablet_replica dst, global_tablet_id source_tablet) {
+        dbglog("update_node_load_on_migration");
+
+        const uint64_t tablet_size = get_tablet_size(src.host, source_tablet);
+
+        // compute_load
         auto& target_info = nodes[dst.host];
-        target_info.shards[dst.shard].tablet_count++;
-        target_info.shards[dst.shard].tablet_count_per_table[source_tablet.table]++;
+        auto& target_shard_info = target_info.shards[dst.shard];
+        target_shard_info.tablet_count++;
+        target_shard_info.du.used += tablet_size;
+        target_shard_info.tablet_count_per_table[source_tablet.table]++;
+        target_shard_info.update();
         target_info.tablet_count_per_table[source_tablet.table]++;
         target_info.tablet_count += 1;
+        target_info.du.used += tablet_size;
         target_info.update();
 
         auto& src_node_info = nodes[src.host];
         auto& src_shard_info = src_node_info.shards[src.shard];
         src_shard_info.tablet_count -= 1;
+        src_shard_info.du.used -= tablet_size;
         src_shard_info.tablet_count_per_table[source_tablet.table]--;
+        src_shard_info.update();
         src_node_info.tablet_count_per_table[source_tablet.table]--;
         src_node_info.tablet_count -= 1;
+        src_node_info.du.used -= tablet_size;
         src_node_info.update();
     }
 
@@ -1592,15 +1590,17 @@ public:
         }
     }
 
-    static void unload(locator::load_sketch& sketch, host_id host, shard_id shard, const migration_tablet_set& tablet_set) {
-        for (auto _ : tablet_set.tablets()) {
-            sketch.unload(host, shard);
+    void unload(locator::size_load_sketch& sketch, host_id host, shard_id shard, const migration_tablet_set& tablet_set) {
+        for (const global_tablet_id& tablet : tablet_set.tablets()) {
+            uint64_t tablet_size = get_tablet_size(host, tablet);
+            sketch.unload(host, shard, tablet_size);
         }
     }
 
-    static void pick(locator::load_sketch& sketch, host_id host, shard_id shard, const migration_tablet_set& tablet_set) {
-        for (auto _ : tablet_set.tablets()) {
-            sketch.pick(host, shard);
+    void pick(locator::size_load_sketch& sketch, host_id host, shard_id shard, const migration_tablet_set& tablet_set) {
+        for (const global_tablet_id& tablet : tablet_set.tablets()) {
+            uint64_t tablet_size = get_tablet_size(host, tablet);
+            sketch.pick(host, shard, tablet_size);
         }
     }
 
@@ -1613,8 +1613,6 @@ public:
             lblogger.debug("Node {} is balanced", host);
             co_return plan;
         }
-
-        auto& sketch = *_load_sketch;
 
         // Keeps candidate source shards in a heap which yields highest-loaded shard first.
         std::vector<shard_id> src_shards;
@@ -1649,7 +1647,7 @@ public:
             } else {
                 std::pop_heap(src_shards.begin(), src_shards.end(), node_load.shards_by_load_cmp());
                 src = src_shards.back();
-                dst = sketch.get_least_loaded_shard(host);
+                dst = _load_sketch->get_least_loaded_shard(host);
             }
 
             auto push_back = seastar::defer([&] {
@@ -1709,8 +1707,8 @@ public:
             erase_candidates(nodes, tmap, tablets);
 
             update_node_load_on_migration(node_load, host, src, dst, tablets);
-            sketch.pick(host, dst);
-            sketch.unload(host, src);
+            _load_sketch->pick(host, dst, 0);
+            _load_sketch->unload(host, src, 0);
         }
 
         co_return plan;
@@ -2486,15 +2484,20 @@ public:
                 on_internal_error(lblogger, format("Node {} not found in topology", host));
             }
             node_load& load = nodes[host];
-            if (!_disk_usage.contains(host)) {
+            if (!_cluster_du.contains(host)) {
                 throw std::runtime_error(format("Host {} not found in disk usage", host));
             }
             load.id = host;
             load.node = node;
             load.shard_count = node->get_shard_count();
-            tablet_load_stats& tablet_load = _disk_usage.at(host);
-            load.disk_usage = tablet_load.get_sum();
+            host_load_stats& host_load = _cluster_du.at(host);
+            load.du = host_load.get_sum();
             load.shards.resize(load.shard_count);
+            for (const auto& [shard_id, du]: host_load.usage_by_shard) {
+                load.shards[shard_id].du = du;
+                load.update();
+            }
+
             if (!load.shard_count) {
                 throw std::runtime_error(format("Shard count of {} not found in topology", host));
             }
@@ -2649,8 +2652,9 @@ public:
 
         // Compute per-shard load and candidate tablets.
 
-        _load_sketch = locator::load_sketch(_tm);
+        _load_sketch = locator::size_load_sketch(_tm, _cluster_du);
         co_await _load_sketch->populate_dc(dc);
+        _load_sketch->dump();
         _tablet_count_per_table.clear();
 
         for (auto&& [table, tmap_] : _tm->tablets().all_tables()) {
@@ -2777,7 +2781,11 @@ public:
         _stopped = true;
     }
 
+<<<<<<< HEAD
     future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, locator::disk_usage_by_host disk_usage, bool test_mode) {
+=======
+    future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, locator::cluster_disk_usage disk_usage) {
+>>>>>>> 08773a61e1 (the journey continues...)
         load_balancer lb(_db, tm, std::move(table_load_stats), _load_balancer_stats, _db.get_config().target_tablet_size_in_bytes(), std::move(skiplist), std::move(disk_usage));
         lb.set_use_table_aware_balancing(_use_tablet_aware_balancing);
         co_return co_await lb.make_plan(_config.initial_tablets_scale, test_mode);
@@ -2961,7 +2969,7 @@ auto fmt::formatter<service::tablet_migration_info>::format(const service::table
     return fmt::format_to(ctx.out(), "{{tablet: {}, src: {}, dst: {}}}", mig.tablet, mig.src, mig.dst);
 }
 
-locator::tablet_load_stats::disk_usage tablet_load_stats::get_sum() const {
+locator::disk_usage host_load_stats::get_sum() const {
     disk_usage result;
     for (const disk_usage& du: usage_by_shard | std::views::values) {
         result.used += du.used;
@@ -2972,4 +2980,40 @@ locator::tablet_load_stats::disk_usage tablet_load_stats::get_sum() const {
 
 sstring size2gb(uint64_t size) {
     return std::format("{:.2f}Gb", size / 1024.0 / 1024.0 / 1024.0);
+}
+
+load_type locator::interpolate(load_type in) {
+    struct point {
+        double in = 0;
+        double out = 0;
+    };
+
+    const std::vector<point> points = {
+        {0,    0},
+        {0.7,  0.7},
+        {0.75, 0.8},
+        {0.80, 0.95},
+        {0.85, 1.2},
+        {0.90, 1.8},
+        {0.95, 3},
+        {1.00, 5},
+    };
+
+    size_t idx = 1;
+    while ((idx < points.size() - 1) && (points[idx].in < in)) {
+        idx++;
+    }
+
+    const point& p = points[idx];
+    const point& last = points[idx - 1];
+
+    return last.out + (in - last.in) * (p.out - last.out)/(p.in - last.in);
+}
+
+load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
+    load_type disk_used = load_type(disk_usage.used) / disk_usage.capacity;
+    load_type count_load = tablet_count / load_type(ideal_tablet_count * n_shards);
+    load_type size_load = interpolate(disk_used);
+
+    return size_load * (1 - count_influence) + count_load * count_influence;
 }
