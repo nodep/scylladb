@@ -67,6 +67,13 @@ struct tablet_replica {
 
 using tablet_replica_set = utils::small_vector<tablet_replica, 3>;
 
+struct temporal_tablet_id {
+    table_id table_id;
+    dht::token last_token;
+
+    bool operator == (const temporal_tablet_id&) const = default;
+};
+
 }
 
 namespace std {
@@ -93,6 +100,14 @@ struct hash<locator::global_tablet_id> {
         return utils::hash_combine(
                 std::hash<table_id>()(id.table),
                 std::hash<locator::tablet_id>()(id.tablet));
+    }
+};
+
+template <>
+struct hash<locator::temporal_tablet_id> {
+    size_t operator()(const locator::temporal_tablet_id& id) const {
+        return utils::hash_combine(std::hash<table_id>()(id.table_id),
+                                   std::hash<dht::token>()(id.last_token));
     }
 };
 
@@ -372,18 +387,19 @@ struct load_stats {
     }
 };
 
-struct tablet_load_stats {
-    struct disk_usage {
-        uint64_t used = 0;
-        uint64_t capacity = 0;
-    };
+struct disk_usage {
+    uint64_t used = 0;
+    uint64_t capacity = 0;
+};
 
+struct host_load_stats {
     std::unordered_map<shard_id, disk_usage> usage_by_shard;
+    std::unordered_map<temporal_tablet_id, uint64_t> tablet_sizes;
 
     disk_usage get_sum() const;
 };
 
-using disk_usage_by_host = std::unordered_map<host_id, tablet_load_stats>;
+using cluster_disk_usage = std::unordered_map<host_id, host_load_stats>;
 
 struct repair_scheduler_config {
     bool auto_repair_enabled = false;

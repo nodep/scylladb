@@ -117,6 +117,35 @@ struct rebalance_stats {
     }
 };
 
+locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::unordered_map<global_tablet_id, uint64_t>& tablet_sizes) {
+
+    // add all the nodes with their capacities
+    locator::cluster_disk_usage disk_usage;
+    tm->get_topology().for_each_node([&] (const locator::node& node) {
+        host_load_stats& hls = disk_usage[node.host_id()];
+        for (shard_id sid = 0; sid < node.get_shard_count(); sid++) {
+            hls.usage_by_shard[sid].capacity = 350LL * 1024 * 1024 * 1024;
+        }
+    });
+
+    // recalc the disk usage and set the tablet sizes
+    for (auto&& [table, tmap] : tm->tablets().all_tables()) {
+        tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& tinfo) -> future<> {
+            const uint64_t size = tablet_sizes.at({table, tid});
+            for (const tablet_replica& replica: tinfo.replicas) {
+                host_load_stats& host_load = disk_usage.at(replica.host);
+                host_load.usage_by_shard[replica.shard].used += size;
+                dht::token last_token = tmap->get_last_token(tid);
+                temporal_tablet_id ttablet_id {table, last_token};
+                host_load.tablet_sizes[ttablet_id] = size;
+            }
+            return make_ready_future<>();
+        }).get();
+    }
+
+    return disk_usage;
+}
+
 static
 rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadata& stm, const std::unordered_map<global_tablet_id, uint64_t>& tablet_sizes,
                                     locator::load_stats_ptr load_stats = {}, std::unordered_set<host_id> skiplist = {}) {
@@ -126,31 +155,8 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
     // The x10 factor is arbitrary, it's there to account for more complex schedules than direct migration.
     auto max_iterations = 1 + get_tablet_count(stm.get()->tablets()) * 10;
 
-    auto calc_disk_usage = [&] () -> locator::disk_usage_by_host {
-        // add all the nodes with their capacities
-        locator::disk_usage_by_host disk_usage;
-        stm.get()->get_topology().for_each_node([&] (const locator::node& node) {
-            tablet_load_stats& tls = disk_usage[node.host_id()];
-            for (shard_id sid = 0; sid < node.get_shard_count(); sid++) {
-                tls.usage_by_shard[sid].capacity = 350LL * 1024 * 1024 * 1024;
-            }
-        });
-
-        // recalc the disk usage
-        for (auto&& [table, tmap] : stm.get()->tablets().all_tables()) {
-            tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& tinfo) -> future<> {
-                const uint64_t size = tablet_sizes.at({table, tid});
-                for (const tablet_replica& replica: tinfo.replicas) {
-                    disk_usage.at(replica.host).usage_by_shard[replica.shard].used += size;
-                }
-                return make_ready_future<>();
-            }).get();
-        }
-
-        return disk_usage;
-    };
-
-    auto log_state = [&] (sstring header, const locator::disk_usage_by_host& disk_usage) {
+    /*
+    auto log_state = [&] (sstring header, const locator::cluster_disk_usage& disk_usage) {
         dbglog("{}", header);
         uint64_t umin = std::numeric_limits<uint64_t>::max();
         uint64_t umax = std::numeric_limits<uint64_t>::min();
@@ -176,12 +182,13 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         dbglog("shard min/max: {}/{}", size2gb(umin), size2gb(umax));
         dbglog("tablet min/max: {}/{}", size2gb(tmin), size2gb(tmax));
     };
+    */
 
     for (size_t i = 0; i < max_iterations; ++i) {
         auto prev_lb_stats = talloc.stats().for_dc(dc);
 
-        locator::disk_usage_by_host disk_usage = calc_disk_usage();
-        log_state("******************** before", disk_usage);
+        locator::cluster_disk_usage disk_usage = calc_disk_usage(stm.get(), tablet_sizes);
+        //log_state("******************** before", disk_usage);
 
         auto start_time = std::chrono::steady_clock::now();
         auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist, disk_usage).get();
@@ -208,7 +215,7 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
 
         if (plan.empty()) {
             testlblog.info("Rebalance took {:.3f} [s] after {} iteration(s)", stats.elapsed_time.count(), i + 1);
-            log_state("******************** after", calc_disk_usage());
+            //log_state("******************** after", calc_disk_usage(stm.get(), tablet_sizes));
             return stats;
         }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
@@ -287,7 +294,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
     co_await do_with_cql_env_thread([&] (auto& e) {
         const int n_hosts = p.nodes;
         const shard_id shard_count = p.shards;
-        const int cycles = p.iterations;
+        const int cycles = 0;   //p.iterations;
         std::unordered_map<global_tablet_id, uint64_t> tablet_sizes;
 
         auto rack1 = endpoint_dc_rack{ dc, "rack-1" };
