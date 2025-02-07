@@ -445,10 +445,8 @@ class load_balancer {
         // Call when tablet_count changes.
         void update() {
             avg_load = compute_load(du, tablet_count, shard_count);
-            dbglog("lb update for {} load {} used {} capacity {} tablets {} shards {}",
-                    id, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
-            //dbglog("computed load of node {} avg_load {} usage {} capacity {} tablets {}",
-            //        id, avg_load, size2gb(disk_usage.used), size2gb(disk_usage.capacity), tablet_count);
+            //dbglog("lb update for {} load {} used {} capacity {} tablets {} shards {}",
+            //        id, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
         }
 
         load_type get_avg_load(uint64_t tablets) const {
@@ -2503,8 +2501,8 @@ public:
             load.du = host_load.get_sum();
             load.shards.resize(load.shard_count);
             for (const auto& [shard_id, du]: host_load.usage_by_shard) {
-                load.shards[shard_id].du = du;
-                load.shards[shard_id].update();
+                load.shards[shard_id].du.capacity = du.capacity;
+                //load.shards[shard_id].update();
             }
             load.update();
 
@@ -2614,7 +2612,7 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
-            dbglog("host {} load {}", host, load.avg_load);
+            dbglog("host {} tablets {} shards {} du {} load {}", host, load.tablet_count, load.shard_count, pprint(load.du), load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
             if (!load.drained) {
@@ -2666,6 +2664,7 @@ public:
         _load_sketch = locator::size_load_sketch(_tm, _cluster_du);
         co_await _load_sketch->populate_dc(dc);
         _load_sketch->dump();
+        throw 
         _tablet_count_per_table.clear();
 
         for (auto&& [table, tmap_] : _tm->tablets().all_tables()) {
@@ -2712,6 +2711,11 @@ public:
                     shard_load& shard_load_info = node_load_info.shards[replica.shard];
                     if (shard_load_info.tablet_count == 0) {
                         node_load_info.shards_by_load.push_back(replica.shard);
+                    }
+                    for (const tablet_id tid: tids) {
+                        const uint64_t tablet_size = get_tablet_size(replica.host, global_tablet_id{table, tid});
+                        dbglog("adding size {} to host {} shard {}", tablet_size, replica.host, replica.shard);
+                        shard_load_info.du.used += tablet_size;
                     }
                     shard_load_info.tablet_count += tids.size();
                     shard_load_info.tablet_count_per_table[table] += tids.size();
@@ -2997,6 +3001,10 @@ sstring size2gb(uint64_t size) {
     return std::format("{:.2f}Gb", size / 1024.0 / 1024.0 / 1024.0);
 }
 
+sstring pprint(const locator::disk_usage& du) {
+    return ::format("{}/{}", size2gb(du.used), size2gb(du.capacity));
+}
+
 load_type locator::interpolate(load_type in) {
     struct point {
         double in = 0;
@@ -3032,3 +3040,4 @@ load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_coun
 
     return size_load * (1 - count_influence) + count_load * count_influence;
 }
+

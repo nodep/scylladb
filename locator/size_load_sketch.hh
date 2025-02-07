@@ -102,8 +102,8 @@ class size_load_sketch {
 
         void update() {
             _load = compute_load(_du, _tablet_count, _shards.size());
-            dbglog("lb update load {} used {} capacity {} tablets {} shards {}",
-                    _load, size2gb(_du.used), size2gb(_du.capacity), _tablet_count, _shards.size());
+            //dbglog("lb update load {} used {} capacity {} tablets {} shards {}",
+            //        _load, size2gb(_du.used), size2gb(_du.capacity), _tablet_count, _shards.size());
             std::sort(_shards_by_load.begin(), _shards_by_load.end(), [&, this]
                         (shard_id& lhs, shard_id& rhs) {
                             return _shards[lhs] < _shards[rhs];
@@ -150,10 +150,10 @@ private:
                     if (!host_load.tablet_sizes.contains(ttablet_id)) {
                         dbglog("table {} last_token {} not found", table, last_token);
                     }
-                    uint64_t tablet_size = host_load.tablet_sizes.at(ttablet_id);
+                    const uint64_t tablet_size = host_load.tablet_sizes.at(ttablet_id);
 
-                    //dbglog("tablet size {} for tablet {} {}", tablet_size, table, last_token);
-                    
+                    dbglog("adding size {} to host {} shard {}", tablet_size, replica.host, replica.shard);
+
                     n._du.used += tablet_size;
                     n._shards[replica.shard].du.used += tablet_size;
                 }
@@ -264,11 +264,15 @@ public:
     void dump() {
         dbglog("****** dumping sketch");
         for (const auto& [host, node]: _nodes) {
-            dbglog("*** load {:.3f} for host {}", node._load, host);
+            dbglog("*** host {} tablets {} shards {} du {} load {:.3f}",
+                    host, node._tablet_count, node._shards.size(), pprint(node._du), node._load);
+
+            /*
             for (size_t i = 0; i < node._shards_by_load.size(); i++) {
                 const shard_load& sl = node._shards[node._shards_by_load[i]];
                 dbglog("   shard {} count {} size {} load {:.3f}", node._shards_by_load[i], sl.tablet_count, size2gb(sl.du.used), sl.load);
             }
+            */
         }
     }
 };
