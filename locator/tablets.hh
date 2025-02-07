@@ -753,3 +753,4 @@ struct fmt::formatter<locator::tablet_task_type> : fmt::formatter<string_view> {
 };
 
 sstring size2gb(uint64_t size);
+sstring pprint(const locator::disk_usage& du);
