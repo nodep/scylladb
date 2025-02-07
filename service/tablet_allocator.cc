@@ -445,6 +445,8 @@ class load_balancer {
         // Call when tablet_count changes.
         void update() {
             avg_load = compute_load(du, tablet_count, shard_count);
+            dbglog("lb update for {} load {} used {} capacity {} tablets {} shards {}",
+                    id, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
             //dbglog("computed load of node {} avg_load {} usage {} capacity {} tablets {}",
             //        id, avg_load, size2gb(disk_usage.used), size2gb(disk_usage.capacity), tablet_count);
         }
@@ -1497,10 +1499,12 @@ public:
     // so convergence is reached where the node we picked as source has lower load, or will have lower
     // load post-movement, than the node we picked as the destination.
     bool check_convergence(node_load& src_info, node_load& dst_info, unsigned delta = 1) {
+        dbglog("check_convergence()");
         // Allow migrating only from candidate nodes which have higher load than the target.
         if (src_info.avg_load <= dst_info.avg_load) {
             lblogger.trace("Load inversion: src={} (avg_load={}), dst={} (avg_load={})",
                            src_info.id, src_info.avg_load, dst_info.id, dst_info.avg_load);
+            dbglog("check_convergence() - load inversion");
             return false;
         }
 
@@ -1509,8 +1513,11 @@ public:
             dst_info.get_avg_load(dst_info.tablet_count + delta)) {
             lblogger.trace("Load inversion post-movement: src={} (avg_load={}), dst={} (avg_load={})",
                            src_info.id, src_info.avg_load, dst_info.id, dst_info.avg_load);
+            dbglog("check_convergence() - post movement load inversion");
             return false;
         }
+
+        dbglog("check_convergence() - true!!!");
 
         return true;
     }
@@ -2177,6 +2184,8 @@ public:
             auto src_host = nodes_by_load.back();
             auto& src_node_info = nodes[src_host];
 
+            dbglog("picked source node: {}", src_host);
+
             bool drain_skipped = src_node_info.shards_by_load.empty() && src_node_info.drained
                     && !src_node_info.skipped_candidates.empty();
 
@@ -2495,8 +2504,9 @@ public:
             load.shards.resize(load.shard_count);
             for (const auto& [shard_id, du]: host_load.usage_by_shard) {
                 load.shards[shard_id].du = du;
-                load.update();
+                load.shards[shard_id].update();
             }
+            load.update();
 
             if (!load.shard_count) {
                 throw std::runtime_error(format("Shard count of {} not found in topology", host));
@@ -2604,6 +2614,7 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
+            dbglog("host {} load {}", host, load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
             if (!load.drained) {
@@ -2727,10 +2738,14 @@ public:
             _tablet_count_per_table[table] = total_load;
         }
 
+        dbglog("max_load {} min_load {}", max_load, min_load);
+
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
-            plan.merge(co_await make_internode_plan(dc, nodes, nodes_to_drain, target));
+            auto internode_plan = co_await make_internode_plan(dc, nodes, nodes_to_drain, target);
+            dbglog("internode_plan.size() == {}", internode_plan.size());
+            plan.merge(std::move(internode_plan));
         } else {
             _stats.for_dc(dc).stop_balance++;
         }
