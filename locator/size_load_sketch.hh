@@ -147,14 +147,11 @@ private:
                     // find the tablet
                     dht::token last_token = tmap.get_last_token(tid);
                     temporal_tablet_id ttablet_id {table, last_token};
-                    if (!host_load.tablet_sizes.contains(ttablet_id)) {
-                        dbglog("table {} last_token {} not found", table, last_token);
+                    auto tsi = host_load.tablet_sizes.find(ttablet_id);
+                    if (tsi == host_load.tablet_sizes.end()) {
+                        throw std::runtime_error(::format("table {} last_token {} not found", table, last_token));
                     }
-                    const uint64_t tablet_size = host_load.tablet_sizes.at(ttablet_id);
-
-                    dbglog("adding size {} to host {} shard {}", tablet_size, replica.host, replica.shard);
-
-                    n._du.used += tablet_size;
+                    const uint64_t tablet_size = tsi->second;
                     n._shards[replica.shard].du.used += tablet_size;
                 }
             }
