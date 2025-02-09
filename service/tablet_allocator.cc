@@ -2664,7 +2664,6 @@ public:
         _load_sketch = locator::size_load_sketch(_tm, _cluster_du);
         co_await _load_sketch->populate_dc(dc);
         _load_sketch->dump();
-        throw 
         _tablet_count_per_table.clear();
 
         for (auto&& [table, tmap_] : _tm->tablets().all_tables()) {
