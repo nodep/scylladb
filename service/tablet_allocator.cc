@@ -753,14 +753,14 @@ public:
     }
 
     uint64_t get_tablet_size(host_id host, const global_tablet_id& gtid) {
-        //const tablet_map& tmap = _tm->tablets().get_tablet_map(gtid.table);
-        //dht::token last_token = tmap.get_last_token(gtid.tablet);
-        //temporal_tablet_id ttablet_id {gtid.table, last_token};
-        //const host_load_stats& host_load = _cluster_du.at(host);
-        //if (!host_load.tablet_sizes.contains(ttablet_id)) {
-        //    dbglog("table {} last_token {} not found", gtid.table, last_token);
-        //}
-        //return host_load.tablet_sizes.at(ttablet_id);
+        const tablet_map& tmap = _tm->tablets().get_tablet_map(gtid.table);
+        dht::token last_token = tmap.get_last_token(gtid.tablet);
+        temporal_tablet_id ttablet_id {gtid.table, last_token};
+        const host_load_stats& host_load = _cluster_du.at(host);
+        if (!host_load.tablet_sizes.contains(ttablet_id)) {
+            dbglog("tablet {}:{} on host {} not found", gtid.table, last_token, host);
+        }
+        return host_load.tablet_sizes.at(ttablet_id);
         return _target_tablet_size;
     }
 
@@ -1538,12 +1538,10 @@ public:
     // Checks whether moving a tablet from shard A to B (intra-node) would go against convergence.
     // Returns false if the tablet should not be moved, and true if it may be moved.
     bool check_convergence(const shard_load& src_info, const shard_load& dst_info, unsigned delta = 1) {
-        // compute_load
         return src_info.tablet_count > dst_info.tablet_count + delta;
     }
 
     //bool check_convergence(const shard_load& src_info, const shard_load& dst_info, const migration_tablet_set& tablet_set) {
-    //    // compute_load
     //    return check_convergence(src_info, dst_info, tablet_set.tablets().size());
     //}
 
@@ -1553,7 +1551,6 @@ public:
 
         const uint64_t tablet_size = get_tablet_size(host, tablet);
 
-        // compute_load
         auto& src_info = node_load.shards[src];
         auto& dst_info = node_load.shards[dst];
         dst_info.tablet_count++;
@@ -1568,11 +1565,8 @@ public:
 
     // Adjusts the load of the source and destination (host:shard) that were picked for the migration.
     void update_node_load_on_migration(node_load_map& nodes, tablet_replica src, tablet_replica dst, global_tablet_id source_tablet) {
-        dbglog("update_node_load_on_migration");
-
         const uint64_t tablet_size = get_tablet_size(src.host, source_tablet);
 
-        // compute_load
         auto& target_info = nodes[dst.host];
         auto& target_shard_info = target_info.shards[dst.shard];
         target_shard_info.tablet_count++;
@@ -1615,10 +1609,10 @@ public:
         }
     }
 
-    void pick(locator::size_load_sketch& sketch, host_id host, shard_id shard, const migration_tablet_set& tablet_set) {
+    void pick(locator::size_load_sketch& sketch, host_id src_host, host_id dst_host, shard_id dst_shard, const migration_tablet_set& tablet_set) {
         for (const global_tablet_id& tablet : tablet_set.tablets()) {
-            uint64_t tablet_size = get_tablet_size(host, tablet);
-            sketch.pick(host, shard, tablet_size);
+            uint64_t tablet_size = get_tablet_size(src_host, tablet);
+            sketch.pick(dst_host, dst_shard, tablet_size);
         }
     }
 
@@ -2195,8 +2189,6 @@ public:
             auto src_host = nodes_by_load.back();
             auto& src_node_info = nodes[src_host];
 
-            dbglog("picked source node: {}", src_host);
-
             bool drain_skipped = src_node_info.shards_by_load.empty() && src_node_info.drained
                     && !src_node_info.skipped_candidates.empty();
 
@@ -2276,6 +2268,22 @@ public:
             // When draining nodes, disable convergence checks so that all tablets are migrated away.
             bool can_check_convergence = !shuffle && nodes_to_drain.empty();
             if (can_check_convergence) {
+                // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
+                double min_usage_perc = std::numeric_limits<double>::max();
+                double max_usage_perc = std::numeric_limits<double>::min();
+                for (node_load& nl: nodes | std::views::values) {
+                    double usage_perc = nl.du.used / double(nl.du.capacity);
+                    min_usage_perc = std::min(min_usage_perc, usage_perc);
+                    max_usage_perc = std::max(max_usage_perc, usage_perc);
+                }
+
+                const double disk_usage_delta_perc = (max_usage_perc - min_usage_perc) * 100;
+                dbglog("disk usage delta is {:.2f}%", disk_usage_delta_perc);
+                if (disk_usage_delta_perc < balance_disk_usage_delta) {
+                    dbglog("Balance achieved");
+                    break;
+                }
+
                 // Check if all nodes reached the same avg_load. There are three sets of nodes: target, candidates (nodes_by_load)
                 // and off-candidates (removed from nodes_by_load). At any time, the avg_load for target is not greater than
                 // that of any candidate, and avg_load of any candidate is not greater than that of any in the off-candidates set.
@@ -2368,11 +2376,12 @@ public:
             auto mig = get_migration_info(source_tablets, kind, src, dst);
             auto mig_streaming_info = get_migration_streaming_infos(topo, tmap, mig);
 
-            pick(*_load_sketch, dst.host, dst.shard, source_tablets);
+            pick(*_load_sketch, src.host, dst.host, dst.shard, source_tablets);
 
             if (can_accept_load(nodes, mig_streaming_info)) {
                 apply_load(nodes, mig_streaming_info);
                 lblogger.debug("Adding migration: {}", mig);
+                dbglog("Adding migration: {}", mig);
                 _stats.for_dc(dc).migrations_produced++;
                 plan.add(std::move(mig));
             } else {
@@ -2627,7 +2636,8 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
-            dbglog("host {} tablets {} shards {} du {} load {}", host, load.tablet_count, load.shard_count, pprint(load.du), load.avg_load);
+            sstring hoststr = ::format("{}", host).substr(0, 8);
+            dbglog("host {} tablets {} shards {} du {} load {:.2f}", hoststr, load.tablet_count, load.shard_count, pprint(load.du), load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
             if (!load.drained) {
@@ -2755,7 +2765,7 @@ public:
             _tablet_count_per_table[table] = total_load;
         }
 
-        dbglog("max_load {} min_load {}", max_load, min_load);
+        dbglog("max_load {:.2f} min_load {:.2f}", max_load, min_load);
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
@@ -2767,15 +2777,15 @@ public:
             _stats.for_dc(dc).stop_balance++;
         }
 
-        if (_tm->tablets().balancing_enabled()) {
-            plan.merge(co_await make_intranode_plan(nodes, nodes_to_drain));
-        }
+        //if (_tm->tablets().balancing_enabled()) {
+        //    plan.merge(co_await make_intranode_plan(nodes, nodes_to_drain));
+        //}
 
-        if (_tm->tablets().balancing_enabled() && plan.empty()) {
-            auto dc_merge_plan = co_await make_merge_colocation_plan(nodes);
-            lblogger.info("Prepared {} migrations for co-locating sibling tablets in DC {}", dc_merge_plan.tablet_migration_count(), dc);
-            plan.merge(std::move(dc_merge_plan));
-        }
+        //if (_tm->tablets().balancing_enabled() && plan.empty()) {
+        //    auto dc_merge_plan = co_await make_merge_colocation_plan(nodes);
+        //    lblogger.info("Prepared {} migrations for co-locating sibling tablets in DC {}", dc_merge_plan.tablet_migration_count(), dc);
+        //    plan.merge(std::move(dc_merge_plan));
+        //}
 
         co_await utils::clear_gently(nodes);
         co_return std::move(plan);
@@ -3015,7 +3025,7 @@ sstring size2gb(uint64_t size) {
 }
 
 sstring pprint(const locator::disk_usage& du) {
-    return ::format("{}/{}", size2gb(du.used), size2gb(du.capacity));
+    return ::format("{} {:.2f}%", size2gb(du.used), (du.used * 100.0) / du.capacity);
 }
 
 load_type locator::interpolate(load_type in) {

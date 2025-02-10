@@ -21,6 +21,7 @@ namespace locator {
 
 constexpr double count_influence = 0.2;
 constexpr size_t ideal_tablet_count = 100;
+constexpr double balance_disk_usage_delta = 2;
 
 using load_type = double;
 
@@ -187,13 +188,26 @@ public:
         return populate(std::nullopt, std::nullopt, dc);
     }
 
+    node_load& ensure_node(host_id node) {
+        if (!_nodes.contains(node)) {
+            const topology& topo = _tm->get_topology();
+            auto shard_count = topo.find_node(node)->get_shard_count();
+            if (shard_count == 0) {
+                throw std::runtime_error(format("Shard count not known for node {}", node));
+            }
+            auto [i, _] = _nodes.emplace(node, node_load{shard_count, _cluster_du->at(node).get_sum()});
+            i->second.populate_shards_by_load();
+        }
+        return _nodes.at(node);
+    }
+
     shard_id get_least_loaded_shard(host_id node) {
-        node_load& nl = _nodes.at(node);
+        node_load& nl = ensure_node(node);
         return nl._shards_by_load.front();
     }
 
     shard_id get_most_loaded_shard(host_id node) {
-        node_load& nl = _nodes.at(node);
+        node_load& nl = ensure_node(node);
         return nl._shards_by_load.back();
     }
 

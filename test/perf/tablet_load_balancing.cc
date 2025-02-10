@@ -124,7 +124,7 @@ locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::un
     tm->get_topology().for_each_node([&] (const locator::node& node) {
         host_load_stats& hls = disk_usage[node.host_id()];
         for (shard_id sid = 0; sid < node.get_shard_count(); sid++) {
-            hls.usage_by_shard[sid].capacity = 350LL * 1024 * 1024 * 1024;
+            hls.usage_by_shard[sid].capacity = 600LL * 1024 * 1024 * 1024;
         }
     });
 
@@ -294,7 +294,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
     co_await do_with_cql_env_thread([&] (auto& e) {
         const int n_hosts = p.nodes;
         const shard_id shard_count = p.shards;
-        const int cycles = 0;   //p.iterations;
+        const int cycles = p.iterations;
         std::unordered_map<global_tablet_id, uint64_t> tablet_sizes;
 
         auto rack1 = endpoint_dc_rack{ dc, "rack-1" };
@@ -383,7 +383,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         for (auto&& [table, tmap_] : stm.get()->tablets().all_tables()) {
             auto& tmap = *tmap_;
             tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
-                const uint64_t tablet_size = tests::random::get_int<uint64_t>(0, default_target_tablet_size * 4);
+                const uint64_t tablet_size = tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
                 tablet_sizes[{table, tid}] = tablet_size;
                 return make_ready_future<>();
             }).get();
