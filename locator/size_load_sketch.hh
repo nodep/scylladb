@@ -263,13 +263,10 @@ public:
         for (const auto& [host, node]: _nodes) {
             dbglog("*** host {} tablets {} shards {} du {} load {:.3f}",
                     host, node._tablet_count, node._shards.size(), pprint(node._du), node._load);
-
-            /*
             for (size_t i = 0; i < node._shards_by_load.size(); i++) {
                 const shard_load& sl = node._shards[node._shards_by_load[i]];
                 dbglog("   shard {} count {} size {} load {:.3f}", node._shards_by_load[i], sl.tablet_count, size2gb(sl.du.used), sl.load);
             }
-            */
         }
     }
 };
