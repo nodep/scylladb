@@ -449,8 +449,14 @@ class load_balancer {
             //        id, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
         }
 
-        load_type get_avg_load(uint64_t tablets) const {
-            return double(tablets) / shard_count;
+        load_type get_avg_load(int tablets, uint64_t tablet_sizes) const {
+            locator::disk_usage du_calc(du);
+            if (tablets < 0)
+                du_calc.used -= tablet_sizes;
+            else
+                du_calc.used += tablet_sizes;
+
+            return compute_load(du_calc, tablet_count + tablets, shard_count);
         }
 
         auto shards_by_load_cmp() {
@@ -747,14 +753,15 @@ public:
     }
 
     uint64_t get_tablet_size(host_id host, const global_tablet_id& gtid) {
-        const tablet_map& tmap = _tm->tablets().get_tablet_map(gtid.table);
-        dht::token last_token = tmap.get_last_token(gtid.tablet);
-        temporal_tablet_id ttablet_id {gtid.table, last_token};
-        const host_load_stats& host_load = _cluster_du.at(host);
-        if (!host_load.tablet_sizes.contains(ttablet_id)) {
-            dbglog("table {} last_token {} not found", gtid.table, last_token);
-        }
-        return host_load.tablet_sizes.at(ttablet_id);
+        //const tablet_map& tmap = _tm->tablets().get_tablet_map(gtid.table);
+        //dht::token last_token = tmap.get_last_token(gtid.tablet);
+        //temporal_tablet_id ttablet_id {gtid.table, last_token};
+        //const host_load_stats& host_load = _cluster_du.at(host);
+        //if (!host_load.tablet_sizes.contains(ttablet_id)) {
+        //    dbglog("table {} last_token {} not found", gtid.table, last_token);
+        //}
+        //return host_load.tablet_sizes.at(ttablet_id);
+        return _target_tablet_size;
     }
 
     future<bool> needs_auto_repair(const locator::global_tablet_id& gid, const locator::tablet_info& info,
@@ -1496,32 +1503,36 @@ public:
     // The assumption is that the algorithm moves tablets from more loaded nodes to less loaded nodes,
     // so convergence is reached where the node we picked as source has lower load, or will have lower
     // load post-movement, than the node we picked as the destination.
-    bool check_convergence(node_load& src_info, node_load& dst_info, unsigned delta = 1) {
-        dbglog("check_convergence()");
+    bool check_convergence(node_load& src_info, node_load& dst_info, size_t tablet_delta, uint64_t tablet_size) {
         // Allow migrating only from candidate nodes which have higher load than the target.
         if (src_info.avg_load <= dst_info.avg_load) {
             lblogger.trace("Load inversion: src={} (avg_load={}), dst={} (avg_load={})",
                            src_info.id, src_info.avg_load, dst_info.id, dst_info.avg_load);
-            dbglog("check_convergence() - load inversion");
             return false;
         }
 
         // Prevent load inversion post-movement which can lead to oscillations.
-        if (src_info.get_avg_load(src_info.tablet_count - delta) <
-            dst_info.get_avg_load(dst_info.tablet_count + delta)) {
+        if (src_info.get_avg_load(-int(tablet_delta), tablet_size) <
+            dst_info.get_avg_load(int(tablet_delta), tablet_size)) {
             lblogger.trace("Load inversion post-movement: src={} (avg_load={}), dst={} (avg_load={})",
                            src_info.id, src_info.avg_load, dst_info.id, dst_info.avg_load);
-            dbglog("check_convergence() - post movement load inversion");
             return false;
         }
-
-        dbglog("check_convergence() - true!!!");
 
         return true;
     }
 
+    uint64_t get_tablet_sizes(host_id hid, const migration_tablet_set& tablet_set) {
+        uint64_t tablet_sizes = 0;
+        for (global_tablet_id& gtid: tablet_set.tablets()) {
+            tablet_sizes += get_tablet_size(hid, gtid);
+        }
+        return tablet_sizes;
+    }
+
     bool check_convergence(node_load& src_info, node_load& dst_info, const migration_tablet_set& tablet_set) {
-        return check_convergence(src_info, dst_info, tablet_set.tablets().size());
+        uint64_t tablet_sizes = get_tablet_sizes(src_info.id, tablet_set);
+        return check_convergence(src_info, dst_info, tablet_set.tablets().size(), tablet_sizes);
     }
 
     // Checks whether moving a tablet from shard A to B (intra-node) would go against convergence.
@@ -1531,14 +1542,14 @@ public:
         return src_info.tablet_count > dst_info.tablet_count + delta;
     }
 
-    bool check_convergence(const shard_load& src_info, const shard_load& dst_info, const migration_tablet_set& tablet_set) {
-        // compute_load
-        return check_convergence(src_info, dst_info, tablet_set.tablets().size());
-    }
+    //bool check_convergence(const shard_load& src_info, const shard_load& dst_info, const migration_tablet_set& tablet_set) {
+    //    // compute_load
+    //    return check_convergence(src_info, dst_info, tablet_set.tablets().size());
+    //}
 
     // Adjusts the load of the source and destination shards in the host where intra-node migration happens.
     void update_node_load_on_migration(node_load& node_load, host_id host, shard_id src, shard_id dst, global_tablet_id tablet) {
-        dbglog("update_node_load_on_migration");
+        dbglog("update_node_load_on_migration -- for shards");
 
         const uint64_t tablet_size = get_tablet_size(host, tablet);
 
@@ -1551,6 +1562,8 @@ public:
         src_info.du.used -= tablet_size;
         dst_info.tablet_count_per_table[tablet.table]++;
         src_info.tablet_count_per_table[tablet.table]--;
+        src_info.update();
+        dst_info.update();
     }
 
     // Adjusts the load of the source and destination (host:shard) that were picked for the migration.
@@ -1685,10 +1698,10 @@ public:
             auto tablets = candidate.tablets;
 
             // Recheck convergence to avoid oscillations if co-located tablets are being migrated together.
-            if (!shuffle && (src == dst || !check_convergence(src_info, dst_info, tablets))) {
-                lblogger.debug("Node {} is balanced", host);
-                break;
-            }
+            //if (!shuffle && (src == dst || !check_convergence(src_info, dst_info, tablets))) {
+            //    lblogger.debug("Node {} is balanced", host);
+            //    break;
+            //}
 
             // Emit migration.
 
@@ -2278,11 +2291,13 @@ public:
                     break;
                 }
 
-                if (!check_convergence(src_node_info, target_info)) {
-                    lblogger.debug("No more candidates. Load would be inverted.");
-                    _stats.for_dc(dc).stop_load_inversion++;
-                    break;
-                }
+                // we can't check convergence if we don't know which tablet we plan to migrate
+
+                //if (!check_convergence(src_node_info, target_info)) {
+                //    lblogger.debug("No more candidates. Load would be inverted.");
+                //    _stats.for_dc(dc).stop_load_inversion++;
+                //    break;
+                //}
             }
 
             // Pick best target shard.
@@ -2310,11 +2325,11 @@ public:
 
             auto& tmap = tmeta.get_tablet_map(source_tablets.table());
             // If best candidate is co-located sibling tablets, then convergence is re-checked to avoid oscillations.
-            if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
-                lblogger.debug("No more candidates. Load would be inverted.");
-                _stats.for_dc(dc).stop_load_inversion++;
-                break;
-            }
+            //if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
+            //    lblogger.debug("No more candidates. Load would be inverted.");
+            //    _stats.for_dc(dc).stop_load_inversion++;
+            //    break;
+            //}
 
             // Check replication strategy constraints.
 
@@ -2663,7 +2678,7 @@ public:
 
         _load_sketch = locator::size_load_sketch(_tm, _cluster_du);
         co_await _load_sketch->populate_dc(dc);
-        _load_sketch->dump();
+        //_load_sketch->dump();
         _tablet_count_per_table.clear();
 
         for (auto&& [table, tmap_] : _tm->tablets().all_tables()) {
@@ -2713,7 +2728,6 @@ public:
                     }
                     for (const tablet_id tid: tids) {
                         const uint64_t tablet_size = get_tablet_size(replica.host, global_tablet_id{table, tid});
-                        dbglog("adding size {} to host {} shard {}", tablet_size, replica.host, replica.shard);
                         shard_load_info.du.used += tablet_size;
                     }
                     shard_load_info.tablet_count += tids.size();
