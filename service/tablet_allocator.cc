@@ -17,12 +17,8 @@
 #include "utils/stall_free.hh"
 #include "utils/overloaded_functor.hh"
 #include "db/config.hh"
-<<<<<<< HEAD
 #include "db/tablet_options.hh"
-#include "locator/load_sketch.hh"
-=======
 #include "locator/size_load_sketch.hh"
->>>>>>> 08773a61e1 (the journey continues...)
 #include "replica/database.hh"
 #include "gms/feature_service.hh"
 #include <iterator>
@@ -2823,11 +2819,7 @@ public:
         _stopped = true;
     }
 
-<<<<<<< HEAD
-    future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, locator::disk_usage_by_host disk_usage, bool test_mode) {
-=======
-    future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, locator::cluster_disk_usage disk_usage) {
->>>>>>> 08773a61e1 (the journey continues...)
+    future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist, locator::cluster_disk_usage disk_usage, bool test_mode) {
         load_balancer lb(_db, tm, std::move(table_load_stats), _load_balancer_stats, _db.get_config().target_tablet_size_in_bytes(), std::move(skiplist), std::move(disk_usage));
         lb.set_use_table_aware_balancing(_use_tablet_aware_balancing);
         co_return co_await lb.make_plan(_config.initial_tablets_scale, test_mode);
@@ -2980,7 +2972,7 @@ future<> tablet_allocator::stop() {
 }
 
 future<migration_plan> tablet_allocator::balance_tablets(locator::token_metadata_ptr tm, locator::load_stats_ptr load_stats, std::unordered_set<host_id> skiplist,
-                locator::disk_usage_by_host disk_usage, bool test_mode) {
+                locator::cluster_disk_usage disk_usage, bool test_mode) {
     return impl().balance_tablets(std::move(tm), std::move(load_stats), std::move(skiplist), std::move(disk_usage), test_mode);
 }
 
