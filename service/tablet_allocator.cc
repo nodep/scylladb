@@ -3017,7 +3017,7 @@ sstring size2gb(uint64_t size) {
 }
 
 sstring pprint(const locator::disk_usage& du) {
-    return ::format("{} {:.2f}%", size2gb(du.used), (du.used * 100.0) / du.capacity);
+    return ::format("{} {} {:.2f}%", size2gb(du.used), size2gb(du.capacity), (du.used * 100.0) / du.capacity);
 }
 
 load_type locator::interpolate(load_type in) {
