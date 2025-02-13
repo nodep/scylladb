@@ -19,7 +19,7 @@
 
 namespace locator {
 
-constexpr double count_influence = 0.2;
+constexpr double count_influence = 0.00002;
 constexpr size_t ideal_tablet_count = 100;
 constexpr double balance_disk_usage_delta = 2;
 

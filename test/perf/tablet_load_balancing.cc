@@ -119,12 +119,23 @@ struct rebalance_stats {
 
 locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::unordered_map<global_tablet_id, uint64_t>& tablet_sizes) {
 
+    size_t node_index = 0;
+    const std::vector<uint64_t> capacities {
+        350UL * 1024 * 1024 * 1024,
+        850UL * 1024 * 1024 * 1024,
+        450UL * 1024 * 1024 * 1024,
+        650UL * 1024 * 1024 * 1024,
+    };
+
     // add all the nodes with their capacities
     locator::cluster_disk_usage disk_usage;
     tm->get_topology().for_each_node([&] (const locator::node& node) {
         host_load_stats& hls = disk_usage[node.host_id()];
         for (shard_id sid = 0; sid < node.get_shard_count(); sid++) {
-            hls.usage_by_shard[sid].capacity = 600LL * 1024 * 1024 * 1024;
+            hls.usage_by_shard[sid].capacity = capacities[node_index];
+        }
+        if (++node_index == capacities.size()) {
+            node_index = 0;
         }
     });
 
@@ -288,6 +299,45 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
+struct tablet_size_generator {
+    size_t _tablet_count = 0;
+
+    uint64_t generate() {
+        ++_tablet_count;
+        //if (_tablet_count % 1000 == 0) {
+        //    return tests::random::get_int<uint64_t>(default_target_tablet_size * 60, default_target_tablet_size * 70);
+        //}
+        return tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
+    }
+};
+
+/*
+struct tablet_size_generator {
+    std::random_device  _rd;
+    std::mt19937        _gen;
+    std::piecewise_linear_distribution<> _d;
+
+    tablet_size_generator()
+        : _gen(_rd())
+    {
+        std::vector<double> i, w;
+        i.push_back(0);                                 w.push_back(0);
+        i.push_back(default_target_tablet_size * .6);   w.push_back(80);
+        i.push_back(default_target_tablet_size * .8);   w.push_back(85);
+        i.push_back(default_target_tablet_size);        w.push_back(80);
+        i.push_back(default_target_tablet_size * 1.2);  w.push_back(60);
+        i.push_back(default_target_tablet_size * 2);    w.push_back(0.1);
+        i.push_back(default_target_tablet_size * 100);  w.push_back(0);
+
+        _d = std::piecewise_linear_distribution<>(i.begin(), i.end(), w.begin());
+    }
+
+    uint64_t generate() {
+        return _d(_gen) / 2.8;
+    }
+};
+*/
+
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
     results global_res;
@@ -380,14 +430,31 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         allocate(s2, p.rf2, p.tablets2);
 
         // allocate sizes to tablets
+        tablet_size_generator tsg;
+        uint64_t tablet_size_sum = 0;
         for (auto&& [table, tmap_] : stm.get()->tablets().all_tables()) {
             auto& tmap = *tmap_;
             tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
-                const uint64_t tablet_size = tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
-                tablet_sizes[{table, tid}] = tablet_size;
+                // uniform distribution
+                // const uint64_t tablet_size = tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
+
+                // more realistic distribution
+                const uint64_t tablet_size = tsg.generate();
+                global_tablet_id gtid{table, tid};
+                if (tablet_sizes.contains(gtid)) {
+                    dbglog("we had this!!! {}", gtid);
+                }
+                tablet_sizes[gtid] = tablet_size;
+
+                tablet_size_sum += tablet_size;
+                if (tablet_size > default_target_tablet_size * 2) {
+                    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
+                }
                 return make_ready_future<>();
             }).get();
         }
+
+        dbglog("created {} tablet sizes; avg size: {}", tablet_sizes.size(), size2gb(tablet_size_sum / tablet_sizes.size()));
 
         auto check_balance = [&] () -> cluster_balance {
             cluster_balance res;
