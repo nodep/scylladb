@@ -2264,6 +2264,7 @@ public:
             // When draining nodes, disable convergence checks so that all tablets are migrated away.
             bool can_check_convergence = !shuffle && nodes_to_drain.empty();
             if (can_check_convergence) {
+                /*
                 // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
                 double min_usage_perc = std::numeric_limits<double>::max();
                 double max_usage_perc = std::numeric_limits<double>::min();
@@ -2276,6 +2277,22 @@ public:
                 const double disk_usage_delta_perc = (max_usage_perc - min_usage_perc) * 100;
                 dbglog("disk usage delta is {:.2f}%", disk_usage_delta_perc);
                 if (disk_usage_delta_perc < balance_disk_usage_delta) {
+                    dbglog("Balance achieved");
+                    break;
+                }
+                */
+
+                // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
+                load_type min_load = std::numeric_limits<double>::max();
+                load_type max_load = std::numeric_limits<double>::min();
+                for (node_load& nl: nodes | std::views::values) {
+                    min_load = std::min(min_load, nl.avg_load);
+                    max_load = std::max(max_load, nl.avg_load);
+                }
+
+                const double load_delta = max_load - min_load;
+                dbglog("load delta is {:.4f}", load_delta);
+                if (load_delta < 0.002) {
                     dbglog("Balance achieved");
                     break;
                 }
@@ -2632,8 +2649,8 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
-            sstring hoststr = ::format("{}", host).substr(0, 8);
-            dbglog("host {} tablets {} shards {} du {} load {:.2f}", hoststr, load.tablet_count, load.shard_count, pprint(load.du), load.avg_load);
+            sstring hoststr = ::format("{}", host).substr(0, 1);
+            dbglog("host {} shards {} tablets {} du {} load {:.4f}", hoststr, load.shard_count, load.tablet_count, pprint(load.du), load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
             if (!load.drained) {
@@ -2761,7 +2778,7 @@ public:
             _tablet_count_per_table[table] = total_load;
         }
 
-        dbglog("max_load {:.2f} min_load {:.2f}", max_load, min_load);
+        dbglog("max_load {:.4f} min_load {:.4f}", max_load, min_load);
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
@@ -3012,12 +3029,12 @@ locator::disk_usage host_load_stats::get_sum() const {
     return result;
 }
 
-sstring size2gb(uint64_t size) {
-    return std::format("{:.2f}Gb", size / 1024.0 / 1024.0 / 1024.0);
+sstring size2gb(uint64_t size, int decimals) {
+    return std::format("{:.{}f} Gb", size / 1024.0 / 1024.0 / 1024.0, decimals);
 }
 
 sstring pprint(const locator::disk_usage& du) {
-    return ::format("{} {} {:.2f}%", size2gb(du.used), size2gb(du.capacity), (du.used * 100.0) / du.capacity);
+    return ::format("{} {} {:.2f}%", size2gb(du.used, 0), size2gb(du.capacity, 0), (du.used * 100.0) / du.capacity);
 }
 
 load_type locator::interpolate(load_type in) {
@@ -3055,4 +3072,3 @@ load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_coun
 
     return size_load * (1 - count_influence) + count_load * count_influence;
 }
-
