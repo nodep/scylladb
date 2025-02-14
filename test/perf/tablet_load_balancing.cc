@@ -132,7 +132,7 @@ locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::un
     tm->get_topology().for_each_node([&] (const locator::node& node) {
         host_load_stats& hls = disk_usage[node.host_id()];
         for (shard_id sid = 0; sid < node.get_shard_count(); sid++) {
-            hls.usage_by_shard[sid].capacity = capacities[node_index];
+            hls.usage_by_shard[sid].capacity = 650UL * 1024 * 1024 * 1024;  //capacities[node_index];
         }
         if (++node_index == capacities.size()) {
             node_index = 0;
@@ -299,19 +299,20 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
+/*
 struct tablet_size_generator {
     size_t _tablet_count = 0;
 
     uint64_t generate() {
         ++_tablet_count;
-        //if (_tablet_count % 1000 == 0) {
-        //    return tests::random::get_int<uint64_t>(default_target_tablet_size * 60, default_target_tablet_size * 70);
-        //}
-        return tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
+        if (_tablet_count % 1000 == 0) {
+            return tests::random::get_int<uint64_t>(default_target_tablet_size * 60, default_target_tablet_size * 70);
+        }
+        return tests::random::get_int<uint64_t>(0, default_target_tablet_size * 1.8);
     }
 };
+*/
 
-/*
 struct tablet_size_generator {
     std::random_device  _rd;
     std::mt19937        _gen;
@@ -336,7 +337,6 @@ struct tablet_size_generator {
         return _d(_gen) / 2.8;
     }
 };
-*/
 
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
@@ -354,7 +354,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
         int host_seq = 1;
         auto add_host = [&] {
-            hosts.push_back(host_id(utils::make_random_uuid()));
+            hosts.push_back(host_id(utils::UUID(::format("{:x}0000000-0000-0000-0000-000000000000", host_seq))));
             ips.push_back(inet_address(format("192.168.0.{}", host_seq++)));
             testlblog.info("Added new node: {} ({})", hosts.back(), ips.back());
         };
@@ -447,9 +447,9 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 tablet_sizes[gtid] = tablet_size;
 
                 tablet_size_sum += tablet_size;
-                if (tablet_size > default_target_tablet_size * 2) {
-                    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
-                }
+                //if (tablet_size > default_target_tablet_size * 2) {
+                //    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
+                //}
                 return make_ready_future<>();
             }).get();
         }

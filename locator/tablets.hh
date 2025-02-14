@@ -752,5 +752,5 @@ struct fmt::formatter<locator::tablet_task_type> : fmt::formatter<string_view> {
     auto format(const locator::tablet_task_type&, fmt::format_context& ctx) const -> decltype(ctx.out());
 };
 
-sstring size2gb(uint64_t size);
+sstring size2gb(uint64_t size, int decimals = 2UL);
 sstring pprint(const locator::disk_usage& du);
