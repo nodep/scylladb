@@ -1341,6 +1341,8 @@ public:
         double shard_balance_threshold = std::ceil(desired_load_per_shard);
         auto new_shard_load = node_info.shards[dst.shard].tablet_count_per_table[table] + 1;
         auto dst_shard_badness = (new_shard_load - shard_balance_threshold) / total_load;
+        if (new_shard_load < shard_balance_threshold)
+            dbglog("negative badness; {}", dst_shard_badness);
         lblogger.trace("Table {} @{} shard balance threshold: {}, dst: {} ({:.4f})", table, dst,
                        shard_balance_threshold, new_shard_load, dst_shard_badness);
 
@@ -2001,6 +2003,8 @@ public:
 
             lblogger.trace("candidate: {}", candidate);
 
+            dbglog("min_dst_badness {}", min_dst_badness);
+
             if (candidate.badness < min_candidate.badness) {
                 min_candidate = candidate;
             }
@@ -2045,16 +2049,27 @@ public:
                         continue;
                     }
 
+                    dbglog("number of candidates for table {}:{} == {}",
+                            table, min_src->shard,
+                            src_node_info.shards[min_src->shard].candidates[table].size());
+
                     auto tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
                     co_await evaluate_targets(tablet, *min_src, min_src_badness);
                     if (!min_candidate.badness.is_bad()) {
+                        dbglog("candidate is good; stopping further search");
                         break;
                     }
                 }
             }
         }
 
+        dbglog("src_node_info.drained {}", src_node_info.drained);
+        if (!src_node_info.drained && min_candidate.badness.is_bad() && _use_table_aware_balancing) {
+            dbglog("swap !!!");
+        }
+
         lblogger.trace("best candidate: {}", min_candidate);
+        dbglog("best candidate: {}", min_candidate);
 
         if (drain_skipped) {
             src_node_info.skipped_candidates.pop_back();
@@ -2120,6 +2135,36 @@ public:
                                                const std::unordered_set<host_id>& nodes_to_drain,
                                                host_id target) {
         migration_plan plan;
+
+        auto get_load_delta = [&] () {
+            // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
+            double min_usage_perc = std::numeric_limits<double>::max();
+            double max_usage_perc = std::numeric_limits<double>::min();
+            for (node_load& nl: nodes | std::views::values) {
+                double usage_perc = nl.du.used / double(nl.du.capacity);
+                min_usage_perc = std::min(min_usage_perc, usage_perc);
+                max_usage_perc = std::max(max_usage_perc, usage_perc);
+            }
+
+            const double disk_usage_delta_perc = (max_usage_perc - min_usage_perc) * 100;
+            //if (disk_usage_delta_perc < balance_disk_usage_delta) {
+            //    dbglog("Balance achieved");
+            //    break;
+            //}
+
+            // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
+            load_type min_load = std::numeric_limits<double>::max();
+            load_type max_load = std::numeric_limits<double>::min();
+            for (node_load& nl: nodes | std::views::values) {
+                min_load = std::min(min_load, nl.avg_load);
+                max_load = std::max(max_load, nl.avg_load);
+            }
+
+            const double load_delta = max_load - min_load;
+            dbglog("load delta is {:.4f} disk usage delta is {:.2f}%", load_delta, disk_usage_delta_perc);
+
+            return load_delta;
+        };
 
         // Prepare candidate nodes and shards for heap-based balancing.
 
@@ -2264,34 +2309,7 @@ public:
             // When draining nodes, disable convergence checks so that all tablets are migrated away.
             bool can_check_convergence = !shuffle && nodes_to_drain.empty();
             if (can_check_convergence) {
-                /*
-                // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
-                double min_usage_perc = std::numeric_limits<double>::max();
-                double max_usage_perc = std::numeric_limits<double>::min();
-                for (node_load& nl: nodes | std::views::values) {
-                    double usage_perc = nl.du.used / double(nl.du.capacity);
-                    min_usage_perc = std::min(min_usage_perc, usage_perc);
-                    max_usage_perc = std::max(max_usage_perc, usage_perc);
-                }
-
-                const double disk_usage_delta_perc = (max_usage_perc - min_usage_perc) * 100;
-                dbglog("disk usage delta is {:.2f}%", disk_usage_delta_perc);
-                if (disk_usage_delta_perc < balance_disk_usage_delta) {
-                    dbglog("Balance achieved");
-                    break;
-                }
-                */
-
-                // we have converged if the max delta of disk usage between nodes is within a pre-defined threshold
-                load_type min_load = std::numeric_limits<double>::max();
-                load_type max_load = std::numeric_limits<double>::min();
-                for (node_load& nl: nodes | std::views::values) {
-                    min_load = std::min(min_load, nl.avg_load);
-                    max_load = std::max(max_load, nl.avg_load);
-                }
-
-                const double load_delta = max_load - min_load;
-                dbglog("load delta is {:.4f}", load_delta);
+                double load_delta = get_load_delta();
                 if (load_delta < 0.002) {
                     dbglog("Balance achieved");
                     break;
@@ -2356,6 +2374,7 @@ public:
 
             // When drain_skipped is true, we already picked movement to a viable target.
             if (!drain_skipped) {
+                dbglog("checking constraints");
                 auto process_skip_info = [&] (migration_tablet_set tablets, skip_info skip) {
                     if (src_node_info.drained && skip.viable_targets.empty()) {
                         auto tablet = tablets.tablets().front();
@@ -2369,6 +2388,7 @@ public:
 
                 auto skip = check_constraints(nodes, tmap, src_node_info, nodes[dst.host], source_tablets, src_node_info.drained);
                 if (skip) {
+                    dbglog("we have skipping");
                     for (auto&& [skip_info, tablets] : *skip) {
                         process_skip_info(tablets, skip_info);
                     }
@@ -2398,6 +2418,7 @@ public:
                 _stats.for_dc(dc).migrations_produced++;
                 plan.add(std::move(mig));
             } else {
+                dbglog("Skipped migration {}", mig);
                 // Shards are overloaded with streaming. Do not include the migration in the plan, but
                 // continue as if it was in the hope that we will find a migration which can be executed without
                 // violating the load. Next make_plan() invocation will notice that the migration was not executed.
@@ -2783,6 +2804,7 @@ public:
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
+            dbglog("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
             auto internode_plan = co_await make_internode_plan(dc, nodes, nodes_to_drain, target);
             dbglog("internode_plan.size() == {}", internode_plan.size());
             plan.merge(std::move(internode_plan));
@@ -3044,6 +3066,7 @@ load_type locator::interpolate(load_type in) {
     };
 
     const std::vector<point> points = {
+        /*
         {0,    0},
         {0.7,  0.7},
         {0.75, 0.8},
@@ -3052,6 +3075,9 @@ load_type locator::interpolate(load_type in) {
         {0.90, 1.8},
         {0.95, 3},
         {1.00, 5},
+        */
+        {0, 0},
+        {1, 1},
     };
 
     size_t idx = 1;

@@ -299,7 +299,6 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
-/*
 struct tablet_size_generator {
     size_t _tablet_count = 0;
 
@@ -311,8 +310,8 @@ struct tablet_size_generator {
         return tests::random::get_int<uint64_t>(0, default_target_tablet_size * 1.8);
     }
 };
-*/
 
+/*
 struct tablet_size_generator {
     std::random_device  _rd;
     std::mt19937        _gen;
@@ -337,6 +336,7 @@ struct tablet_size_generator {
         return _d(_gen) / 2.8;
     }
 };
+*/
 
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
@@ -447,9 +447,9 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 tablet_sizes[gtid] = tablet_size;
 
                 tablet_size_sum += tablet_size;
-                //if (tablet_size > default_target_tablet_size * 2) {
-                //    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
-                //}
+                if (tablet_size > default_target_tablet_size * 2) {
+                    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
+                }
                 return make_ready_future<>();
             }).get();
         }
