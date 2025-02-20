@@ -203,6 +203,13 @@ struct migration_candidate {
     tablet_replica src;
     tablet_replica dst;
     migration_badness badness;
+
+    std::optional<migration_tablet_set> for_swap;
+};
+
+struct picked_candidates {
+    migration_candidate primary;
+    std::optional<migration_candidate> for_swap;
 };
 
 }
@@ -212,6 +219,15 @@ struct fmt::formatter<service::migration_badness> : fmt::formatter<std::string_v
     template <typename FormatContext>
     auto format(const service::migration_badness& badness, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "{{s: {:.4f}, n: {:.4f}}}", badness.shard_badness(), badness.node_badness());
+    }
+};
+
+template<>
+struct fmt::formatter<service::picked_candidates> : fmt::formatter<std::string_view> {
+    template <typename FormatContext>
+    auto format(const service::picked_candidates& candidates, FormatContext& ctx) const {
+        fmt::format_to(ctx.out(), "{} {}", candidates.primary, candidates.for_swap);
+        return ctx.out();
     }
 };
 
@@ -1341,8 +1357,6 @@ public:
         double shard_balance_threshold = std::ceil(desired_load_per_shard);
         auto new_shard_load = node_info.shards[dst.shard].tablet_count_per_table[table] + 1;
         auto dst_shard_badness = (new_shard_load - shard_balance_threshold) / total_load;
-        if (new_shard_load < shard_balance_threshold)
-            dbglog("negative badness; {}", dst_shard_badness);
         lblogger.trace("Table {} @{} shard balance threshold: {}, dst: {} ({:.4f})", table, dst,
                        shard_balance_threshold, new_shard_load, dst_shard_badness);
 
@@ -1545,8 +1559,6 @@ public:
 
     // Adjusts the load of the source and destination shards in the host where intra-node migration happens.
     void update_node_load_on_migration(node_load& node_load, host_id host, shard_id src, shard_id dst, global_tablet_id tablet) {
-        dbglog("update_node_load_on_migration -- for shards");
-
         const uint64_t tablet_size = get_tablet_size(host, tablet);
 
         auto& src_info = node_load.shards[src];
@@ -1894,7 +1906,7 @@ public:
     //
     //   src_node_info.id == src.host
     //   target_info.id == dst.host
-    //   src_node_info.shard_by_load.back() == src.shard
+    //   src_node_info.shards_by_load.back() == src.shard
     //   nodes_by_load_dst.back().id == dst.host
     //
     //   if drain_skipped == true:
@@ -1906,11 +1918,11 @@ public:
     // Invariants:
     //
     //   nodes_by_load_dst[:-1] is a valid heap
-    //   src_node_info.shard_by_load[:-1] is a valid heap
+    //   src_node_info.shards_by_load[:-1] is a valid heap
     //
     // Post-conditions:
     //
-    //   src_node_info.shard_by_load.back() == result.src.shard
+    //   src_node_info.shards_by_load.back() == result.src.shard
     //   nodes_by_load_dst.back().id == result.dst.host
     //   result.tablet is removed from candidate lists in src_node_info.
     //
@@ -2003,12 +2015,12 @@ public:
 
             lblogger.trace("candidate: {}", candidate);
 
-            dbglog("min_dst_badness {}", min_dst_badness);
-
             if (candidate.badness < min_candidate.badness) {
                 min_candidate = candidate;
             }
         };
+
+        uint64_t max_tablet_size = 0;
 
         if (min_candidate.badness.is_bad() && _use_table_aware_balancing) {
             _stats.for_dc(_dc).bad_first_candidates++;
@@ -2049,11 +2061,21 @@ public:
                         continue;
                     }
 
-                    dbglog("number of candidates for table {}:{} == {}",
-                            table, min_src->shard,
-                            src_node_info.shards[min_src->shard].candidates[table].size());
+                    //dbglog("number of candidates for table {}:{} == {}",
+                    //        table, min_src->shard,
+                    //        src_node_info.shards[min_src->shard].candidates[table].size());
 
-                    auto tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
+                    // pick the largest tablet among the candidates for this table
+                    migration_tablet_set tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
+                    max_tablet_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
+                    for (const migration_tablet_set& t : src_node_info.shards[min_src->shard].candidates[table]) {
+                        const uint64_t new_size = get_tablet_size(src_node_info.id, t.tablets().front());
+                        if (new_size < huge_tablet_size_threshold  &&  max_tablet_size < new_size) {
+                            tablet = t;
+                            max_tablet_size = new_size;
+                        }
+                    }
+                    
                     co_await evaluate_targets(tablet, *min_src, min_src_badness);
                     if (!min_candidate.badness.is_bad()) {
                         dbglog("candidate is good; stopping further search");
@@ -2063,13 +2085,34 @@ public:
             }
         }
 
-        dbglog("src_node_info.drained {}", src_node_info.drained);
-        if (!src_node_info.drained && min_candidate.badness.is_bad() && _use_table_aware_balancing) {
-            dbglog("swap !!!");
+        if (!drain_skipped && min_candidate.badness.is_bad() && _use_table_aware_balancing) {
+            // try to swap the tablets
+            node_load& target_node = nodes[min_candidate.dst.host];
+            const table_id table = min_candidate.tablets.tablets().front().table;
+            if (!src_node_info.drained  &&  !target_node.shards[min_candidate.dst.shard].candidates[table].empty()) {
+                // pick the smallest tablet of the same table on the dest shard to make a tablet swap
+                migration_tablet_set tablet = *target_node.shards[min_candidate.dst.shard].candidates[table].begin();
+                uint64_t min_tablet_size = get_tablet_size(target_node.id, tablet.tablets().front());
+                for (const migration_tablet_set& t : target_node.shards[min_candidate.dst.shard].candidates[table]) {
+                    const uint64_t new_size = get_tablet_size(target_info.id, t.tablets().front());
+                    if (min_tablet_size > new_size) {
+                        tablet = t;
+                        min_tablet_size = new_size;
+                    }
+                }
+
+                min_candidate.for_swap = tablet;
+                erase_candidate(target_node.shards[min_candidate.src.shard], min_candidate.tablets);
+
+                dbglog("swapping candidates {} {}", size2gb(min_tablet_size), size2gb(max_tablet_size));
+            } else {
+                dbglog("swapping not possible");
+            }
+        } else {
+            dbglog("best candidate: {}", min_candidate);
         }
 
         lblogger.trace("best candidate: {}", min_candidate);
-        dbglog("best candidate: {}", min_candidate);
 
         if (drain_skipped) {
             src_node_info.skipped_candidates.pop_back();
@@ -2205,9 +2248,6 @@ public:
             }
         }
 
-        std::make_heap(nodes_by_load.begin(), nodes_by_load.end(), nodes_cmp);
-        std::make_heap(nodes_by_load_dst.begin(), nodes_by_load_dst.end(), nodes_dst_cmp);
-
         const tablet_metadata& tmeta = _tm->tablets();
         const locator::topology& topo = _tm->get_topology();
         load_type max_off_candidate_load = 0; // max load among nodes which ran out of candidates.
@@ -2216,6 +2256,9 @@ public:
         size_t skipped_migrations = 0;
         auto shuffle = in_shuffle_mode();
         while (plan.size() < batch_size) {
+            std::make_heap(nodes_by_load.begin(), nodes_by_load.end(), nodes_cmp);
+            std::make_heap(nodes_by_load_dst.begin(), nodes_by_load_dst.end(), nodes_dst_cmp);
+    
             co_await coroutine::maybe_yield();
 
             if (nodes_by_load.empty()) {
@@ -2232,6 +2275,10 @@ public:
 
             bool drain_skipped = src_node_info.shards_by_load.empty() && src_node_info.drained
                     && !src_node_info.skipped_candidates.empty();
+
+            if (drain_skipped) {
+                dbglog("*** draining skipped");
+            }
 
             lblogger.debug("source node: {}, avg_load={:.2f}, skipped={}, drain_skipped={}", src_host,
                            src_node_info.avg_load, src_node_info.skipped_candidates.size(), drain_skipped);
@@ -2310,7 +2357,7 @@ public:
             bool can_check_convergence = !shuffle && nodes_to_drain.empty();
             if (can_check_convergence) {
                 double load_delta = get_load_delta();
-                if (load_delta < 0.002) {
+                if (load_delta < balance_load_delta) {
                     dbglog("Balance achieved");
                     break;
                 }
@@ -2374,7 +2421,6 @@ public:
 
             // When drain_skipped is true, we already picked movement to a viable target.
             if (!drain_skipped) {
-                dbglog("checking constraints");
                 auto process_skip_info = [&] (migration_tablet_set tablets, skip_info skip) {
                     if (src_node_info.drained && skip.viable_targets.empty()) {
                         auto tablet = tablets.tablets().front();
@@ -2393,6 +2439,16 @@ public:
                         process_skip_info(tablets, skip_info);
                     }
                     continue;
+                }
+                // check constraints for the selected swap tablet
+                if (candidate.for_swap.has_value()) {
+                    node_load& target_node = nodes[src.host];
+                    node_load& source_node = nodes[dst.host];
+                    skip = check_constraints(nodes, tmap, source_node, target_node, *candidate.for_swap, source_node.drained);
+                    if (skip) {
+                        dbglog("skipping swap; {} skip info size", skip->size());
+                        candidate.for_swap.reset();
+                    }
                 }
             }
             if (candidate.badness.is_bad()) {
@@ -2434,9 +2490,20 @@ public:
                 }
             }
 
+            if (candidate.for_swap) {
+                mig = get_migration_info(*candidate.for_swap, kind, dst, src);
+                dbglog("Adding swap migration: {}", mig);
+                _stats.for_dc(dc).migrations_produced++;
+                plan.add(std::move(mig));
+            }
+
             erase_candidates(nodes, tmap, source_tablets);
 
             update_node_load_on_migration(nodes, src, dst, source_tablets);
+            if (candidate.for_swap) {
+                update_node_load_on_migration(nodes, dst, src, *candidate.for_swap);
+            }
+
             if (src_node_info.tablet_count == 0) {
                 push_back_node_candidate.cancel();
                 nodes_by_load.pop_back();
@@ -2670,8 +2737,8 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
-            sstring hoststr = ::format("{}", host).substr(0, 1);
-            dbglog("host {} shards {} tablets {} du {} load {:.4f}", hoststr, load.shard_count, load.tablet_count, pprint(load.du), load.avg_load);
+            dbglog("host {:.2} shards {} tablets {} du {} load {:.4f}",
+                    ::format("{}", host), load.shard_count, load.tablet_count, pprint(load.du), load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
             if (!load.drained) {
@@ -2804,7 +2871,6 @@ public:
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
-            dbglog("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
             auto internode_plan = co_await make_internode_plan(dc, nodes, nodes_to_drain, target);
             dbglog("internode_plan.size() == {}", internode_plan.size());
             plan.merge(std::move(internode_plan));

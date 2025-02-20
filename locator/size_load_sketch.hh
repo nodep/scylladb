@@ -13,15 +13,17 @@
 #include "locator/tablets.hh"
 #include "utils/stall_free.hh"
 #include "utils/extremum_tracking.hh"
+#include "utils/div_ceil.hh"
 
 #include <optional>
 #include <vector>
 
 namespace locator {
 
-constexpr double count_influence = 1;
+constexpr double count_influence = 0;
 constexpr size_t ideal_tablet_count = 100;
-//constexpr double balance_disk_usage_delta = 2;
+constexpr double balance_load_delta = .002;
+constexpr double huge_tablet_size_threshold = 5UL * 1024 * 1024 * 1024 * 10;
 
 using load_type = double;
 
@@ -134,28 +136,30 @@ private:
                     if (only_dc && node->dc_rack().dc != *only_dc) {
                         continue;
                     }
-                    node_load nl{node->get_shard_count(), host_load.get_sum()};
+                    locator::disk_usage du = host_load.get_sum();
+                    du.used = 0;
+                    node_load nl{node->get_shard_count(), du};
                     for (shard_id sid = 0; sid < nl._shards.size(); sid++) {
                         nl._shards[sid].du.capacity = host_load.usage_by_shard.at(sid).capacity;
                     }
                     _nodes.emplace(replica.host, nl);
                 }
                 node_load& n = _nodes.at(replica.host);
+                // find the tablet
+                dht::token last_token = tmap.get_last_token(tid);
+                temporal_tablet_id ttablet_id {table, last_token};
+                auto tsi = host_load.tablet_sizes.find(ttablet_id);
+                if (tsi == host_load.tablet_sizes.end()) {
+                    throw std::runtime_error(::format("table {} last_token {} not found", table, last_token));
+                }
+                const uint64_t tablet_size = tsi->second;
                 if (replica.shard < n._shards.size()) {
                     n._tablet_count += 1;
                     n._shards[replica.shard].tablet_count += 1;
-
-                    // find the tablet
-                    dht::token last_token = tmap.get_last_token(tid);
-                    temporal_tablet_id ttablet_id {table, last_token};
-                    auto tsi = host_load.tablet_sizes.find(ttablet_id);
-                    if (tsi == host_load.tablet_sizes.end()) {
-                        throw std::runtime_error(::format("table {} last_token {} not found", table, last_token));
-                    }
-                    const uint64_t tablet_size = tsi->second;
                     n._shards[replica.shard].du.used += tablet_size;
                 }
-            }
+                n._du.used += tablet_size;
+        }
             return make_ready_future<>();
         });
     }
@@ -195,7 +199,9 @@ public:
             if (shard_count == 0) {
                 throw std::runtime_error(format("Shard count not known for node {}", node));
             }
-            auto [i, _] = _nodes.emplace(node, node_load{shard_count, _cluster_du->at(node).get_sum()});
+            locator::disk_usage du = _cluster_du->at(node).get_sum();
+            du.used = 0;
+            auto [i, _] = _nodes.emplace(node, node_load{shard_count, du});
             i->second.populate_shards_by_load();
         }
         return _nodes.at(node);
@@ -221,6 +227,11 @@ public:
         n.update_shard_load(shard, 1, size);
     }
 
+    const disk_usage& get_disk_usage(host_id node) {
+        node_load& nl = ensure_node(node);
+        return nl._du;
+    } 
+    
     load_type get_load(host_id node) const {
         if (!_nodes.contains(node)) {
             return 0;
@@ -242,6 +253,14 @@ public:
         }
         auto& n = _nodes.at(node);
         return n.load() / n._shards.size();
+    }
+
+    double get_real_avg_shard_load(host_id node) const {
+        if (!_nodes.contains(node)) {
+            return 0;
+        }
+        auto& n = _nodes.at(node);
+        return double(n.load()) / n._shards.size();
     }
 
     shard_id get_shard_count(host_id node) const {

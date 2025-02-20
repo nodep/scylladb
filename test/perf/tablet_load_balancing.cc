@@ -19,6 +19,7 @@
 #include "service/tablet_allocator.hh"
 #include "locator/tablet_replication_strategy.hh"
 #include "locator/network_topology_strategy.hh"
+#include "locator/size_load_sketch.hh"
 #include "locator/load_sketch.hh"
 #include "replica/tablets.hh"
 #include "locator/tablet_replication_strategy.hh"
@@ -51,7 +52,8 @@ cql_test_config tablet_cql_test_config() {
 
 static
 future<table_id> add_table(cql_test_env& e) {
-    auto id = table_id(utils::UUID_gen::get_time_UUID());
+    static char cnt = 10;
+    auto id = table_id(utils::UUID(::format("{:x}0000000-0000-0000-0000-000000000000", cnt++)));
     co_await e.create_table([id] (std::string_view ks_name) {
         return *schema_builder(ks_name, id.to_sstring(), id)
                 .with_column("p1", utf8_type, column_kind::partition_key)
@@ -247,6 +249,7 @@ struct params {
     int shards;
     int scale1 = 1;
     int scale2 = 1;
+    std::optional<unsigned> seed;
 };
 
 struct table_balance {
@@ -302,12 +305,24 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
 struct tablet_size_generator {
     size_t _tablet_count = 0;
 
+    tablet_size_generator(std::optional<unsigned> seed = std::nullopt) {
+        const size_t used_seed = seed.value_or(time(NULL));
+        dbglog("random seed: {}", used_seed);
+        srand(used_seed);
+    }
+
+    uint64_t get(uint64_t range_min, uint64_t range_max) {
+        const double range = range_max - range_min;
+        const double factor = range / RAND_MAX;
+        return uint64_t(range_min + rand() * factor);
+    }
+
     uint64_t generate() {
         ++_tablet_count;
         if (_tablet_count % 1000 == 0) {
-            return tests::random::get_int<uint64_t>(default_target_tablet_size * 60, default_target_tablet_size * 70);
+            return get(default_target_tablet_size * 60, default_target_tablet_size * 70);
         }
-        return tests::random::get_int<uint64_t>(0, default_target_tablet_size * 1.8);
+        return get(0, default_target_tablet_size * 2);
     }
 };
 
@@ -354,14 +369,16 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
         int host_seq = 1;
         auto add_host = [&] {
-            hosts.push_back(host_id(utils::UUID(::format("{:x}0000000-0000-0000-0000-000000000000", host_seq))));
+            hosts.push_back(host_id(utils::UUID(::format("{:02x}0000000-0000-0000-0000-000000000000", host_seq))));
             ips.push_back(inet_address(format("192.168.0.{}", host_seq++)));
             testlblog.info("Added new node: {} ({})", hosts.back(), ips.back());
         };
 
+        dht::token t{0};
         auto add_host_to_topology = [&] (token_metadata& tm, int i) -> future<> {
             tm.update_topology(hosts[i], rack1, node::state::normal, shard_count);
-            co_await tm.update_normal_tokens(std::unordered_set{token(tests::d2t(float(i) / hosts.size()))}, hosts[i]);
+            t._data += 10000;
+            co_await tm.update_normal_tokens(std::unordered_set{t}, hosts[i]);
         };
 
         for (int i = 0; i < n_hosts; ++i) {
@@ -430,24 +447,18 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         allocate(s2, p.rf2, p.tablets2);
 
         // allocate sizes to tablets
-        tablet_size_generator tsg;
+        tablet_size_generator tsg(p.seed);
         uint64_t tablet_size_sum = 0;
         for (auto&& [table, tmap_] : stm.get()->tablets().all_tables()) {
             auto& tmap = *tmap_;
             tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
-                // uniform distribution
-                // const uint64_t tablet_size = tests::random::get_int<uint64_t>(0, default_target_tablet_size * 2);
-
                 // more realistic distribution
                 const uint64_t tablet_size = tsg.generate();
                 global_tablet_id gtid{table, tid};
-                if (tablet_sizes.contains(gtid)) {
-                    dbglog("we had this!!! {}", gtid);
-                }
                 tablet_sizes[gtid] = tablet_size;
 
                 tablet_size_sum += tablet_size;
-                if (tablet_size > default_target_tablet_size * 2) {
+                if (tablet_size > default_target_tablet_size * 4) {
                     dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
                 }
                 return make_ready_future<>();
@@ -463,8 +474,11 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
             int table_index = 0;
             for (auto s : {s1, s2}) {
+                locator::cluster_disk_usage disk_usage = calc_disk_usage(stm.get(), tablet_sizes);
+                size_load_sketch size_load(stm.get(), disk_usage);
                 load_sketch load(stm.get());
                 load.populate(std::nullopt, s->id()).get();
+                size_load.populate(std::nullopt, s->id()).get();
 
                 min_max_tracker<uint64_t> shard_load_minmax;
                 min_max_tracker<uint64_t> node_load_minmax;
@@ -477,8 +491,13 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                     auto overcommit = double(minmax.max()) / avg_shard_load;
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);
-                    testlblog.info("Load on host {} for table {}: total={}, min={}, max={}, spread={}, avg={:.2f}, overcommit={:.2f}",
-                                 h, s->cf_name(), node_load, minmax.min(), minmax.max(), minmax.max() - minmax.min(), avg_shard_load, overcommit);
+                    const locator::disk_usage& du = size_load.get_disk_usage(h);
+                    testlblog.info("Load on host {:.2} for table {:.1}: total={}, min={}, max={}, spread={}, avg={:.2f}, size={}, overcommit={:.2f}",
+                                 ::format("{}", h), s->cf_name(), node_load, minmax.min(), minmax.max(), minmax.max() - minmax.min(), avg_shard_load, size2gb(du.used), overcommit);
+                    //const auto& shards = load.ensure_node(h)._shards;
+                    //for (size_t i = 0; i < shards.size(); i++) {
+                    //    testlblog.info("   shard load {} {}", i, shards[i]);
+                    //}
                     node_load_minmax.update(node_load);
                     sum_node_load += node_load;
                 }
@@ -551,6 +570,7 @@ future<> run_simulation(const params& p, const sstring& name = "") {
         testlblog.warn("[run {}] Scheduling took longer than 1s!", name);
     }
 
+    /*
     auto old_res = co_await test_load_balancing_with_many_tables(p, false);
     testlblog.info("[run {}] Overcommit (old) : init : {}", name, old_res.init);
     testlblog.info("[run {}] Overcommit (old) : worst: {}", name, old_res.worst);
@@ -567,6 +587,7 @@ future<> run_simulation(const params& p, const sstring& name = "") {
             testlblog.warn("[run {}] table{} shard overcommit {:.2f} > 1.2!", name, i + 1, overcommit);
         }
     }
+    */
 }
 
 future<> run_simulations(const boost::program_options::variables_map& app_cfg) {
@@ -608,6 +629,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
             ("rf1", bpo::value<int>(), "Replication factor for the first table.")
             ("rf2", bpo::value<int>(), "Replication factor for the second table.")
             ("shards", bpo::value<int>(), "Number of shards per node.")
+            ("seed", bpo::value<int>(), "Random seed.")
             ("verbose", "Enables standard logging")
             ;
     return app.run(argc, argv, [&] {
@@ -636,6 +658,10 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                         .rf2 = app.configuration()["rf2"].as<int>(),
                         .shards = app.configuration()["shards"].as<int>(),
                     };
+
+                    if (app.configuration().count("seed")) {
+                        p.seed = app.configuration()["seed"].as<int>();
+                    }
                     run_simulation(p).get();
                 }
             } catch (seastar::abort_requested_exception&) {
