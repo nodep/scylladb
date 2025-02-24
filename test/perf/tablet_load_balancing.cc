@@ -163,6 +163,76 @@ locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::un
     return disk_usage;
 }
 
+locator::disk_usage host_load_stats::get_sum() const {
+    disk_usage result;
+    for (const disk_usage& du: usage_by_shard | std::views::values) {
+        result.used += du.used;
+        result.capacity += du.capacity;
+    }
+    return result;
+}
+
+sstring size2gb(uint64_t size, int decimals) {
+    return std::format("{:.{}f} Gb", size / 1024.0 / 1024.0 / 1024.0, decimals);
+}
+
+sstring pprint(const locator::disk_usage& du) {
+    return ::format("{} {} {:.2f}%", size2gb(du.used, 0), size2gb(du.capacity, 0), (du.used * 100.0) / du.capacity);
+}
+
+load_type locator::interpolate(load_type in) {
+    struct point {
+        double in = 0;
+        double out = 0;
+    };
+
+    const std::vector<point> points = {
+        /*
+        {0,    0},
+        {0.7,  0.7},
+        {0.75, 0.8},
+        {0.80, 0.95},
+        {0.85, 1.2},
+        {0.90, 1.8},
+        {0.95, 3},
+        {1.00, 5},
+        */
+        {0, 0},
+        {1, 1},
+    };
+
+    size_t idx = 1;
+    while ((idx < points.size() - 1) && (points[idx].in < in)) {
+        idx++;
+    }
+
+    const point& p = points[idx];
+    const point& last = points[idx - 1];
+
+    return last.out + (in - last.in) * (p.out - last.out)/(p.in - last.in);
+}
+
+load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
+    load_type disk_used = load_type(disk_usage.used) / disk_usage.capacity;
+    load_type count_load = tablet_count / load_type(ideal_tablet_count * n_shards);
+    load_type size_load = interpolate(disk_used);
+
+    return size_load * (1 - count_influence) + count_load * count_influence;
+}
+
+void size_load_sketch::dump()
+{
+    testlblog.info("****** dumping sketch");
+    for (const auto& [host, node]: _nodes) {
+        testlblog.info("*** host {} tablets {} shards {} du {} load {:.3f}",
+                host, node._tablet_count, node._shards.size(), pprint(node._du), node._load);
+        for (size_t i = 0; i < node._shards_by_load.size(); i++) {
+            const shard_load& sl = node._shards[node._shards_by_load[i]];
+            testlblog.info("   shard {} count {} size {} load {:.3f}", node._shards_by_load[i], sl.tablet_count, size2gb(sl.du.used), sl.load);
+        }
+    }
+}
+
 static
 rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadata& stm, const std::unordered_map<global_tablet_id, uint64_t>& tablet_sizes,
                                     locator::load_stats_ptr load_stats = {}, std::unordered_set<host_id> skiplist = {}) {
