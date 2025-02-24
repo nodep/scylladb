@@ -33,6 +33,7 @@ using namespace replica;
 namespace service {
 
 seastar::logger lblogger("load_balancer");
+seastar::logger lbsimlog("lbsimlog");
 
 void load_balancer_stats_manager::setup_metrics(const dc_name& dc, load_balancer_dc_stats& stats) {
     namespace sm = seastar::metrics;
@@ -457,8 +458,8 @@ class load_balancer {
         // Call when tablet_count changes.
         void update() {
             avg_load = compute_load(du, tablet_count, shard_count);
-            //dbglog("lb update for {} load {} used {} capacity {} tablets {} shards {}",
-            //        id, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
+            //lbsimlog.info("lb update for {} load {} used {} capacity {} tablets {} shards {}",
+            //        zid, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
         }
 
         load_type get_avg_load(int tablets, uint64_t tablet_sizes) const {
@@ -732,7 +733,7 @@ public:
         const locator::topology& topo = _tm->get_topology();
         migration_plan plan;
 
-        dbglog("kujemo plan...");
+        lbsimlog.info("kujemo plan...");
 
         // Prepare plans for each DC separately and combine them to be executed in parallel.
         for (auto&& dc : topo.get_datacenters()) {
@@ -770,7 +771,7 @@ public:
         temporal_tablet_id ttablet_id {gtid.table, last_token};
         const host_load_stats& host_load = _cluster_du.at(host);
         if (!host_load.tablet_sizes.contains(ttablet_id)) {
-            dbglog("tablet {}:{} on host {} not found", gtid.table, last_token, host);
+            lbsimlog.info("tablet {}:{} on host {} not found", gtid.table, last_token, host);
         }
         return host_load.tablet_sizes.at(ttablet_id);
         return _target_tablet_size;
@@ -2061,7 +2062,7 @@ public:
                         continue;
                     }
 
-                    //dbglog("number of candidates for table {}:{} == {}",
+                    //lbsimlog.info("number of candidates for table {}:{} == {}",
                     //        table, min_src->shard,
                     //        src_node_info.shards[min_src->shard].candidates[table].size());
 
@@ -2078,7 +2079,7 @@ public:
                     
                     co_await evaluate_targets(tablet, *min_src, min_src_badness);
                     if (!min_candidate.badness.is_bad()) {
-                        dbglog("candidate is good; stopping further search");
+                        lbsimlog.info("candidate is good; stopping further search");
                         break;
                     }
                 }
@@ -2104,12 +2105,12 @@ public:
                 min_candidate.for_swap = tablet;
                 erase_candidate(target_node.shards[min_candidate.src.shard], min_candidate.tablets);
 
-                dbglog("swapping candidates {} {}", size2gb(min_tablet_size), size2gb(max_tablet_size));
+                lbsimlog.info("swapping candidates {} {}", size2gb(min_tablet_size), size2gb(max_tablet_size));
             } else {
-                dbglog("swapping not possible");
+                lbsimlog.info("swapping not possible");
             }
         } else {
-            dbglog("best candidate: {}", min_candidate);
+            lbsimlog.info("best candidate: {}", min_candidate);
         }
 
         lblogger.trace("best candidate: {}", min_candidate);
@@ -2191,7 +2192,7 @@ public:
 
             const double disk_usage_delta_perc = (max_usage_perc - min_usage_perc) * 100;
             //if (disk_usage_delta_perc < balance_disk_usage_delta) {
-            //    dbglog("Balance achieved");
+            //    lbsimlog.info("Balance achieved");
             //    break;
             //}
 
@@ -2204,7 +2205,7 @@ public:
             }
 
             const double load_delta = max_load - min_load;
-            dbglog("load delta is {:.4f} disk usage delta is {:.2f}%", load_delta, disk_usage_delta_perc);
+            lbsimlog.info("load delta is {:.4f} disk usage delta is {:.2f}%", load_delta, disk_usage_delta_perc);
 
             return load_delta;
         };
@@ -2277,7 +2278,7 @@ public:
                     && !src_node_info.skipped_candidates.empty();
 
             if (drain_skipped) {
-                dbglog("*** draining skipped");
+                lbsimlog.info("*** draining skipped");
             }
 
             lblogger.debug("source node: {}, avg_load={:.2f}, skipped={}, drain_skipped={}", src_host,
@@ -2358,7 +2359,7 @@ public:
             if (can_check_convergence) {
                 double load_delta = get_load_delta();
                 if (load_delta < balance_load_delta) {
-                    dbglog("Balance achieved");
+                    lbsimlog.info("Balance achieved");
                     break;
                 }
 
@@ -2411,11 +2412,11 @@ public:
 
             auto& tmap = tmeta.get_tablet_map(source_tablets.table());
             // If best candidate is co-located sibling tablets, then convergence is re-checked to avoid oscillations.
-            //if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
-            //    lblogger.debug("No more candidates. Load would be inverted.");
-            //    _stats.for_dc(dc).stop_load_inversion++;
-            //    break;
-            //}
+            if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
+                lblogger.debug("No more candidates. Load would be inverted.");
+                _stats.for_dc(dc).stop_load_inversion++;
+                break;
+            }
 
             // Check replication strategy constraints.
 
@@ -2434,7 +2435,7 @@ public:
 
                 auto skip = check_constraints(nodes, tmap, src_node_info, nodes[dst.host], source_tablets, src_node_info.drained);
                 if (skip) {
-                    dbglog("we have skipping");
+                    lbsimlog.info("we have skipping");
                     for (auto&& [skip_info, tablets] : *skip) {
                         process_skip_info(tablets, skip_info);
                     }
@@ -2446,7 +2447,7 @@ public:
                     node_load& source_node = nodes[dst.host];
                     skip = check_constraints(nodes, tmap, source_node, target_node, *candidate.for_swap, source_node.drained);
                     if (skip) {
-                        dbglog("skipping swap; {} skip info size", skip->size());
+                        lbsimlog.info("skipping swap; {} skip info size", skip->size());
                         candidate.for_swap.reset();
                     }
                 }
@@ -2470,11 +2471,11 @@ public:
             if (can_accept_load(nodes, mig_streaming_info)) {
                 apply_load(nodes, mig_streaming_info);
                 lblogger.debug("Adding migration: {}", mig);
-                dbglog("Adding migration: {}", mig);
+                lbsimlog.info("Adding migration: {}", mig);
                 _stats.for_dc(dc).migrations_produced++;
                 plan.add(std::move(mig));
             } else {
-                dbglog("Skipped migration {}", mig);
+                lbsimlog.info("Skipped migration {}", mig);
                 // Shards are overloaded with streaming. Do not include the migration in the plan, but
                 // continue as if it was in the hope that we will find a migration which can be executed without
                 // violating the load. Next make_plan() invocation will notice that the migration was not executed.
@@ -2492,7 +2493,7 @@ public:
 
             if (candidate.for_swap) {
                 mig = get_migration_info(*candidate.for_swap, kind, dst, src);
-                dbglog("Adding swap migration: {}", mig);
+                lbsimlog.info("Adding swap migration: {}", mig);
                 _stats.for_dc(dc).migrations_produced++;
                 plan.add(std::move(mig));
             }
@@ -2737,7 +2738,7 @@ public:
         std::optional<host_id> min_load_node = std::nullopt;
         for (auto&& [host, load] : nodes) {
             load.update();
-            dbglog("host {:.2} shards {} tablets {} du {} load {:.4f}",
+            lbsimlog.info("host {:.2} shards {} tablets {} du {} load {:.4f}",
                     ::format("{}", host), load.shard_count, load.tablet_count, pprint(load.du), load.avg_load);
             _stats.for_node(dc, host).load = load.avg_load;
 
@@ -2866,13 +2867,13 @@ public:
             _tablet_count_per_table[table] = total_load;
         }
 
-        dbglog("max_load {:.4f} min_load {:.4f}", max_load, min_load);
+        lbsimlog.info("max_load {:.4f} min_load {:.4f}", max_load, min_load);
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
             auto internode_plan = co_await make_internode_plan(dc, nodes, nodes_to_drain, target);
-            dbglog("internode_plan.size() == {}", internode_plan.size());
+            lbsimlog.info("internode_plan.size() == {}", internode_plan.size());
             plan.merge(std::move(internode_plan));
         } else {
             _stats.for_dc(dc).stop_balance++;
@@ -3163,4 +3164,17 @@ load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_coun
     load_type size_load = interpolate(disk_used);
 
     return size_load * (1 - count_influence) + count_load * count_influence;
+}
+
+void size_load_sketch::dump()
+{
+    service::lbsimlog.info("****** dumping sketch");
+    for (const auto& [host, node]: _nodes) {
+        service::lbsimlog.info("*** host {} tablets {} shards {} du {} load {:.3f}",
+                host, node._tablet_count, node._shards.size(), pprint(node._du), node._load);
+        for (size_t i = 0; i < node._shards_by_load.size(); i++) {
+            const shard_load& sl = node._shards[node._shards_by_load[i]];
+            service::lbsimlog.info("   shard {} count {} size {} load {:.3f}", node._shards_by_load[i], sl.tablet_count, size2gb(sl.du.used), sl.load);
+        }
+    }
 }

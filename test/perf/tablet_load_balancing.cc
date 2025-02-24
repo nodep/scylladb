@@ -110,11 +110,15 @@ struct rebalance_stats {
     seconds_double elapsed_time = seconds_double(0);
     seconds_double max_rebalance_time = seconds_double(0);
     uint64_t rebalance_count = 0;
+    uint64_t migrated_gb = 0;
+    uint64_t migrated_tablets = 0;
 
     rebalance_stats& operator+=(const rebalance_stats& other) {
         elapsed_time += other.elapsed_time;
         max_rebalance_time = std::max(max_rebalance_time, other.max_rebalance_time);
         rebalance_count += other.rebalance_count;
+        migrated_gb += other.migrated_gb;
+        migrated_tablets += other.migrated_tablets;
         return *this;
     }
 };
@@ -170,15 +174,15 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
 
     /*
     auto log_state = [&] (sstring header, const locator::cluster_disk_usage& disk_usage) {
-        dbglog("{}", header);
+        testlblog.info("{}", header);
         uint64_t umin = std::numeric_limits<uint64_t>::max();
         uint64_t umax = std::numeric_limits<uint64_t>::min();
         for (auto [host, host_usage]: disk_usage) {
-            dbglog("host: {}", host);
+            testlblog.info("host: {}", host);
             for (auto [shard, shard_usage]: host_usage.usage_by_shard) {
                 umin = std::min(shard_usage.used, umin);
                 umax = std::max(shard_usage.used, umax);
-                dbglog("    shard: {} usage: {} capacity: {}", shard, size2gb(shard_usage.used), size2gb(shard_usage.capacity));
+                testlblog.info("    shard: {} usage: {} capacity: {}", shard, size2gb(shard_usage.used), size2gb(shard_usage.capacity));
             }
         }
 
@@ -192,8 +196,8 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
                 return make_ready_future<>();
             }).get();
         }
-        dbglog("shard min/max: {}/{}", size2gb(umin), size2gb(umax));
-        dbglog("tablet min/max: {}/{}", size2gb(tmin), size2gb(tmax));
+        testlblog.info("shard min/max: {}/{}", size2gb(umin), size2gb(umax));
+        testlblog.info("tablet min/max: {}/{}", size2gb(tmin), size2gb(tmax));
     };
     */
 
@@ -208,14 +212,20 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         auto end_time = std::chrono::steady_clock::now();
         auto lb_stats = talloc.stats().for_dc(dc) - prev_lb_stats;
 
+        uint64_t migrated_total = 0;
+        for (const tablet_migration_info& tmi : plan.migrations()) {
+            migrated_total += tablet_sizes.at(tmi.tablet);
+        }
         auto elapsed = std::chrono::duration_cast<seconds_double>(end_time - start_time);
         rebalance_stats iteration_stats = {
             .elapsed_time = elapsed,
             .max_rebalance_time = elapsed,
             .rebalance_count = 1,
+            .migrated_gb = migrated_total,
+            .migrated_tablets = plan.size(),
         };
         stats += iteration_stats;
-        testlblog.debug("Rebalance iteration {} took {:.3f} [s]: mig={}, bad={}, first_bad={}, eval={}, skiplist={}, skip: (load={}, rack={}, node={})",
+        testlblog.info("Rebalance iteration {} took {:.3f} [s]: mig={}, bad={}, first_bad={}, eval={}, skiplist={}, skip: (load={}, rack={}, node={})",
                       i + 1, elapsed.count(),
                       lb_stats.migrations_produced,
                       lb_stats.bad_migrations,
@@ -227,7 +237,8 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
                       lb_stats.tablets_skipped_node);
 
         if (plan.empty()) {
-            testlblog.info("Rebalance took {:.3f} [s] after {} iteration(s)", stats.elapsed_time.count(), i + 1);
+            testlblog.info("Rebalance took {:.3f} [s] after {} iteration(s), tablets moved: {} {}",
+                            stats.elapsed_time.count(), i + 1, stats.migrated_tablets, size2gb(stats.migrated_gb));
             //log_state("******************** after", calc_disk_usage(stm.get(), tablet_sizes));
             return stats;
         }
@@ -307,7 +318,7 @@ struct tablet_size_generator {
 
     tablet_size_generator(std::optional<unsigned> seed = std::nullopt) {
         const size_t used_seed = seed.value_or(time(NULL));
-        dbglog("random seed: {}", used_seed);
+        testlblog.info("random seed: {}", used_seed);
         srand(used_seed);
     }
 
@@ -459,13 +470,13 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
                 tablet_size_sum += tablet_size;
                 if (tablet_size > default_target_tablet_size * 4) {
-                    dbglog("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
+                    testlblog.info("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
                 }
                 return make_ready_future<>();
             }).get();
         }
 
-        dbglog("created {} tablet sizes; avg size: {}", tablet_sizes.size(), size2gb(tablet_size_sum / tablet_sizes.size()));
+        testlblog.info("created {} tablet sizes; avg size: {}", tablet_sizes.size(), size2gb(tablet_size_sum / tablet_sizes.size()));
 
         auto check_balance = [&] () -> cluster_balance {
             cluster_balance res;
@@ -492,7 +503,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);
                     const locator::disk_usage& du = size_load.get_disk_usage(h);
-                    testlblog.info("Load on host {:.2} for table {:.1}: total={}, min={}, max={}, spread={}, avg={:.2f}, size={}, overcommit={:.2f}",
+                    testlblog.info("Load on {:.2} for {:.1}: total={}, min={}, max={}, spread={}, avg={:.2f}, size={}, overcommit={:.2f}",
                                  ::format("{}", h), s->cf_name(), node_load, minmax.min(), minmax.max(), minmax.max() - minmax.min(), avg_shard_load, size2gb(du.used), overcommit);
                     //const auto& shards = load.ensure_node(h)._shards;
                     //for (size_t i = 0; i < shards.size(); i++) {
@@ -638,7 +649,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                 auto testlog_level = logging::logger_registry().get_logger_level("testlblog");
                 logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
                 logging::logger_registry().set_logger_level("testlblog", testlog_level);
-                logging::logger_registry().set_logger_level(yellow("dbglog"), seastar::log_level::info);
+                //logging::logger_registry().set_logger_level("lbsimlog", seastar::log_level::info);
             }
             engine().at_exit([] {
                 aborted.request_abort();
