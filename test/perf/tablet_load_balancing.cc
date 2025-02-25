@@ -627,11 +627,17 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             size_load_sketch size_load(stm.get(), disk_usage);
             size_load.populate(std::nullopt).get();
 
+            min_max_tracker<double> node_load_minmax;
             for (auto h: hosts) {
                 auto node_du = size_load.get_disk_usage(h);
+                double node_load = 100.0 * node_du.used / node_du.capacity;
                 testlblog.info("Node load {:.2} used={} cap={} disk_load={:5.1f}%",
-                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), 100.0 * node_du.used / node_du.capacity);
+                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), node_load);
+                node_load_minmax.update(node_load);
             }
+
+            testlblog.info("Nodes load min={:5.1f}% max={:5.1f}% spread={:5.1f}%",
+                    node_load_minmax.min(), node_load_minmax.max(), node_load_minmax.max() - node_load_minmax.min());
 
             /*
             for (int i = 0; i < nr_tables; i++) {
