@@ -22,7 +22,7 @@ namespace locator {
 
 constexpr double count_influence = 0;
 constexpr size_t ideal_tablet_count = 100;
-constexpr double balance_load_delta = .002;
+constexpr double balance_load_delta = .005;
 constexpr double huge_tablet_size_threshold = 5UL * 1024 * 1024 * 1024 * 10;
 
 using load_type = double;
@@ -290,6 +290,13 @@ public:
     }
 
     void dump();
+
+    locator::disk_usage get_disk_usage(host_id node) const {
+        if (!_nodes.contains(node)) {
+            return {};
+        }
+        return _nodes.at(node)._du;
+    }
 };
 
 } // namespace locator
