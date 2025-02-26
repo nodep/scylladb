@@ -23,7 +23,19 @@ namespace locator {
 constexpr double count_influence = 0;
 constexpr size_t ideal_tablet_count = 100;
 constexpr double balance_load_delta = .005;
-constexpr double huge_tablet_size_threshold = 5UL * 1024 * 1024 * 1024 * 10;
+constexpr uint64_t huge_tablet_size_threshold = 5UL * 1024 * 1024 * 1024 * 10;
+
+inline sstring brief(host_id h) {
+    return ::format("{:.2}", ::format("{}", h));
+}
+
+inline sstring brief(table_id t) {
+    return ::format("{:.2}", ::format("{}", t));
+}
+
+inline sstring brief(global_tablet_id gt) {
+    return ::format("{}:{}", brief(gt.table), gt.tablet);
+}
 
 using load_type = double;
 

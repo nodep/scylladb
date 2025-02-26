@@ -131,10 +131,10 @@ uint64_t get_shard_capacity(host_id h) {
         650UL * 1024 * 1024 * 1024,
     };
 
-    const uint64_t i = abs(h.id.get_most_significant_bits() >> 56);
-    const uint64_t capacity = capacities[i % capacities.size()];
+    //const uint64_t i = abs(h.id.get_most_significant_bits() >> 56);
+    //const uint64_t capacity = capacities[i % capacities.size()];
 
-    return capacity;
+    return capacities[3];
 }
 
 locator::cluster_disk_usage get_cluster_with_capacities(token_metadata_ptr tm) {
@@ -339,6 +339,11 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
             //log_state("******************** after", calc_disk_usage(stm.get(), tablet_sizes));
             return stats;
         }
+
+        //dbglogblue("plan size {}", plan.size());
+        //for (const tablet_migration_info& tmi : plan.migrations()) {
+        //    dbglogblue("migrating {} from {} to {}", brief(tmi.tablet), brief(tmi.src.host), brief(tmi.dst.host));
+        //}
         stm.mutate_token_metadata([&] (token_metadata& tm) {
             apply_plan(tm, plan);
             return make_ready_future<>();
@@ -427,8 +432,8 @@ struct tablet_size_generator {
 
     uint64_t generate() {
         ++_tablet_count;
-        if (_tablet_count % 1000 == 0) {
-            return get(default_target_tablet_size * 60, default_target_tablet_size * 70);
+        if (_tablet_count % 100 == 0) {
+            return get(huge_tablet_size_threshold, huge_tablet_size_threshold * 5);
         }
         return get(0, default_target_tablet_size * 2);
     }
