@@ -192,7 +192,7 @@ sstring size2gb(uint64_t size, int decimals) {
 }
 
 sstring pprint(const locator::disk_usage& du) {
-    return ::format("{} {} {:.2f}%", size2gb(du.used, 0), size2gb(du.capacity, 0), (du.used * 100.0) / du.capacity);
+    return ::format("{} {} {:.2f}%", size2gb(du.used), size2gb(du.capacity), (du.used * 100.0) / du.capacity);
 }
 
 load_type locator::interpolate(load_type in) {
@@ -303,7 +303,7 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         check_usage(disk_usage);
 
         auto start_time = std::chrono::steady_clock::now();
-        auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist, disk_usage).get();
+        auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist, disk_usage, true).get();
         auto end_time = std::chrono::steady_clock::now();
         auto lb_stats = talloc.stats().for_dc(dc) - prev_lb_stats;
 
@@ -339,7 +339,11 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         }
 
         dbglogblue("plan size {}", plan.size());
-        for (const tablet_migration_info& tmi : plan.migrations()) {
+        migration_plan::migrations_vector mv = plan.migrations();
+        std::sort(mv.begin(), mv.end(), [] (const tablet_migration_info& l, const tablet_migration_info& r) {
+            return l.tablet < r.tablet;
+        });
+        for (const tablet_migration_info& tmi : mv) {
             dbglogblue("migrating {} from {} to {}", brief(tmi.tablet), brief(tmi.src), brief(tmi.dst));
         }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
@@ -430,8 +434,11 @@ struct tablet_size_generator {
 
     uint64_t generate() {
         ++_tablet_count;
-        if (_tablet_count % 100 == 0) {
+        if (_tablet_count % 1000 == 0) {
             return get(huge_tablet_size_threshold, huge_tablet_size_threshold * 5);
+        }
+        if (_tablet_count % 51 == 0) {
+            return get(default_target_tablet_size * 2, huge_tablet_size_threshold);
         }
         return get(0, default_target_tablet_size * 2);
     }
@@ -571,7 +578,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
                 tablet_size_sum += tablet_size;
                 total_table_size += tablet_size;
-                if (tablet_size > default_target_tablet_size * 4) {
+                if (tablet_size >= huge_tablet_size_threshold) {
                     testlblog.info("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
                 }
                 return make_ready_future<>();
@@ -616,7 +623,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 }
 
                 auto node_imbalance = node_load_minmax.max() - node_load_minmax.min();
-                testlblog.info("Table node imbalance: min={:5.1f}%, max={:5.1f}%, spread={:5.1f}%",
+                testlblog.info("Table node imbalance: min={:5.1f}%, max={:5.1f}%, spread={:6.2f}%",
                               node_load_minmax.min(), node_load_minmax.max(), node_imbalance);
 
                 res.tables[table_index++] = {
@@ -765,7 +772,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                 auto testlog_level = logging::logger_registry().get_logger_level("testlblog");
                 logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
                 logging::logger_registry().set_logger_level("testlblog", testlog_level);
-                logging::logger_registry().set_logger_level(yellow("dbglog"), seastar::log_level::info);
+                //logging::logger_registry().set_logger_level(yellow("dbglog"), seastar::log_level::info);
             }
             engine().at_exit([] {
                 aborted.request_abort();
