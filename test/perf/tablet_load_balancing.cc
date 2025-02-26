@@ -169,9 +169,7 @@ locator::cluster_disk_usage calc_disk_usage(token_metadata_ptr tm, const std::un
                 temporal_tablet_id ttablet_id {table, last_token};
                 host_load.tablet_sizes[ttablet_id] = size;
 
-                //auto h = ::format("{}", replica.host);
-                //auto t = ::format("{}", table);
-                //dbglog("{:.2} {:.2}:{} {}", h, t, tid, size2gb(size));
+                //dbglog("{} {} {}", brief(replica.host), brief(global_tablet_id{table, tid}), size2gb(size, 2));
             }
             return make_ready_future<>();
         }).get();

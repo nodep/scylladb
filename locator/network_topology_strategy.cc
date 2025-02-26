@@ -424,6 +424,8 @@ future<tablet_replica_set> network_topology_strategy::add_tablets_in_dc(schema_p
     // for sorting in descending load order
     // (in terms of number of replicas)
     auto node_load_cmp = [] (const node_load& a, const node_load& b) {
+        if (a.load == b.load)
+            return a.host > b.host;
         return a.load > b.load;
     };
 
