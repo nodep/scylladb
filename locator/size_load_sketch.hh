@@ -18,12 +18,17 @@
 #include <optional>
 #include <vector>
 
+struct interpolate_point {
+    double in = 0;
+    double out = 0;
+};
+
+double interpolate(double in, const std::vector<interpolate_point>& points);
+double compute_load(const locator::disk_usage& disk_usage, size_t tablet_count, size_t n_shards);
+
 namespace locator {
 
-constexpr double count_influence = 0;
-constexpr size_t ideal_tablet_count = 100;
 constexpr double balance_load_delta = .005;
-constexpr uint64_t huge_tablet_size_threshold = 5UL * 1024 * 1024 * 1024 * 10;
 
 inline sstring brief(host_id h) {
     return ::format("{:.2}", ::format("{}", h));
@@ -42,9 +47,6 @@ inline sstring brief(tablet_replica tr) {
 }
 
 using load_type = double;
-
-load_type interpolate(load_type in);
-load_type compute_load(const locator::disk_usage& disk_usage, size_t tablet_count, size_t n_shards);
 
 class size_load_sketch {
     using shard_id = seastar::shard_id;

@@ -125,16 +125,24 @@ struct rebalance_stats {
 
 uint64_t get_shard_capacity(host_id h) {
     const std::vector<uint64_t> capacities {
-        450UL * 1024 * 1024 * 1024,
+        650UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
+        600UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
         850UL * 1024 * 1024 * 1024,
-        450UL * 1024 * 1024 * 1024,
+        650UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
+        550UL * 1024 * 1024 * 1024,
+        850UL * 1024 * 1024 * 1024,
         650UL * 1024 * 1024 * 1024,
     };
 
-    //const uint64_t i = abs(h.id.get_most_significant_bits() >> 56);
-    //const uint64_t capacity = capacities[i % capacities.size()];
+    const uint64_t i = abs(h.id.get_most_significant_bits() >> 56);
+    const uint64_t capacity = capacities[i % capacities.size()];
 
-    return capacities[3];
+    return capacity;
 }
 
 locator::cluster_disk_usage get_cluster_with_capacities(token_metadata_ptr tm) {
@@ -192,17 +200,25 @@ sstring size2gb(uint64_t size, int decimals) {
 }
 
 sstring pprint(const locator::disk_usage& du) {
-    return ::format("{} {} {:.2f}%", size2gb(du.used, 0), size2gb(du.capacity, 0), (du.used * 100.0) / du.capacity);
+    return ::format("{} {} {:.2f}%", size2gb(du.used), size2gb(du.capacity), (du.used * 100.0) / du.capacity);
 }
 
-load_type locator::interpolate(load_type in) {
-    struct point {
-        double in = 0;
-        double out = 0;
-    };
+double interpolate(double in, const std::vector<interpolate_point>& points) {
+    size_t idx = 1;
+    while ((idx < points.size() - 1) && (points[idx].in < in)) {
+        idx++;
+    }
 
-    const std::vector<point> points = {
-        /*
+    const interpolate_point& p = points[idx];
+    const interpolate_point& last = points[idx - 1];
+
+    return last.out + (in - last.in) * (p.out - last.out)/(p.in - last.in);
+}
+
+/*
+double compute_load_mine(const disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
+
+    const std::vector<interpolate_point> points = {
         {0,    0},
         {0.7,  0.7},
         {0.75, 0.8},
@@ -211,28 +227,44 @@ load_type locator::interpolate(load_type in) {
         {0.90, 1.8},
         {0.95, 3},
         {1.00, 5},
-        */
-        {0, 0},
-        {1, 1},
+        //{0, 0},
+        //{1, 1},
     };
 
-    size_t idx = 1;
-    while ((idx < points.size() - 1) && (points[idx].in < in)) {
-        idx++;
-    }
-
-    const point& p = points[idx];
-    const point& last = points[idx - 1];
-
-    return last.out + (in - last.in) * (p.out - last.out)/(p.in - last.in);
-}
-
-load_type locator::compute_load(const disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
+    load_type ideal_tablet_count = disk_usage.capacity / default_target_tablet_size;
     load_type disk_used = load_type(disk_usage.used) / disk_usage.capacity;
+    load_type size_load = interpolate(disk_used, points);
     load_type count_load = tablet_count / load_type(ideal_tablet_count * n_shards);
-    load_type size_load = interpolate(disk_used);
+
+    constexpr double count_influence = 0.1;
 
     return size_load * (1 - count_influence) + count_load * count_influence;
+}
+*/
+
+// raphael's suggestion
+double compute_load(const disk_usage& disk_usage, size_t tablet_count, size_t n_shards) {
+
+    const std::vector<interpolate_point> points = {
+        /*
+        {0.0,  0.2},
+        {0.7,  0.2},
+        {0.75, 0.18},
+        {0.85, 0.15},
+        {0.90, 0.11},
+        {0.95, 0.06},
+        {1.00, 0},
+        */
+        {0,  0},
+        {1,  0},
+    };
+
+    load_type ideal_tablet_count = disk_usage.used == 0 ? 1.0 : load_type(disk_usage.used) / default_target_tablet_size;
+    load_type size_load = load_type(disk_usage.used) / disk_usage.capacity;
+    load_type local_count_influence = interpolate(size_load, points);
+    load_type count_load = tablet_count / load_type(ideal_tablet_count);
+
+    return size_load * (1 - local_count_influence) + count_load * local_count_influence;
 }
 
 void check_usage(const cluster_disk_usage& disk_usage) {
@@ -303,7 +335,7 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         check_usage(disk_usage);
 
         auto start_time = std::chrono::steady_clock::now();
-        auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist, disk_usage).get();
+        auto plan = talloc.balance_tablets(stm.get(), load_stats, skiplist, disk_usage, true).get();
         auto end_time = std::chrono::steady_clock::now();
         auto lb_stats = talloc.stats().for_dc(dc) - prev_lb_stats;
 
@@ -339,7 +371,11 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
         }
 
         dbglogblue("plan size {}", plan.size());
-        for (const tablet_migration_info& tmi : plan.migrations()) {
+        migration_plan::migrations_vector mv = plan.migrations();
+        std::sort(mv.begin(), mv.end(), [] (const tablet_migration_info& l, const tablet_migration_info& r) {
+            return l.tablet < r.tablet;
+        });
+        for (const tablet_migration_info& tmi : mv) {
             dbglogblue("migrating {} from {} to {}", brief(tmi.tablet), brief(tmi.src), brief(tmi.dst));
         }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
@@ -430,10 +466,19 @@ struct tablet_size_generator {
 
     uint64_t generate() {
         ++_tablet_count;
-        if (_tablet_count % 100 == 0) {
+        if (_tablet_count % 1000 == 0) {
             return get(huge_tablet_size_threshold, huge_tablet_size_threshold * 5);
         }
-        return get(0, default_target_tablet_size * 2);
+        if (_tablet_count % 51 == 0) {
+            return get(default_target_tablet_size * 2, huge_tablet_size_threshold);
+        }
+        //if (_tablet_count % 200 == 0) {
+        //    return get(default_target_tablet_size * 4, huge_tablet_size_threshold);
+        //}
+        //if (_tablet_count % 101 == 0) {
+        //    return get(default_target_tablet_size * 2, default_target_tablet_size * 4);
+        //}
+        return default_target_tablet_size;
     }
 };
 
@@ -571,7 +616,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
                 tablet_size_sum += tablet_size;
                 total_table_size += tablet_size;
-                if (tablet_size > default_target_tablet_size * 4) {
+                if (tablet_size >= huge_tablet_size_threshold) {
                     testlblog.info("huge tablet: {}:{} {}", table, tid, size2gb(tablet_size));
                 }
                 return make_ready_future<>();
@@ -616,7 +661,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 }
 
                 auto node_imbalance = node_load_minmax.max() - node_load_minmax.min();
-                testlblog.info("Table node imbalance: min={:5.1f}%, max={:5.1f}%, spread={:5.1f}%",
+                testlblog.info("Table node imbalance: min={:5.1f}%, max={:5.1f}%, spread={:6.2f}%",
                               node_load_minmax.min(), node_load_minmax.max(), node_imbalance);
 
                 res.tables[table_index++] = {
@@ -631,20 +676,29 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             size_load.populate(std::nullopt).get();
 
             min_max_tracker<double> node_load_minmax;
-            min_max_tracker<size_t> node_tablet_count_minmax;
+            min_max_tracker<uint64_t> avg_tablet_size_minmax;
+            uint64_t total_used = 0;
+            size_t num_tablets = 0;
             for (auto h: hosts) {
                 auto node_du = size_load.get_disk_usage(h);
                 double node_load = 100.0 * node_du.used / node_du.capacity;
                 size_t tablet_count = size_load.get_tablet_count(h);
-                testlblog.info("Node load {:.2} used={} cap={} disk_load={:5.1f}% count={}",
-                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), node_load, tablet_count);
+                uint64_t avg_tablet_size = node_du.used / tablet_count;
+                testlblog.info("Node load {:.2} used={} cap={} disk_load={:5.1f}% count={}, avg_size={}",
+                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), node_load, tablet_count, size2gb(avg_tablet_size, 2));
                 node_load_minmax.update(node_load);
-                node_tablet_count_minmax.update(tablet_count);
+                avg_tablet_size_minmax.update(avg_tablet_size);
+                num_tablets += tablet_count;
+                total_used += node_du.used;
             }
 
-            testlblog.info("Nodes load size min={:5.1f}% max={:5.1f}% spread={:5.1f}%  count min={} max={} spread={}",
+            const double avg_tablet_size = double(total_used) / num_tablets;
+            double min_avg_tablet_size = avg_tablet_size_minmax.min() / avg_tablet_size;
+            double max_avg_tablet_size = avg_tablet_size_minmax.max() / avg_tablet_size;
+
+            testlblog.info("Nodes load size min={:5.1f}% max={:5.1f}% spread={:5.1f}%  avg_size min={:.2f}% max={:.2f}% spread={:.2f}%",
                     node_load_minmax.min(), node_load_minmax.max(), node_load_minmax.max() - node_load_minmax.min(),
-                    node_tablet_count_minmax.min(), node_tablet_count_minmax.max(), node_tablet_count_minmax.max() - node_tablet_count_minmax.min());
+                    min_avg_tablet_size, max_avg_tablet_size, max_avg_tablet_size - min_avg_tablet_size);
 
             /*
             for (int i = 0; i < nr_tables; i++) {

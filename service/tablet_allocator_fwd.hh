@@ -14,6 +14,7 @@ namespace service {
 
 // This the default target size of tablets.
 static constexpr uint64_t default_target_tablet_size = 5UL * 1024 * 1024 * 1024;
+static constexpr uint64_t huge_tablet_size_threshold = default_target_tablet_size * 10;
 
 class tablet_allocator_impl;
 
