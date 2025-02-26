@@ -37,6 +37,10 @@ inline sstring brief(global_tablet_id gt) {
     return ::format("{}:{}", brief(gt.table), gt.tablet);
 }
 
+inline sstring brief(tablet_replica tr) {
+    return ::format("{}:{}", brief(tr.host), tr.shard);
+}
+
 using load_type = double;
 
 load_type interpolate(load_type in);
@@ -308,6 +312,13 @@ public:
             return {};
         }
         return _nodes.at(node)._du;
+    }
+
+    size_t get_tablet_count(host_id node) const {
+        if (!_nodes.contains(node)) {
+            return 0;
+        }
+        return _nodes.at(node)._tablet_count;
     }
 };
 

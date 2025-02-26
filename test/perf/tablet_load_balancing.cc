@@ -338,10 +338,10 @@ rebalance_stats rebalance_tablets(tablet_allocator& talloc, shared_token_metadat
             return stats;
         }
 
-        //dbglogblue("plan size {}", plan.size());
-        //for (const tablet_migration_info& tmi : plan.migrations()) {
-        //    dbglogblue("migrating {} from {} to {}", brief(tmi.tablet), brief(tmi.src.host), brief(tmi.dst.host));
-        //}
+        dbglogblue("plan size {}", plan.size());
+        for (const tablet_migration_info& tmi : plan.migrations()) {
+            dbglogblue("migrating {} from {} to {}", brief(tmi.tablet), brief(tmi.src), brief(tmi.dst));
+        }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
             apply_plan(tm, plan);
             return make_ready_future<>();
@@ -631,16 +631,20 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             size_load.populate(std::nullopt).get();
 
             min_max_tracker<double> node_load_minmax;
+            min_max_tracker<size_t> node_tablet_count_minmax;
             for (auto h: hosts) {
                 auto node_du = size_load.get_disk_usage(h);
                 double node_load = 100.0 * node_du.used / node_du.capacity;
-                testlblog.info("Node load {:.2} used={} cap={} disk_load={:5.1f}%",
-                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), node_load);
+                size_t tablet_count = size_load.get_tablet_count(h);
+                testlblog.info("Node load {:.2} used={} cap={} disk_load={:5.1f}% count={}",
+                    ::format("{}", h), size2gb(node_du.used), size2gb(node_du.capacity), node_load, tablet_count);
                 node_load_minmax.update(node_load);
+                node_tablet_count_minmax.update(tablet_count);
             }
 
-            testlblog.info("Nodes load min={:5.1f}% max={:5.1f}% spread={:5.1f}%",
-                    node_load_minmax.min(), node_load_minmax.max(), node_load_minmax.max() - node_load_minmax.min());
+            testlblog.info("Nodes load size min={:5.1f}% max={:5.1f}% spread={:5.1f}%  count min={} max={} spread={}",
+                    node_load_minmax.min(), node_load_minmax.max(), node_load_minmax.max() - node_load_minmax.min(),
+                    node_tablet_count_minmax.min(), node_tablet_count_minmax.max(), node_tablet_count_minmax.max() - node_tablet_count_minmax.min());
 
             /*
             for (int i = 0; i < nr_tables; i++) {
