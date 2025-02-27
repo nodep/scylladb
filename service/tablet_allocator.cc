@@ -458,8 +458,6 @@ class load_balancer {
         // Call when tablet_count changes.
         void update() {
             avg_load = compute_load(du, tablet_count, shard_count);
-            //lbsimlog.info("lb update for {} load {} used {} capacity {} tablets {} shards {}",
-            //        zid, avg_load, size2gb(du.used), size2gb(du.capacity), tablet_count, shard_count);
         }
 
         load_type get_avg_load(int tablets, uint64_t tablet_sizes) const {
@@ -2062,10 +2060,6 @@ public:
                         continue;
                     }
 
-                    //lbsimlog.info("number of candidates for table {}:{} == {}",
-                    //        table, min_src->shard,
-                    //        src_node_info.shards[min_src->shard].candidates[table].size());
-
                     // pick the largest tablet among the candidates for this table
                     migration_tablet_set tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
                     max_tablet_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
@@ -2086,6 +2080,7 @@ public:
             }
         }
 
+        /*
         if (!drain_skipped && min_candidate.badness.is_bad() && _use_table_aware_balancing) {
             // try to swap the tablets
             node_load& target_node = nodes[min_candidate.dst.host];
@@ -2112,6 +2107,7 @@ public:
         } else {
             lbsimlog.info("best candidate: {}", min_candidate);
         }
+        */
 
         lblogger.trace("best candidate: {}", min_candidate);
 
@@ -2259,7 +2255,12 @@ public:
         while (plan.size() < batch_size) {
             std::make_heap(nodes_by_load.begin(), nodes_by_load.end(), nodes_cmp);
             std::make_heap(nodes_by_load_dst.begin(), nodes_by_load_dst.end(), nodes_dst_cmp);
-    
+
+            for (auto&& [host, node_load] : nodes) {
+                std::make_heap(node_load.shards_by_load.begin(), node_load.shards_by_load.end(),
+                                node_load.shards_by_load_cmp());
+            }
+                
             co_await coroutine::maybe_yield();
 
             if (nodes_by_load.empty()) {
@@ -2359,6 +2360,7 @@ public:
             if (can_check_convergence) {
                 double load_delta = get_load_delta();
                 if (load_delta < balance_load_delta) {
+                    dbglogyellow("load_delta {:.5f}", load_delta);
                     lbsimlog.info("Balance achieved");
                     break;
                 }
@@ -2414,6 +2416,7 @@ public:
             // If best candidate is co-located sibling tablets, then convergence is re-checked to avoid oscillations.
             if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
                 lblogger.debug("No more candidates. Load would be inverted.");
+                dbglog("No more candidates. Load would be inverted.");
                 _stats.for_dc(dc).stop_load_inversion++;
                 break;
             }
@@ -2627,8 +2630,8 @@ public:
             load.du = host_load.get_sum();
             load.shards.resize(load.shard_count);
             for (const auto& [shard_id, du]: host_load.usage_by_shard) {
-                load.shards[shard_id].du.capacity = du.capacity;
-                //load.shards[shard_id].update();
+                load.shards[shard_id].du = du;
+                load.shards[shard_id].update();
             }
             load.update();
 
@@ -2753,6 +2756,15 @@ public:
                 _total_capacity_shards += load.shard_count;
                 _total_capacity_nodes++;
             }
+        }
+
+        dbglogred("-------------");
+        for (auto& [h, n] : nodes) {
+            dbglogred("host {} load {:.4f} {} {} {:5.1f}%", brief(h), n.avg_load, 
+                        n.du.used, n.du.capacity, 100.0 * n.du.used / n.du.capacity);
+            //for (auto& s : n.shards) {
+            //    dbglogred("    shard load {:.4f} {} {}", s.load, size2gb(s.du.used), size2gb(s.du.capacity));
+            //}
         }
 
         for (auto&& [host, load] : nodes) {
