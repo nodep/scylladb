@@ -207,6 +207,11 @@ struct migration_candidate {
     migration_badness badness;
 };
 
+struct size_tier {
+    uint64_t begin_size = 0;
+    uint64_t end_size = 0;
+};
+
 }
 
 template<>
@@ -699,15 +704,56 @@ public:
         , _cluster_du(std::move(disk_usage))
     { }
 
-    future<migration_plan> make_plan(std::optional<unsigned> initial_scale, bool test_mode) {
+    future<migration_plan> make_plan(std::optional<unsigned> initial_scale, bool do_tiers, bool test_mode) {
         const locator::topology& topo = _tm->get_topology();
         migration_plan plan;
 
         // Prepare plans for each DC separately and combine them to be executed in parallel.
         for (auto&& dc : topo.get_datacenters()) {
-            auto dc_plan = co_await make_plan(dc, initial_scale, test_mode, true);
-            if (dc_plan.empty()) {
-                dc_plan = co_await make_plan(dc, initial_scale, test_mode, false);
+            std::optional<size_tier> st;
+            migration_plan dc_plan;
+            if (do_tiers) {
+                // create tiers
+                std::vector<uint64_t> sizes;
+                uint64_t total_size = 0;
+                size_t tablet_count = 0;
+                for (auto&& [table, tmap] : _tm->tablets().all_tables()) {
+                    co_await tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& tinfo) -> future<> {
+                        const uint64_t tablet_size = get_tablet_size(tinfo.replicas.front().host, {table, tid});
+                        sizes.push_back(tablet_size);
+                        total_size += tablet_size;
+                        tablet_count++;
+                        return make_ready_future<>();
+                    });
+                }
+
+                dbglog("tablet count {} total size {}", tablet_count, size2gb(total_size));
+                const int num_tiers = 8;
+                uint64_t tier_size = total_size / num_tiers;
+
+                std::sort(sizes.begin(), sizes.end(), std::greater());
+                
+                std::vector<uint64_t> tiers;
+                uint64_t tier_sum = 0;
+                for (const uint64_t size : sizes) {
+                    tier_sum += size;
+                    if (tier_sum >= tier_size) {
+                        tiers.push_back(size);
+                        tier_sum -= tier_size;
+                    }
+                }
+                
+                size_tier st = {0, std::numeric_limits<uint64_t>::max()};
+                for (const uint64_t tier : tiers) {
+                    st.begin_size = tier;
+                    dc_plan = co_await make_plan(dc, test_mode, st);
+                    if (!dc_plan.empty()) {
+                        break;
+                    }
+                    st.end_size = st.begin_size;
+                }
+            } else {
+                dc_plan = co_await make_plan(dc, test_mode, st);
             }
             lblogger.info("Prepared {} migrations in DC {}", dc_plan.size(), dc);
             plan.merge(std::move(dc_plan));
@@ -2429,15 +2475,15 @@ public:
         }
     };
 
-    bool use_tablet(host_id h, const global_tablet_id& gtid, bool huge_tablets) {
-        const uint64_t tablet_size = get_tablet_size(h, gtid);
-        if (huge_tablets) {
-            return tablet_size >= huge_tablet_size_threshold;
+    bool use_tablet(host_id h, const global_tablet_id& gtid, std::optional<size_tier> st) {
+        if (!st) {
+            return true;
         }
-        return tablet_size < huge_tablet_size_threshold;
+        const uint64_t tablet_size = get_tablet_size(h, gtid);
+        return tablet_size >= st->begin_size && tablet_size < st->end_size;
     }
 
-    future<migration_plan> make_plan(dc_name dc, std::optional<unsigned> initial_scale, bool test_mode, bool huge_tablets) {
+    future<migration_plan> make_plan(dc_name dc, bool test_mode, std::optional<size_tier> st) {
         migration_plan plan;
 
         _dc = dc;
@@ -2532,7 +2578,7 @@ public:
                 // optimistically assuming that they will succeed.
                 for (auto&& replica : get_replicas_for_tablet_load(ti, trinfo)) {
                     const global_tablet_id gtid{table, tid};
-                    if (use_tablet(replica.host, gtid, huge_tablets) && nodes.contains(replica.host)) {
+                    if (use_tablet(replica.host, gtid, st) && nodes.contains(replica.host)) {
                         nodes[replica.host].tablet_count += 1;
                         // This invariant is assumed later.
                         if (replica.shard >= nodes[replica.host].shard_count) {
@@ -2565,10 +2611,14 @@ public:
 
         plan.set_has_nodes_to_drain(!nodes_to_drain.empty());
 
-        dbglog("huge {}", huge_tablets);
-        for (const node_load& nl : nodes | std::views::values) {
-            dbglog("host {:.2} shards {} tablets {}", ::format("{}", nl.id), nl.shard_count, nl.tablet_count);
+        if (st) {
+            dbglog("tier {} - {}", size2gb(st->begin_size), size2gb(st->end_size));
+        } else {
+            dbglog("tierless");
         }
+        //for (const node_load& nl : nodes | std::views::values) {
+        //    dbglog("host {:.2} shards {} tablets {}", ::format("{}", nl.id), nl.shard_count, nl.tablet_count);
+        //z}
 
         // Compute load imbalance.
 
@@ -2690,7 +2740,7 @@ public:
                     } else {
                         for (auto tid : tids) {
                             global_tablet_id gtid{table, tid};
-                            if (use_tablet(replica.host, gtid, huge_tablets)) {
+                            if (use_tablet(replica.host, gtid, st)) {
                                 // migrating tablets are not candidates
                                 if (!migrating(get_table_desc(tid))) {
                                     add_candidate(shard_load_info, migration_tablet_set{gtid});
@@ -2760,11 +2810,11 @@ public:
     }
 
     future<migration_plan> balance_tablets(token_metadata_ptr tm, locator::load_stats_ptr table_load_stats, std::unordered_set<host_id> skiplist,
-        locator::cluster_disk_usage disk_usage, bool test_mode) {
+        locator::cluster_disk_usage disk_usage, bool do_tiers, bool test_mode) {
         load_balancer lb(_db, tm, std::move(table_load_stats), _load_balancer_stats, _db.get_config().target_tablet_size_in_bytes(),
                             std::move(skiplist), std::move(disk_usage));
         lb.set_use_table_aware_balancing(_use_tablet_aware_balancing);
-        co_return co_await lb.make_plan(_config.initial_tablets_scale, test_mode);
+        co_return co_await lb.make_plan(_config.initial_tablets_scale, do_tiers, test_mode);
     }
 
     void set_use_tablet_aware_balancing(bool use_tablet_aware_balancing) {
@@ -2914,8 +2964,8 @@ future<> tablet_allocator::stop() {
 }
 
 future<migration_plan> tablet_allocator::balance_tablets(locator::token_metadata_ptr tm, locator::load_stats_ptr load_stats, std::unordered_set<host_id> skiplist,
-        locator::cluster_disk_usage disk_usage, bool test_mode) {
-    return impl().balance_tablets(std::move(tm), std::move(load_stats), std::move(skiplist), std::move(disk_usage), test_mode);
+        locator::cluster_disk_usage disk_usage, bool do_tiers, bool test_mode) {
+    return impl().balance_tablets(std::move(tm), std::move(load_stats), std::move(skiplist), std::move(disk_usage), do_tiers, test_mode);
 }
 
 void tablet_allocator::set_use_table_aware_balancing(bool use_tablet_aware_balancing) {

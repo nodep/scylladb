@@ -230,7 +230,7 @@ public:
     /// The algorithm takes care of limiting the streaming load on the system, also by taking active migrations into account.
     ///
     future<migration_plan> balance_tablets(locator::token_metadata_ptr, locator::load_stats_ptr = {}, std::unordered_set<locator::host_id> = {},
-                            locator::cluster_disk_usage disk_usage = {}, bool test_mode = false);
+                            locator::cluster_disk_usage disk_usage = {}, bool do_tiers = false, bool test_mode = false);
 
     load_balancer_stats_manager& stats();
 
