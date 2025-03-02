@@ -2015,8 +2015,6 @@ public:
             }
         };
 
-        uint64_t max_tablet_size = 0;
-
         if (min_candidate.badness.is_bad() && _use_table_aware_balancing) {
             _stats.for_dc(_dc).bad_first_candidates++;
 
@@ -2056,14 +2054,16 @@ public:
                         continue;
                     }
 
-                    // pick the largest tablet among the candidates for this table
+                    // If the source node is drained, pick the largest tablet among the candidates for this table
                     migration_tablet_set tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
-                    max_tablet_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
-                    for (const migration_tablet_set& t : src_node_info.shards[min_src->shard].candidates[table]) {
-                        const uint64_t new_size = get_tablet_size(src_node_info.id, t.tablets().front());
-                        if (new_size < huge_tablet_size_threshold  &&  max_tablet_size < new_size) {
-                            tablet = t;
-                            max_tablet_size = new_size;
+                    if (src_node_info.drained) {
+                        uint64_t max_tablet_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
+                        for (const migration_tablet_set& t : src_node_info.shards[min_src->shard].candidates[table]) {
+                            const uint64_t new_size = get_tablet_size(src_node_info.id, t.tablets().front());
+                            if (max_tablet_size < new_size) {
+                                tablet = t;
+                                max_tablet_size = new_size;
+                            }
                         }
                     }
                     
@@ -2234,8 +2234,8 @@ public:
 
             bool is_source = false;
             if (nodes_to_drain.empty()) {
-                const double nload = double(node_load.du.used) / node_load.du.capacity;
-                is_source = nload > _dc_load;
+                //const double nload = double(node_load.du.used) / node_load.du.capacity;
+                is_source = node_load.avg_load > _dc_load;
             } else {
                 is_source = node_load.drained;
             }
@@ -2248,6 +2248,8 @@ public:
                 nodes_by_load_dst.push_back(host);
             }
         }
+
+        dbgloggreen("sources={} destinations={}", nodes_by_load_src.size(), nodes_by_load_dst.size());
 
         const tablet_metadata& tmeta = _tm->tablets();
         const locator::topology& topo = _tm->get_topology();
@@ -2282,7 +2284,7 @@ public:
             bool drain_skipped = src_node_info.shards_by_load.empty() && src_node_info.drained
                     && !src_node_info.skipped_candidates.empty();
 
-            dbglog("source node {} avg_load {}", brief(src_host), src_node_info.avg_load);
+            //dbglog("source node {} avg_load {}", brief(src_host), src_node_info.avg_load);
 
             lblogger.debug("source node: {}, avg_load={:.2f}, skipped={}, drain_skipped={}", src_host,
                            src_node_info.avg_load, src_node_info.skipped_candidates.size(), drain_skipped);
@@ -2354,7 +2356,7 @@ public:
             });
 
             lblogger.debug("target node: {}, avg_load={}", target, target_info.avg_load);
-            dbgloggreen("target node: {}, avg_load={}, size={}", brief(target), target_info.avg_load, nodes_by_load_dst.size());
+            //dbgloggreen("target node: {}, avg_load={}, size={}", brief(target), target_info.avg_load, nodes_by_load_dst.size());
 
             // Check convergence conditions.
 
@@ -2414,8 +2416,6 @@ public:
             auto source_tablets = candidate.tablets;
             src = candidate.src;
             dst = candidate.dst;
-
-            dbgloggreen("candidate src {} dst {}", brief(src), brief(dst));
 
             // If best candidate is co-located sibling tablets, then convergence is re-checked to avoid oscillations.
             //if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
@@ -2641,8 +2641,6 @@ public:
             }
             load.update();
 
-            _total_capacity_storage += load.du.capacity;
-
             if (!load.shard_count) {
                 throw std::runtime_error(format("Shard count of {} not found in topology", host));
             }
@@ -2744,6 +2742,8 @@ public:
 
         _total_capacity_shards = 0;
         _total_capacity_nodes = 0;
+        _total_capacity_storage = 0;
+        uint64_t total_tablet_count = 0;
         load_type max_load = 0;
         load_type min_load = 0;
         std::optional<host_id> min_load_node = std::nullopt;
@@ -2763,12 +2763,14 @@ public:
                 }
                 _total_capacity_shards += load.shard_count;
                 _total_capacity_nodes++;
+                _total_capacity_storage += load.du.capacity;
+                total_tablet_count += load.tablet_count;
             }
         }
 
         dbglogred("-------------");
         for (auto& [h, n] : nodes) {
-            dbglogred("host {} load {:.4f} {} drained={}", brief(h), n.avg_load, pprint(n.du), n.drained);
+            dbglogred("host {} load {:.4f} du {} tablets {} drained={}", brief(h), n.avg_load, n.tablet_count, pprint(n.du), n.drained);
             //for (auto& s : n.shards) {
             //    dbglogred("    shard load {:.4f} {} {}", s.load, size2gb(s.du.used), size2gb(s.du.capacity));
             //}
@@ -2890,9 +2892,9 @@ public:
             _tablet_count_per_table[table] = total_load;
         }
 
-        _dc_load = double(_total_used_storage) / _total_capacity_storage;
-
-        lbsimlog.info("max_load {:.4f} min_load {:.4f}", max_load, min_load);
+        _dc_load = compute_load(locator::disk_usage(_total_used_storage, _total_capacity_storage), total_tablet_count, _total_capacity_shards);
+        dbglog("total dc_load={} used={} capacity={} tablet_count={}", _dc_load, size2gb(_total_used_storage), size2gb(_total_capacity_storage), total_tablet_count);
+        dbglog("max_load {:.4f} min_load {:.4f} delta {:.4f}", max_load, min_load, max_load - min_load);
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
