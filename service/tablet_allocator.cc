@@ -646,6 +646,7 @@ class load_balancer {
     absl::flat_hash_map<table_id, uint64_t> _table_size;
     uint64_t _total_capacity_storage = 0;
     uint64_t _total_used_storage = 0;
+    uint64_t _avg_tablet_size = 0;
     double _dc_load = 0;
     dc_name _dc;
     size_t _total_capacity_shards; // Total number of non-drained shards in the balanced node set.
@@ -2056,6 +2057,34 @@ public:
 
                     // If the source node is drained, pick the largest tablet among the candidates for this table
                     migration_tablet_set tablet = *src_node_info.shards[min_src->shard].candidates[table].begin();
+                    // pick a tablet which will improve avg tablet size on the source
+                    /*
+                    uint64_t avg_tablet_size_for_table = default_target_tablet_size;
+                    size_t tablet_count = src_node_info.shards[min_src->shard].tablet_count_per_table[table];
+                    if (tablet_count != 0) {
+                        avg_tablet_size_for_table = src_node_info.shards[min_src->shard].table_size[table] / tablet_count;
+                    }
+
+                    uint64_t picked_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
+                    for (const migration_tablet_set& t : src_node_info.shards[min_src->shard].candidates[table]) {
+                        const uint64_t size = get_tablet_size(src_node_info.id, t.tablets().front());
+                        if (avg_tablet_size_for_table > _avg_tablet_size) {
+                            if (size < picked_size) {
+                                tablet = t;
+                                picked_size = size;
+                            }
+                        } else {
+                            if (size > picked_size) {
+                                tablet = t;
+                                picked_size = size;
+                            }
+                        }
+                    }
+                    dbglog("src picked size={} avg_all={} avg_table={}", 
+                            size2gb(picked_size, 2), size2gb(_avg_tablet_size, 2), size2gb(avg_tablet_size_for_table, 2));
+                    */
+
+                    /*
                     if (src_node_info.drained) {
                         uint64_t max_tablet_size = get_tablet_size(src_node_info.id, tablet.tablets().front());
                         for (const migration_tablet_set& t : src_node_info.shards[min_src->shard].candidates[table]) {
@@ -2066,6 +2095,7 @@ public:
                             }
                         }
                     }
+                    */
                     
                     co_await evaluate_targets(tablet, *min_src, min_src_badness);
                     if (!min_candidate.badness.is_bad()) {
@@ -2895,6 +2925,12 @@ public:
         _dc_load = compute_load(locator::disk_usage(_total_used_storage, _total_capacity_storage), total_tablet_count, _total_capacity_shards);
         dbglog("total dc_load={} used={} capacity={} tablet_count={}", _dc_load, size2gb(_total_used_storage), size2gb(_total_capacity_storage), total_tablet_count);
         dbglog("max_load {:.4f} min_load {:.4f} delta {:.4f}", max_load, min_load, max_load - min_load);
+        if (total_tablet_count) {
+            _avg_tablet_size = _total_used_storage / total_tablet_count;
+        } else {
+            _avg_tablet_size = default_target_tablet_size;
+        }
+        dbglog("_total_used_storage = {} total_tablet_count = {}", size2gb(_total_used_storage, 2), total_tablet_count);
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
