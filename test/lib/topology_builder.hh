@@ -178,7 +178,8 @@ public:
         ++_nr_nodes;
 
         auto ip = make_node_address(_nr_nodes);
-        auto id = locator::host_id(utils::UUID_gen::get_time_UUID());
+        auto id = locator::host_id(utils::UUID(::format("{:02x}0000000-0000-0000-0000-000000000000", _nr_nodes)));
+        //locator::host_id(utils::UUID_gen::get_time_UUID());
         auto dc_rack = rack_override.value_or(rack());
         dht::token token = new_token();
         std::unordered_set<dht::token> tokens({token});
