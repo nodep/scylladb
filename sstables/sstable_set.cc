@@ -800,6 +800,20 @@ public:
         , _selector(_sstables->make_incremental_selector())
         , _fn(std::move(fn)) {
 
+        sstring sstables_desc;
+        _sstables->for_each_sstable([&](const shared_sstable& sst) {
+            if (!sstables_desc.empty()) {
+                sstables_desc += ",";
+            }
+            sstables_desc += ::format("{}", sst->get_filename().format());
+        });
+
+        tracing::trace(_trace_state, "{}: created for range: {} with {} sstables: {}",
+                fmt::ptr(this),
+                *_pr,
+                _sstables->size(),
+                sstables_desc);
+
         irclogger.trace("{}: created for range: {} with {} sstables",
                 fmt::ptr(this),
                 *_pr,
@@ -813,6 +827,7 @@ public:
     incremental_reader_selector& operator=(incremental_reader_selector&&) = delete;
 
     virtual std::vector<mutation_reader> create_new_readers(const std::optional<dht::ring_position_view>& pos) override {
+        tracing::trace(_trace_state, "{}: {}({})", fmt::ptr(this), __FUNCTION__, seastar::lazy_deref(pos));
         irclogger.trace("{}: {}({})", fmt::ptr(this), __FUNCTION__, seastar::lazy_deref(pos));
 
         auto readers = std::vector<mutation_reader>();
@@ -821,6 +836,8 @@ public:
             auto selection = _selector->select({_selector_position, _pr});
             _selector_position = selection.next_position;
 
+            tracing::trace(_trace_state, "{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
+                    _selector_position);
             irclogger.trace("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
                     _selector_position);
 
@@ -832,6 +849,7 @@ public:
             }
         } while (!_selector_position.is_max() && readers.empty() && (!pos || dht::ring_position_tri_compare(*_s, *pos, _selector_position) >= 0));
 
+        tracing::trace(_trace_state, "{}: created {} new readers", fmt::ptr(this), readers.size());
         irclogger.trace("{}: created {} new readers", fmt::ptr(this), readers.size());
 
         // prevents sstable_set::incremental_selector::_current_sstables from holding reference to

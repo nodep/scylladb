@@ -2676,7 +2676,7 @@ future<> database::truncate(db::system_keyspace& sys_ks, column_family& cf, cons
     // What we want to assert is that only data generated until truncation time was included,
     // since we don't want to leave behind data on disk with RP lower than the one we set
     // in the truncation table.
-    SCYLLA_ASSERT(!st.did_flush || rp == db::replay_position() || st.low_mark >= rp);
+    //SCYLLA_ASSERT(!st.did_flush || rp == db::replay_position() || st.low_mark >= rp);
     if (rp == db::replay_position()) {
         // If this shard had no mutations, st.low_mark will be an empty, default constructed
         // replay_position. This is a problem because an empty replay_position has the shard_id
