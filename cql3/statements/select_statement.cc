@@ -417,6 +417,9 @@ select_statement::do_execute(query_processor& qp,
             query::is_first_page::no,
             options.get_timestamp(state));
     command->allow_limit = db::allow_per_partition_rate_limit::yes;
+    if (_schema->cf_name() == "test")
+        dbglog("Running our query ID {}", _schema->id());
+
     logger.trace("Executing read query (reversed {}): table schema {}, query schema {}",
         command->slice.is_reversed(), _schema->version(), _query_schema->version());
     tracing::trace(state.get_trace_state(), "Executing read query (reversed {})", command->slice.is_reversed());
@@ -469,16 +472,23 @@ select_statement::do_execute(query_processor& qp,
                     *command, key_ranges))) {
         f = execute_without_checking_exception_message_non_aggregate_unpaged(qp, command, std::move(key_ranges), state, options, now);
     } else {
+        if (_schema->cf_name() == "test")
+            dbglog("execute_without_checking_exception_message_aggregate_or_paged");
         f = execute_without_checking_exception_message_aggregate_or_paged(qp, command,
             std::move(key_ranges), state, options, now, page_size, aggregate,
             nonpaged_filtering, parsed_limit);
     }
 
     if (!tablet_info.has_value()) {
-        return f;
+        return f.then([this](auto res){
+            if (_schema->cf_name() == "test")
+                dbglog("finished!");
+            return res;
+        });
     }
 
     return f.then([tablet_replicas = std::move(tablet_info->tablet_replicas), token_range = tablet_info->token_range] (auto res) mutable {
+        dbglog("finished?");
         res->add_tablet_info(std::move(tablet_replicas), token_range);
         return res;
     });
@@ -498,6 +508,7 @@ select_statement::execute_without_checking_exception_message_aggregate_or_paged(
     auto per_partition_limit = get_limit(options, _per_partition_limit, true);
 
     if (aggregate || nonpaged_filtering) {
+        dbglog("aggregate || nonpaged_filtering == true");
         auto builder = cql3::selection::result_set_builder(*_selection, now, &options, *_group_by_cell_indices, limit, per_partition_limit);
         coordinator_result<void> result_void = co_await utils::result_do_until(
                 [&p, &builder, limit] {

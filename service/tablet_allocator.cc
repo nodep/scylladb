@@ -1220,7 +1220,7 @@ public:
             }
         });
 
-        auto process_table = [&] (table_id table, schema_ptr s, const tablet_aware_replication_strategy* rs, size_t tablet_count) {
+        auto process_table = [&] (table_id table, schema_ptr s, const tablet_aware_replication_strategy* rs, size_t tablet_count) -> future<> {
             table_sizing& table_plan = plan.tables[table];
             table_plan.current_tablet_count = tablet_count;
             rs_by_table[table] = rs;
@@ -1285,6 +1285,17 @@ public:
                 maybe_apply({table_plan.current_tablet_count, "current count"});
             }
 
+            co_await utils::get_local_injector().inject("merge_for_missing_data", [&] (auto& handler) -> future<> {
+                const size_t tablet_cnt = handler.template get<size_t>("tablets_cnt").value();
+                if (s->cf_name() == "test"  &&  table_plan.current_tablet_count == tablet_cnt) {
+                    dbglog("from current/target: {} {} {}", table_plan.current_tablet_count, target_tablet_count.tablet_count, target_tablet_count.reason);
+                    target_tablet_count.tablet_count = table_plan.current_tablet_count / 2;
+                    target_tablet_count.reason = "test merge";
+                    dbglog("merging {}", target_tablet_count.tablet_count);
+                }
+                return make_ready_future<>();
+            });
+
             table_plan.target_tablet_count = target_tablet_count.tablet_count;
             table_plan.target_tablet_count_reason = target_tablet_count.reason;
 
@@ -1294,12 +1305,12 @@ public:
 
         for (auto&& [table, tmap] : _tm->tablets().all_tables()) {
             auto [s, rs] = get_schema_and_rs(table);
-            process_table(table, s, rs, tmap->tablet_count());
+            co_await process_table(table, s, rs, tmap->tablet_count());
             co_await coroutine::maybe_yield();
         }
 
         if (new_table) {
-            process_table(new_table->id(), new_table, new_rs, 0);
+            co_await process_table(new_table->id(), new_table, new_rs, 0);
         }
 
         // Below section ensures we respect the _tablets_per_shard_goal.
@@ -1392,9 +1403,11 @@ public:
             table_plan.target_tablet_count_aligned = 1u << log2ceil(table_plan.target_tablet_count);
 
             if (table_plan.target_tablet_count_aligned > table_plan.current_tablet_count) {
-                table_plan.resize_decision = locator::resize_decision::split();
+                //table_plan.resize_decision = locator::resize_decision::split();
+                //dbglog("splitting table {}", table);
             } else if (table_plan.target_tablet_count_aligned < table_plan.current_tablet_count) {
                 table_plan.resize_decision = locator::resize_decision::merge();
+                dbglog("merging table to {} tablets", table_plan.target_tablet_count_aligned);
             }
 
             lblogger.debug("Table {}, {} => {} ({}: {}), resize: {}", table,

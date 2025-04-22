@@ -373,6 +373,8 @@ public:
                                      mutation_reader::forwarding fwd_mr = mutation_reader::forwarding::no,
                                      const tombstone_gc_state* gc_state = nullptr,
                                      max_purgeable_fn get_max_purgeable = can_never_purge) {
+        if (s->cf_name() == "test")
+            dbglogt("making reader...");
         if (auto reader_opt = make_reader_opt(s, permit, range, slice, gc_state, std::move(get_max_purgeable), std::move(trace_state), fwd, fwd_mr)) {
             return std::move(*reader_opt);
         }
@@ -395,6 +397,8 @@ public:
                                     const dht::partition_range& range = query::full_partition_range,
                                     const tombstone_gc_state* gc_state = nullptr,
                                     max_purgeable_fn get_max_purgeable = can_never_purge) {
+        if (s->cf_name() == "test")
+            dbglogt("making reader...");
         auto& full_slice = s->full_slice();
         return make_reader(std::move(s), std::move(permit), range, full_slice, nullptr,
                 streamed_mutation::forwarding::no, mutation_reader::forwarding::no, gc_state, std::move(get_max_purgeable));

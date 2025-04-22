@@ -246,11 +246,13 @@ table::make_reader_v2(schema_ptr s,
 
     const auto bypass_cache = slice.options.contains(query::partition_slice::option::bypass_cache);
     if (cache_enabled() && !bypass_cache) {
+        dbglogt("making make_reader_opt");
         if (auto reader_opt = _cache.make_reader_opt(s, permit, range, slice, &_compaction_manager.get_tombstone_gc_state(),
                     get_max_purgeable_fn_for_cache_underlying_reader(), std::move(trace_state), fwd, fwd_mr)) {
             readers.emplace_back(std::move(*reader_opt));
         }
     } else {
+        dbglogt("here");
         readers.emplace_back(make_sstable_reader(s, permit, _sstables, range, slice, std::move(trace_state), fwd, fwd_mr));
     }
 
@@ -302,6 +304,7 @@ table::make_streaming_reader(schema_ptr s, reader_permit permit,
         add_memtables_to_reader_list(readers, s, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
             readers.reserve(memtable_count + 1);
         });
+        dbglogt("here");
         readers.emplace_back(make_sstable_reader(s, permit, _sstables, range, slice, std::move(trace_state), fwd, fwd_mr));
         return make_combined_reader(s, std::move(permit), std::move(readers), fwd, fwd_mr);
     });
@@ -323,6 +326,7 @@ mutation_reader table::make_streaming_reader(schema_ptr schema, reader_permit pe
     add_memtables_to_reader_list(readers, schema, permit, range, slice, trace_state, fwd, fwd_mr, [&] (size_t memtable_count) {
         readers.reserve(memtable_count + 1);
     });
+    dbglogt("here");
     readers.emplace_back(make_sstable_reader(schema, permit, _sstables, range, slice, std::move(trace_state), fwd, fwd_mr));
     return maybe_compact_for_streaming(
             make_combined_reader(std::move(schema), std::move(permit), std::move(readers), fwd, fwd_mr),
@@ -2510,7 +2514,8 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
     if (!_config.enable_disk_writes) {
         tlogger.warn("Writes disabled, column family no durable.");
     }
-
+    if (_schema->cf_name() == "test")
+        dbglog("table ctor");
     recalculate_tablet_count_stats();
     set_metrics();
 }
@@ -2771,6 +2776,7 @@ partition_presence_checker
 table::make_partition_presence_checker(lw_shared_ptr<const sstables::sstable_set> sstables) {
     auto sel = make_lw_shared<sstables::sstable_set::incremental_selector>(sstables->make_incremental_selector());
     return [this, sstables = std::move(sstables), sel = std::move(sel)] (const dht::decorated_key& key) {
+        dbglog("checking decorated key: {}", key);
         auto& sst = sel->select(key).sstables;
         if (sst.empty()) {
             return partition_presence_checker_result::definitely_doesnt_exist;
@@ -2802,6 +2808,12 @@ snapshot_source
 table::sstables_as_snapshot_source() {
     return snapshot_source([this] () {
         auto sst_set = _sstables;
+        if (_schema->cf_name() == "test") {
+            dbglog("------------------------");
+            _sstables->for_each_sstable([](const sstables::shared_sstable& sst) {
+                dbglog("sstable old: {}", sst->get_filename());
+            });
+        }
         return mutation_source([this, sst_set] (schema_ptr s,
                 reader_permit permit,
                 const dht::partition_range& r,
@@ -2809,6 +2821,13 @@ table::sstables_as_snapshot_source() {
                 tracing::trace_state_ptr trace_state,
                 streamed_mutation::forwarding fwd,
                 mutation_reader::forwarding fwd_mr) {
+            //dbglogt("here");
+            //if (_schema->cf_name() == "test") {
+            //    dbglog("------------------------");
+            //    sst_set->for_each_sstable([](const sstables::shared_sstable& sst) {
+            //        dbglog("sstable new: {}", sst->get_filename());
+            //    });
+            //}
             auto reader = make_sstable_reader(std::move(s), std::move(permit), sst_set, r, slice, std::move(trace_state), fwd, fwd_mr);
             return make_compacting_reader(
                 std::move(reader),
@@ -3565,6 +3584,7 @@ table::query(schema_ptr query_schema,
 
         if (!querier_opt) {
             query::querier_base::querier_config conf(_config.tombstone_warn_threshold);
+            dbglog("table::query");
             querier_opt = query::querier(as_mutation_source(), query_schema, permit, range, qs.cmd.slice, trace_state, conf);
         }
         auto& q = *querier_opt;
@@ -3655,6 +3675,7 @@ table::as_mutation_source() const {
                                    tracing::trace_state_ptr trace_state,
                                    streamed_mutation::forwarding fwd,
                                    mutation_reader::forwarding fwd_mr) {
+        dbglogt("make_reader_v2 as_mutation_source");
         return this->make_reader_v2(std::move(s), std::move(permit), range, slice, std::move(trace_state), fwd, fwd_mr);
     });
 }
@@ -3743,6 +3764,7 @@ table::make_reader_v2_excluding_staging(schema_ptr s,
         return !sst.requires_view_building();
     };
 
+    dbglogt("here");
     readers.emplace_back(make_sstable_reader(s, permit, _sstables, range, slice, std::move(trace_state), fwd, fwd_mr, excl_staging_predicate));
     return make_combined_reader(s, std::move(permit), std::move(readers), fwd, fwd_mr);
 }

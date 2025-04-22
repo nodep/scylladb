@@ -84,6 +84,8 @@ public:
         return fast_forward_to(std::move(range), snapshot_and_phase.snapshot, snapshot_and_phase.phase);
     }
     future<> fast_forward_to(dht::partition_range&& range, mutation_source& snapshot, row_cache::phase_type phase) {
+        if (_cache.schema()->cf_name() == "test")
+            dbglog("range in fast_forward_to() {}", range);
         _range = std::move(range);
         _last_key = { };
         _new_last_key = { };
@@ -96,6 +98,8 @@ public:
             }
         }
         return close_reader().then([this, snapshot, phase] () mutable {
+            if (_cache.schema()->cf_name() == "test")
+                dbglog("from fast_forward_to()");
             _reader = _cache.create_underlying_reader(_read_context, snapshot, _range);
             _reader_creation_phase = phase;
         });
