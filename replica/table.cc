@@ -3572,6 +3572,13 @@ table::query(schema_ptr query_schema,
              ? memory_limiter.new_digest_read(permit.max_result_size(), short_read_allowed)
              : memory_limiter.new_data_read(permit.max_result_size(), short_read_allowed));
 
+    if (query_schema->cf_name() == "test") {
+        dbglog("ranges:");
+        for (const auto& r : partition_ranges) {
+            dbglog("range: {}", r);
+        }
+    }
+
     query_state qs(query_schema, cmd, opts, partition_ranges, std::move(accounter));
 
     std::optional<query::querier> querier_opt;
@@ -3584,7 +3591,7 @@ table::query(schema_ptr query_schema,
 
         if (!querier_opt) {
             query::querier_base::querier_config conf(_config.tombstone_warn_threshold);
-            dbglog("table::query");
+            dbglog("table::query for range {}", range);
             querier_opt = query::querier(as_mutation_source(), query_schema, permit, range, qs.cmd.slice, trace_state, conf);
         }
         auto& q = *querier_opt;

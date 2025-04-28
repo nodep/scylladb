@@ -50,7 +50,7 @@ mutation_reader
 row_cache::create_underlying_reader(read_context& ctx, mutation_source& src, const dht::partition_range& pr) {
     schema_ptr entry_schema = to_query_domain(ctx.slice(), _schema);
     if (entry_schema->cf_name() == "test") {
-        dbglog("in create_underlying_reader ()");
+        dbglog("in create_underlying_reader () for range {}", pr);
     }
     auto reader = src.make_reader_v2(entry_schema, ctx.permit(), pr, ctx.slice(), ctx.trace_state(), streamed_mutation::forwarding::yes);
     ctx.on_underlying_created();
@@ -596,6 +596,8 @@ public:
     }
 
     future<> fast_forward_to(dht::partition_range&& pr) {
+        if (_cache.schema()->cf_name() == "test")
+            dbglog("fast forward in range_pop for range: {}", pr);
         if (!pr.start()) {
             _last_key = row_cache::previous_entry_pointer();
         } else if (!pr.start()->is_inclusive() && pr.start()->value().has_key()) {
@@ -605,8 +607,6 @@ public:
             _last_key = {};
         }
 
-        if (_cache.schema()->cf_name() == "test")
-            dbglog("fast forward in range_pop");
         return _reader.fast_forward_to(std::move(pr));
     }
     future<> close() noexcept {
@@ -643,7 +643,7 @@ private:
         if (_is_test)
             dbgloggreen("{}: do_read_from_primary()", fmt::ptr(this), *_pr);
         return _cache._read_section(_cache._tracker.region(), [this] () -> mutation_reader_opt {
-            if (_is_test) dbgloggreen("{}: _read_section()", fmt::ptr(this), *_pr);
+            if (_is_test) dbgloggreen("{}: _read_section() pr == {}", fmt::ptr(this), *_pr);
             bool not_moved = true;
             if (!_primary.valid()) {
                 if (_is_test) dbgloggreen("{}: _primary is not valid; advancing to {}", fmt::ptr(this), *_pr, as_ring_position_view(_lower_bound));
@@ -674,9 +674,9 @@ private:
                 if (_primary.in_range()) {
                     if (_is_test) dbgloggreen("{}: _primary.in_range() == true", fmt::ptr(this));
                     cache_entry& e = _primary.entry();
-                    _secondary_range = dht::partition_range(_lower_bound,
-                        dht::partition_range::bound{e.key(), false});
+                    _secondary_range = dht::partition_range(_lower_bound, dht::partition_range::bound{e.key(), false});
                     _lower_bound = dht::partition_range::bound{e.key(), true};
+                    if (_is_test) dbgloggreen("{}: _secondary_range == {}  _lower_bound == {}", fmt::ptr(this), _secondary_range, as_ring_position_view(_lower_bound));
                     _secondary_in_progress = true;
                     return std::nullopt;
                 } else {
@@ -684,10 +684,12 @@ private:
                     dht::ring_position_comparator cmp(*_read_context->schema());
                     auto range = _pr->trim_front(std::optional<dht::partition_range::bound>(_lower_bound), cmp);
                     if (!range) {
+                        if (_is_test) dbgloggreen("{}: !range", fmt::ptr(this));
                         return std::nullopt;
                     }
                     _lower_bound = dht::partition_range::bound{dht::ring_position::max()};
                     _secondary_range = std::move(*range);
+                    if (_is_test) dbgloggreen("{}: _secondary_range == {}  _lower_bound == {}", fmt::ptr(this), _secondary_range, as_ring_position_view(_lower_bound));
                     _secondary_in_progress = true;
                     return std::nullopt;
                 }
@@ -709,10 +711,10 @@ private:
 
     future<mutation_reader_opt> read_from_secondary() {
         if (_is_test)
-            dbgloggreen("{}: reading from secondary...", fmt::ptr(this), *_pr);
+            dbgloggreen("{}: reading from secondary... {}", fmt::ptr(this), *_pr);
         return _secondary_reader().then([this] (mutation_reader_opt&& fropt) {
             if (_is_test)
-                dbgloggreen("{}: reading from secondary complete", fmt::ptr(this), *_pr);
+                dbgloggreen("{}: reading from secondary complete {}", fmt::ptr(this), *_pr);
             if (fropt) {
                 return make_ready_future<mutation_reader_opt>(std::move(fropt));
             } else {
@@ -776,6 +778,9 @@ public:
                     }
                 });
             }
+        }).then([this]{
+            if (_is_test)
+                dbgloggreen("{}: fill_buffer() complete", fmt::ptr(this));
         });
     }
     virtual future<> next_partition() override {
@@ -789,7 +794,7 @@ public:
     }
     virtual future<> fast_forward_to(const dht::partition_range& pr) override {
         if (_is_test)
-            dbgloggreen("{}: fast_forward_to(pr)", fmt::ptr(this));
+            dbgloggreen("{}: fast_forward_to() pr == {}", fmt::ptr(this), pr);
         clear_buffer();
         _end_of_stream = false;
         _secondary_in_progress = false;

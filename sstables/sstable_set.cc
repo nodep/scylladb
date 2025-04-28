@@ -828,35 +828,36 @@ public:
 
         auto readers = std::vector<mutation_reader>();
 
-        if (_is_test)
-            dbglog("---- starting for partition range {}", *_pr);
+        //if (_is_test)
+        //    dbglog("---- starting for partition range {}", *_pr);
 
         do {
             auto selection = _selector->select({_selector_position, _pr});
             _selector_position = selection.next_position;
 
             if (_is_test)
-                dbglog("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
-                    _selector_position);
+                dbglog("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(), _selector_position);
 
             irclogger.trace("{}: {} sstables to consider, advancing selector to {}", fmt::ptr(this), selection.sstables.size(),
                     _selector_position);
 
             readers.clear();
-            if (_is_test  &&  !selection.sstables.empty())
-                dbglog("{} sstables", selection.sstables.size());
+            //if (_is_test  &&  !selection.sstables.empty())
+            //    dbglog("{} sstables", selection.sstables.size());
             for (auto& sst : selection.sstables) {
-                if (_is_test)
-                    dbglog("sstable: {}", sst);
+                //if (_is_test)
+                //    dbglog("sstable: {}", sst);
                 if (_read_sstable_gens.emplace(sst->generation()).second) {
                     readers.push_back(create_reader(sst));
                 }
             }
         } while (!_selector_position.is_max() && readers.empty() && (!pos || dht::ring_position_tri_compare(*_s, *pos, _selector_position) >= 0));
 
-        if (_is_test)
-            dbglog("---- ended");
+        //if (_is_test)
+        //    dbglog("---- ended");
 
+        if (_is_test)
+            dbglog("{}: created {} new readers", fmt::ptr(this), readers.size());
         irclogger.trace("{}: created {} new readers", fmt::ptr(this), readers.size());
 
         // prevents sstable_set::incremental_selector::_current_sstables from holding reference to
@@ -865,8 +866,8 @@ public:
             _selector.reset();
         }
 
-        if (_is_test)
-            dbglog("returning {} readers", readers.size());
+        //if (_is_test)
+        //    dbglog("returning {} readers", readers.size());
         return readers;
     }
 

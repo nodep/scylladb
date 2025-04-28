@@ -90,8 +90,12 @@ public:
         _last_key = { };
         _new_last_key = { };
         if (_reader) {
+            if (_cache.schema()->cf_name() == "test")   dbglog("_reader is present; _reader_creation_phase {} phase {}", _reader_creation_phase, phase);
             if (_reader_creation_phase == phase) {
                 ++_cache._tracker._stats.underlying_partition_skips;
+                if (_cache.schema()->cf_name() == "test")      dbglog("_reader->fast_forward_to(_range)  {}", _range);
+                mutation_reader::impl& impl = _reader->get_impl();
+                dbglogyellow("impl of autoupdating_underlying_reader is {}", typeid(impl).name());
                 return _reader->fast_forward_to(_range);
             } else {
                 ++_cache._tracker._stats.underlying_recreations;

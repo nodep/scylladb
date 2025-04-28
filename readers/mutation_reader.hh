@@ -412,6 +412,10 @@ public:
         return _impl->operator()();
     }
 
+    impl& get_impl() {
+        return *_impl;
+    }
+
     template <typename Consumer>
     requires FlatMutationReaderConsumerV2<Consumer>
     auto consume_pausable(Consumer consumer) {

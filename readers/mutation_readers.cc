@@ -1540,6 +1540,8 @@ public:
         clear_buffer();
         _end_of_stream = false;
         _compactor.abandon_current_partition();
+        mutation_reader::impl& impl = _reader.get_impl();
+        dbglogyellow("impl of compacting_reader._reader is {}", typeid(impl).name());
         return _reader.fast_forward_to(pr);
     }
     virtual future<> fast_forward_to(position_range pr) override {

@@ -600,6 +600,7 @@ future<> mutation_reader_merger::next_partition() {
 }
 
 future<> mutation_reader_merger::fast_forward_to(const dht::partition_range& pr) {
+    dbglogyellow("mutation_reader_merger::fast_forward_to(const dht::partition_range& pr) {}", pr);
     _single_reader = { };
     _gallop_mode_hits = 0;
     _next.clear();
@@ -607,10 +608,14 @@ future<> mutation_reader_merger::fast_forward_to(const dht::partition_range& pr)
     _fragment_heap.clear();
     _reader_heap.clear();
 
+    dbglogyellow("cleared");
     for (auto it = _all_readers.begin(); it != _all_readers.end(); ++it) {
+        dbglogyellow("adding reader");
         _next.emplace_back(it, mutation_fragment_v2::kind::partition_end);
     }
     return parallel_for_each(_all_readers, [&pr] (mutation_reader& mr) {
+        mutation_reader::impl& impl = mr.get_impl();
+        dbglogyellow("impl of mutation_reader_merger._all_readers is {}", typeid(impl).name());
         return mr.fast_forward_to(pr);
     }).then([this, &pr] {
         add_readers(_selector->fast_forward_to(pr));
