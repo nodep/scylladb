@@ -943,9 +943,12 @@ class tablet_incremental_selector : public sstables::incremental_selector_impl {
 public:
     tablet_incremental_selector(const tablet_sstable_set& tset)
             : _tset(tset)
-    {}
+    {
+        dbglog("{}: creating {}", fmt::ptr(this), tset.size());
+    }
 
     virtual std::tuple<dht::partition_range, std::vector<sstables::shared_sstable>, dht::ring_position_ext> select(const selector_pos& s) override {
+        dbglog();
         // Always return minimum singular range, such that incremental_selector::select() will always call this function,
         // which in turn will find the next sstable set to select sstables from.
         const dht::partition_range current_range = dht::partition_range::make_singular(dht::ring_position::min());

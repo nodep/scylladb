@@ -1540,6 +1540,7 @@ private:
                 co_await _index_reader->advance_reverse_to_next_partition();
             }
         } else {
+            dbglog("_sst->get_stats().on_range_partition_read(); _pr == {}", _pr);
             _sst->get_stats().on_range_partition_read();
             co_await get_index_reader().advance_to(_pr);
         }
@@ -1603,6 +1604,7 @@ public:
         }
     }
     virtual future<> fast_forward_to(const dht::partition_range& pr) override {
+        dbglogred("mx_sstable_mutation_reader::fast_forward_to() for file: {}  range: {}", _sst->get_filename(), pr);
         if (reversed()) {
             // FIXME
             on_internal_error(sstlog, "mx reader: fast_forward_to(partition_range) not supported for reversed queries");

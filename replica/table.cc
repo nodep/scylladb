@@ -2828,6 +2828,9 @@ table::sstables_as_snapshot_source() {
             //        dbglog("sstable new: {}", sst->get_filename());
             //    });
             //}
+            if (_schema->cf_name() == "test") {
+                dbglog("calling make_sstable_reader() for range == {}", r);
+            }
             auto reader = make_sstable_reader(std::move(s), std::move(permit), sst_set, r, slice, std::move(trace_state), fwd, fwd_mr);
             return make_compacting_reader(
                 std::move(reader),

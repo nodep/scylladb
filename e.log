@@ -1,3 +1,7 @@
+// sstable == snapshot?
+
+CREATE TABLE ks.test (pk int PRIMARY KEY, c int);
+
     -9157060164899361011, pk=23)
 last_token=-8070450532247928833, keyspace_name='ks', repair_scheduler_config=repair_scheduler_config(auto_repair_enabled=False, auto_repair_threshold=864000), resize_seq_number=2, resize_task_info=None, resize_type='none', table_name='test', tablet_count=16, migration_task_info=None, new_replicas=None, repair_task_info=None, repair_time=None, replicas=[(UUID('6238f6b8-7b3a-47c6-b272-3ff76132ff7e'), 0), (UUID('69393d39-a052-4c09-95ac-b1b18d933359'), 0), (UUID('bd4ce0b9-8b53-44e3-bda5-1bd8b8e8fac5'), 0)], session=None, stage=None, transition=None)
     -7509452495886106294, pk=5)

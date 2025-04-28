@@ -768,7 +768,7 @@ public:
                     dbgloggreen("{}: is_end_of_stream() == {}  is_buffer_full() == {}", fmt::ptr(this), is_end_of_stream(), is_buffer_full());
                 return is_end_of_stream() || is_buffer_full(); }, [this] {
             if (_is_test)
-                dbgloggreen("{}: filling buffer {} {}", fmt::ptr(this), !_reader, _read_next_partition);
+                dbgloggreen("{}: filling buffer !_reader == {}  _read_next_partition == {}", fmt::ptr(this), !_reader, _read_next_partition);
             if (!_reader || _read_next_partition) {
                 return read_next_partition();
             } else {

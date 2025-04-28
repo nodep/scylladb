@@ -52,9 +52,9 @@ async def test_missing_data(manager: ManagerClient):
 
     await manager.api.flush_keyspace(servers[0].ip_addr, 'ks')
 
-    logger.info('tokens:')
-    for row in await cql.run_async('SELECT token(pk), pk FROM ks.test', host=hosts[0]):
-        logger.info(row)
+    # logger.info('tokens:')
+    # for row in await cql.run_async('SELECT token(pk), pk FROM ks.test', host=hosts[0]):
+    #     logger.info(row)
 
     s = ''
     for row in await cql.run_async(f"SELECT * FROM system.tablets WHERE table_name = 'test' ALLOW FILTERING"):
