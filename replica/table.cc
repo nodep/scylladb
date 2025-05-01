@@ -2738,15 +2738,21 @@ void tablet_storage_group_manager::update_effective_replication_map(const locato
     //  problem as fresh node won't have any data in new range and migration cleanup invalidates the
     //  range being moved away.
     if (schema()->cf_name() == "test") {
+        static thread_local bool done = false;
+        if (!done) {
+            dbglog("asd ----------------------------------------------------------");
+            done = true;
+        }
         if (!tablet_migrating_in  &&  (old_tablet_count != new_tablet_count)) {
-            dbglog("found it! tablet_migrating_in = {}  old_tablet_count == {} new_tablet_count == {}",
+            dbglog("asd found it! tablet_migrating_in = {}  old_tablet_count == {} new_tablet_count == {}",
                 tablet_migrating_in, old_tablet_count, new_tablet_count);
         } else if (tablet_migrating_in) {
-            dbglog("found it and it is good! old_tablet_count == {} new_tablet_count == {}",
+            dbglog("asd found it and it is good! old_tablet_count == {} new_tablet_count == {}",
                 old_tablet_count, new_tablet_count);
         }
     }
-    if (tablet_migrating_in || old_tablet_count != new_tablet_count) {
+    if (tablet_migrating_in /*|| old_tablet_count != new_tablet_count*/) {
+        dbglog("asd refreshing mutation source");
         refresh_mutation_source();
     }
 }
