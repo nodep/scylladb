@@ -1286,12 +1286,16 @@ public:
             }
 
             co_await utils::get_local_injector().inject("merge_for_missing_data", [&] (auto& handler) -> future<> {
-                const size_t tablet_cnt = handler.template get<size_t>("tablets_cnt").value();
-                if (s->cf_name() == "test"  &&  table_plan.current_tablet_count == tablet_cnt) {
-                    lblogger.info("from current/target: {} {} {}", table_plan.current_tablet_count, target_tablet_count.tablet_count, target_tablet_count.reason);
-                    target_tablet_count.tablet_count = table_plan.current_tablet_count / 2;
-                    target_tablet_count.reason = "test merge";
-                    lblogger.info("merging {}", target_tablet_count.tablet_count);
+                const size_t merge_tablets_cnt = handler.template get<size_t>("merge_tablets_cnt").value();
+                if (s->cf_name() == "test") {
+                    if (table_plan.current_tablet_count == merge_tablets_cnt) {
+                        target_tablet_count.tablet_count = table_plan.current_tablet_count / 2;
+                        target_tablet_count.reason = "test merge";
+                        lblogger.debug("Merging table 'test' which currently has {} tablets", table_plan.current_tablet_count);
+                    } else {
+                        target_tablet_count.tablet_count = table_plan.current_tablet_count;
+                        target_tablet_count.reason = "";
+                    }
                 }
                 return make_ready_future<>();
             });
@@ -1402,9 +1406,17 @@ public:
         for (auto&& [table, table_plan] : plan.tables) {
             table_plan.target_tablet_count_aligned = 1u << log2ceil(table_plan.target_tablet_count);
 
+            auto tbl = _db.get_tables_metadata().get_table_if_exists(table);
+            const bool is_test = bool(tbl) ? tbl->schema()->cf_name() == "test" : false;
             if (table_plan.target_tablet_count_aligned > table_plan.current_tablet_count) {
-                //table_plan.resize_decision = locator::resize_decision::split();
+                if (is_test) {
+                    dbglog("splitting test {}", table_plan.target_tablet_count);
+                }
+                table_plan.resize_decision = locator::resize_decision::split();
             } else if (table_plan.target_tablet_count_aligned < table_plan.current_tablet_count) {
+                if (is_test) {
+                    dbglog("merging test {}", table_plan.target_tablet_count);
+                }
                 table_plan.resize_decision = locator::resize_decision::merge();
             }
 

@@ -37,6 +37,9 @@ async def test_missing_data(manager: ManagerClient):
     cql = manager.get_cql()
     hosts = await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
 
+    await manager.api.disable_tablet_balancing(servers[0].ip_addr)
+
+    # create a table with 32 tablets and disable auto compaction
     inital_tablets = 32
 
     await cql.run_async(f"CREATE KEYSPACE ks WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 3}} AND tablets = {{'initial': {inital_tablets}}}")
@@ -45,78 +48,57 @@ async def test_missing_data(manager: ManagerClient):
     for s in servers:
         await manager.api.disable_autocompaction(s.ip_addr, 'ks', 'test')
 
+    # insert one record per tablet on average
     num_records = inital_tablets
 
     for i in range(num_records):
         cql.execute(f'INSERT INTO ks.test (pk, c) VALUES ({i}, {i})')
 
-    await manager.api.flush_keyspace(servers[0].ip_addr, 'ks')
+    # flush everything
+    for s in servers:
+        await manager.api.flush_keyspace(servers[0].ip_addr, 'ks')
 
-    # logger.info('tokens:')
-    # for row in await cql.run_async('SELECT token(pk), pk FROM ks.test', host=hosts[0]):
-    #     logger.info(row)
+    # force merge on the test table
+    merge_tablets_cnt = inital_tablets
+    for s in servers:
+        await manager.api.enable_injection(s.ip_addr, 'merge_for_missing_data', one_shot=False, parameters={'merge_tablets_cnt': merge_tablets_cnt})
 
-    s = ''
-    for row in await cql.run_async(f"SELECT * FROM system.tablets WHERE table_name = 'test' ALLOW FILTERING"):
-        s += f'{row}\n'
-    logger.info(f'original tablets:\n{s}')
+    await manager.api.enable_tablet_balancing(servers[0].ip_addr)
 
-    tablets_cnt = inital_tablets
-
+    # wait for merge to complete
+    expect_tablet_count = merge_tablets_cnt // 2
+    started = time.time()
     while True:
-        # allow merge
-        for s in servers:
-            await manager.api.enable_injection(s.ip_addr, 'merge_for_missing_data', one_shot=False, parameters={'tablets_cnt': tablets_cnt})
+        s = ''
+        act_tablet_count = 0
+        for row in await cql.run_async(f"SELECT * FROM system.tablets WHERE table_name = 'test' ALLOW FILTERING"):
+            s += f'{row}\n'
+            act_tablet_count += 1
+        logger.info(f'actual/expected tablet count: {act_tablet_count}/{expect_tablet_count}')
 
-        while True:
-            s = ''
-            act_tablet_count = 0
-            for row in await cql.run_async(f"SELECT * FROM system.tablets WHERE table_name = 'test' ALLOW FILTERING"):
-                s += f'{row}\n'
-                act_tablet_count += 1
-            logger.info(f'actual/expected tablet count: {act_tablet_count}/{tablets_cnt // 2}')
+        if act_tablet_count == expect_tablet_count:
+            logger.info(f'tablets:\n{s}')
+            break
 
-            if act_tablet_count == tablets_cnt // 2:
-                tablets_cnt = act_tablet_count
-                logger.info(f'tablets:\n{s}')
-                break
-
-            await asyncio.sleep(.1)
-
-        logger.info('merged!!!')
-
-        for i in range(len(hosts)):
-            qry = 'SELECT * FROM ks.test'
-            stmt = SimpleStatement(qry, consistency_level = ConsistencyLevel.ONE)
-            logger.info(f'Running: "{qry}" on server ID: {servers[i].server_id}')
-            res = cql.execute(stmt, host=hosts[i])
-            missing = set(range(num_records))
-            rec_count = 0
-            for row in res:
-                rec_count += 1
-                missing.discard(row.pk)
-            if missing:
-                logger.info(f'missing: {missing}')
-
-                '''
-                # run with tracing
-                try:
-                    logger.info(f'Running tracing for query {qry}')
-                    res = cql.execute(qry, trace=True, host=hosts[i])
-                    tracing = res.get_all_query_traces(max_wait_sec_per=900)
-                    page_traces = []
-                    for trace in tracing:
-                        trace_events = []
-                        for event in trace.events:
-                            trace_events.append(f"  {event.source} {event.source_elapsed} {event.description}")
-                        page_traces.append("\n".join(trace_events))
-                    logger.info("Tracing {}:\n{}\n".format(qry, "\n".join(page_traces)))
-                    for row in res:
-                        logger.info(f'  data row: {row}')
-                except Exception as ex:
-                    self.log.warning(f'  exception: {ex}')
-                '''
-
-            assert rec_count == num_records, f"received {rec_count} records instead of {num_records} while querying server {servers[i].server_id}; tablet count {tablets_cnt}"
+        if (time.time() - started) > 60:
+            assert False, 'Timeout while waiting for tablet merge'
 
         await asyncio.sleep(.1)
+
+    logger.info(f'merged test table; new number of tablets: {expect_tablet_count}')
+
+    # assrert the number of records has not changed
+    for i in range(len(hosts)):
+        qry = 'SELECT * FROM ks.test'
+        stmt = SimpleStatement(qry, consistency_level = ConsistencyLevel.ONE)
+        logger.info(f'Running: "{qry}" on server ID: {servers[i].server_id}')
+        res = cql.execute(stmt, host=hosts[i])
+        missing = set(range(num_records))
+        rec_count = 0
+        for row in res:
+            rec_count += 1
+            missing.discard(row.pk)
+
+        assert rec_count == num_records, f"received {rec_count} records instead of {num_records} while querying server {servers[i].server_id}; missing keys: {missing}"
+
+    await asyncio.sleep(.1)
