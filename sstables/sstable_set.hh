@@ -119,9 +119,12 @@ public:
         streamed_mutation::forwarding,
         mutation_reader::forwarding,
         const sstable_predicate&) const;
+
+    virtual void dump(const char* prefix) const {}
 };
 
 class sstable_set : public enable_lw_shared_from_this<sstable_set> {
+public:
     std::unique_ptr<sstable_set_impl> _impl;
 public:
     ~sstable_set();

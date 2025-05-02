@@ -1220,7 +1220,7 @@ public:
             }
         });
 
-        auto process_table = [&] (table_id table, schema_ptr s, const tablet_aware_replication_strategy* rs, size_t tablet_count) {
+        auto process_table = [&] (table_id table, schema_ptr s, const tablet_aware_replication_strategy* rs, size_t tablet_count) -> future <> {
             table_sizing& table_plan = plan.tables[table];
             table_plan.current_tablet_count = tablet_count;
             rs_by_table[table] = rs;
@@ -1285,6 +1285,21 @@ public:
                 maybe_apply({table_plan.current_tablet_count, "current count"});
             }
 
+            co_await utils::get_local_injector().inject("merge_for_missing_data", [&] (auto& handler) -> future<> {
+                const size_t merge_tablets_cnt = handler.template get<size_t>("merge_tablets_cnt").value();
+                if (s->cf_name() == "test") {
+                    if (table_plan.current_tablet_count == merge_tablets_cnt) {
+                        target_tablet_count.tablet_count = table_plan.current_tablet_count / 2;
+                        target_tablet_count.reason = "test merge";
+                        lblogger.debug("Merging table 'test' which currently has {} tablets", table_plan.current_tablet_count);
+                    } else {
+                        target_tablet_count.tablet_count = table_plan.current_tablet_count;
+                        target_tablet_count.reason = "";
+                    }
+                }
+                return make_ready_future<>();
+            });
+                
             table_plan.target_tablet_count = target_tablet_count.tablet_count;
             table_plan.target_tablet_count_reason = target_tablet_count.reason;
 
@@ -1294,12 +1309,12 @@ public:
 
         for (auto&& [table, tmap] : _tm->tablets().all_tables()) {
             auto [s, rs] = get_schema_and_rs(table);
-            process_table(table, s, rs, tmap->tablet_count());
+            co_await process_table(table, s, rs, tmap->tablet_count());
             co_await coroutine::maybe_yield();
         }
 
         if (new_table) {
-            process_table(new_table->id(), new_table, new_rs, 0);
+            co_await process_table(new_table->id(), new_table, new_rs, 0);
         }
 
         // Below section ensures we respect the _tablets_per_shard_goal.
@@ -3061,12 +3076,17 @@ public:
 
         if (_tm->tablets().balancing_enabled()) {
             plan.merge(co_await make_intranode_plan(nodes, nodes_to_drain));
+            for (const auto& mig: plan.migrations()) {
+                dbglogcyan("migrating {} from {} to {}", mig.tablet.tablet, mig.src.shard, mig.dst.shard);
+            }
         }
 
         if (_tm->tablets().balancing_enabled() && plan.empty()) {
             auto dc_merge_plan = co_await make_merge_colocation_plan(dc, nodes);
             auto level = dc_merge_plan.tablet_migration_count() > 0 ? seastar::log_level::info : seastar::log_level::debug;
             lblogger.log(level, "Prepared {} migrations for co-locating sibling tablets in DC {}", dc_merge_plan.tablet_migration_count(), dc);
+            if (dc_merge_plan.tablet_migration_count() > 0)
+                dbglogblue("Prepared {} migrations for co-locating sibling tablets in DC {}", dc_merge_plan.tablet_migration_count(), dc);
             plan.merge(std::move(dc_merge_plan));
         }
 

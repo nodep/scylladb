@@ -747,15 +747,27 @@ future<std::vector<canonical_mutation>> read_tablet_mutations(seastar::sharded<r
 // its tablets/storage_groups compound_sstable_set:s.
 // The managed sets cannot be modified through tablet_sstable_set, but only jointly read from, so insert() and erase() are disabled.
 class tablet_sstable_set : public sstables::sstable_set_impl {
+public:
     schema_ptr _schema;
     locator::tablet_map _tablet_map;
     // Keep a single (compound) sstable_set per tablet/storage_group
-    absl::flat_hash_map<size_t, lw_shared_ptr<const sstables::sstable_set>, absl::Hash<size_t>> _sstable_sets;
+    std::map<size_t, lw_shared_ptr<const sstables::sstable_set>> _sstable_sets;
     // Used when ordering is required for correctness, but hot paths will use flat_hash_map
     // which provides faster lookup time.
     std::set<size_t> _sstable_set_ids;
     size_t _size = 0;
     uint64_t _bytes_on_disk = 0;
+
+    virtual void dump(const char* prefix) const override {
+        if (sstring(prefix) == "no refresh")
+            dbglogyellow("dumping tablet_sstable_set: {}", prefix);
+        else
+            dbglogred("dumping tablet_sstable_set: {}", prefix);
+        for (const auto& [key, value] : _sstable_sets) {
+            dbglog("tablet_id {} sstable_size {}", key, value->size());
+        }
+        dbglog("tablet_sstable_set dumped");
+    }
 
 public:
     tablet_sstable_set(schema_ptr s, const storage_group_manager& sgm, const locator::tablet_map& tmap)

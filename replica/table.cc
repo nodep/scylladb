@@ -2713,6 +2713,7 @@ void tablet_storage_group_manager::update_effective_replication_map(const locato
             auto range = new_tablet_map->get_token_range(tid);
             _storage_groups[tid.value()] = allocate_storage_group(*new_tablet_map, tid, std::move(range));
             tablet_migrating_in = true;
+            dbgloggreen("tablet {} migrated in", tid.value());
         }
     }
 
@@ -2732,8 +2733,27 @@ void tablet_storage_group_manager::update_effective_replication_map(const locato
     //  Also serves as a protection for clearing the cache on the new range, although it shouldn't be a
     //  problem as fresh node won't have any data in new range and migration cleanup invalidates the
     //  range being moved away.
-    if (tablet_migrating_in) {
+    const bool is_test = schema()->cf_name() == "test";
+    if (is_test) {
+        if (!tablet_migrating_in  &&  (old_tablet_count != new_tablet_count)) {
+            dbglog("found it! tablet_migrating_in = {}  old_tablet_count == {} new_tablet_count == {}",
+                tablet_migrating_in, old_tablet_count, new_tablet_count);
+        } else if (tablet_migrating_in) {
+            dbglog("found it and it is good! old_tablet_count == {} new_tablet_count == {}",
+                old_tablet_count, new_tablet_count);
+        }
+    }
+    if (tablet_migrating_in /*|| old_tablet_count != new_tablet_count*/) {
+        if (is_test) {
+            _t._sstables->_impl->dump("pre refresh");
+            dbglog("refreshing mutation source");
+        }
         refresh_mutation_source();
+        if (is_test)
+            _t._sstables->_impl->dump("post refresh");
+    } else {
+        //if (is_test)
+        //    _t._sstables->_impl->dump("no refresh");
     }
 }
 

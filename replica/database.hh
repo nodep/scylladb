@@ -456,7 +456,7 @@ public:
         cache_temperature rate;
         lowres_clock::time_point last_updated;
     };
-private:
+public:
     schema_ptr _schema;
     config _config;
     locator::effective_replication_map_ptr _erm;
