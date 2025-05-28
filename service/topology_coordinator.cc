@@ -3140,6 +3140,16 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
         stats += dc_stats;
     }
 
+    if (stats.tablet_stats) {
+        dbglog("--- load stats");
+        for (const auto& [host, tablet_ls] : *stats.tablet_stats) {
+            dbglog("host: {} capacity {} available {}", host, size2gb(tablet_ls.capacity), size2gb(tablet_ls.available));
+            for (const auto& [range_tablet_id, size] : tablet_ls.tablet_sizes) {
+                dbglog("  range: {} size: {}", range_tablet_id.token_range, size);
+            }
+        }
+    }
+
     for (auto& [table_id, table_load_stats] : stats.tables) {
         auto table_total_replicas = total_replicas.at(table_id);
         if (table_total_replicas == 0) {

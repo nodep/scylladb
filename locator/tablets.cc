@@ -708,6 +708,18 @@ load_stats& load_stats::operator+=(const load_stats& s) {
     for (auto& [host, cap] : s.capacity) {
         capacity[host] = cap;
     }
+    if (s.tablet_stats) {
+        if (!tablet_stats) {
+            tablet_stats = *s.tablet_stats;
+        } else {
+            for (auto& [host, tablet_ls] : *s.tablet_stats) {
+                tablet_load_stats& this_tablet_ls = (*tablet_stats)[host];
+                this_tablet_ls.capacity = tablet_ls.capacity;
+                this_tablet_ls.available = tablet_ls.available;
+                this_tablet_ls.tablet_sizes.insert(tablet_ls.tablet_sizes.begin(), tablet_ls.tablet_sizes.end());
+            }
+        }
+    }
     return *this;
 }
 

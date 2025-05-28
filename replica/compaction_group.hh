@@ -367,6 +367,7 @@ public:
     virtual utils::chunked_vector<storage_group_ptr> storage_groups_for_token_range(dht::token_range tr) const = 0;
 
     virtual locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept = 0;
+    virtual locator::tablet_load_stats tablet_load_stats() const noexcept = 0;
     virtual bool all_storage_groups_split() = 0;
     virtual future<> split_all_storage_groups(tasks::task_info tablet_split_task_info) = 0;
     virtual future<> maybe_split_compaction_group_of(size_t idx) = 0;

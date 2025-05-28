@@ -6756,9 +6756,12 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
     // double accounting (anomaly) in the reported size.
     auto tmlock = co_await get_token_metadata_lock();
 
+    const bool size_based_lb = _feature_service.size_based_load_balancing;
+    const locator::host_id this_host = _db.local().get_token_metadata().get_my_id();
+
     // Each node combines a per-table load map from all of its shards and returns it to the coordinator.
     // So if there are 1k nodes, there will be 1k RPCs in total.
-    auto load_stats = co_await _db.map_reduce0([&table_ids] (replica::database& db) -> future<locator::load_stats> {
+    auto load_stats = co_await _db.map_reduce0([&table_ids, size_based_lb, &this_host] (replica::database& db) -> future<locator::load_stats> {
         locator::load_stats load_stats{};
         auto& tables_metadata = db.get_tables_metadata();
 
@@ -6795,14 +6798,29 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
             };
 
             load_stats.tables.emplace(id, table->table_load_stats(tablet_filter));
+
+            if (size_based_lb) {
+                locator::tablet_load_stats tls = table->tablet_load_stats();
+                load_stats.tablet_stats = locator::tablet_load_stats_map{{{this_host, tls}}};
+            }
+
             co_await coroutine::maybe_yield();
         }
 
         co_return std::move(load_stats);
     }, locator::load_stats{}, std::plus<locator::load_stats>());
 
-    auto this_host = _db.local().get_token_metadata().get_my_id();
-    load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
+    if (size_based_lb) {
+        if (!load_stats.tablet_stats) {
+            load_stats.tablet_stats = locator::tablet_load_stats_map{{{this_host, locator::tablet_load_stats{}}}};
+        }
+        const std::filesystem::space_info si = _disk_space_monitor->space();
+        locator::tablet_load_stats& tls = (*load_stats.tablet_stats)[this_host];
+        tls.capacity = si.capacity;
+        tls.available = si.available;
+    } else {
+        load_stats.capacity[this_host] = _disk_space_monitor->space().capacity;
+    }
 
     co_return std::move(load_stats);
 }
