@@ -72,6 +72,13 @@ struct tablet_replica {
 
 using tablet_replica_set = utils::small_vector<tablet_replica, 3>;
 
+struct range_limited_tablet_id {
+    table_id table;
+    dht::token_range token_range;
+
+    bool operator==(const range_limited_tablet_id&) const = default;
+};
+
 }
 
 namespace std {
@@ -98,6 +105,15 @@ struct hash<locator::global_tablet_id> {
         return utils::hash_combine(
                 std::hash<table_id>()(id.table),
                 std::hash<locator::tablet_id>()(id.tablet));
+    }
+};
+
+template<>
+struct hash<locator::range_limited_tablet_id> {
+    size_t operator()(const locator::range_limited_tablet_id& rltid) const {
+        return utils::hash_combine(
+                std::hash<table_id>()(rltid.table),
+                std::hash<dht::token_range>()(rltid.token_range));
     }
 };
 
@@ -389,11 +405,23 @@ struct load_stats_v1 {
     std::unordered_map<table_id, table_load_stats> tables;
 };
 
+struct tablet_load_stats {
+    uint64_t used = 0;
+    uint64_t available = 0;
+
+    std::unordered_map<range_limited_tablet_id, uint64_t> tablet_sizes;
+};
+
+using tablet_load_stats_map = std::unordered_map<host_id, tablet_load_stats>;
+
 struct load_stats {
     std::unordered_map<table_id, table_load_stats> tables;
 
     // Capacity in bytes for data file storage.
     std::unordered_map<host_id, uint64_t> capacity;
+
+    // Size-based load balancing data
+    std::optional<tablet_load_stats_map> tablet_stats;
 
     static load_stats from_v1(load_stats_v1&&);
 

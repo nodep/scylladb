@@ -28,9 +28,23 @@ struct load_stats_v1 final {
     std::unordered_map<::table_id, locator::table_load_stats> tables;
 };
 
+struct range_limited_tablet_id {
+    ::table_id table;
+    dht::token_range token_range;
+};
+
+struct tablet_load_stats {
+    uint64_t used;
+    uint64_t available;
+
+    std::unordered_map<locator::range_limited_tablet_id, uint64_t> tablet_sizes;
+};
+
 struct load_stats {
     std::unordered_map<::table_id, locator::table_load_stats> tables;
     std::unordered_map<locator::host_id, uint64_t> capacity;
+
+    std::optional<std::unordered_map<locator::host_id, locator::tablet_load_stats>> tablet_stats [[version 2025.3]];
 };
 
 }

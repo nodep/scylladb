@@ -730,6 +730,10 @@ public:
             .split_ready_seq_number = std::numeric_limits<locator::resize_decision::seq_number_t>::min()
         };
     }
+
+    locator::tablet_load_stats tablet_load_stats() const noexcept override {
+        return locator::tablet_load_stats{};
+    }
     bool all_storage_groups_split() override { return true; }
     future<> split_all_storage_groups(tasks::task_info tablet_split_task_info) override { return make_ready_future(); }
     future<> maybe_split_compaction_group_of(size_t idx) override { return make_ready_future(); }
@@ -863,6 +867,7 @@ public:
     }
 
     locator::table_load_stats table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept override;
+    locator::tablet_load_stats tablet_load_stats() const noexcept override;
     bool all_storage_groups_split() override;
     future<> split_all_storage_groups(tasks::task_info tablet_split_task_info) override;
     future<> maybe_split_compaction_group_of(size_t idx) override;
@@ -2555,6 +2560,21 @@ locator::table_load_stats tablet_storage_group_manager::table_load_stats(std::fu
 
 locator::table_load_stats table::table_load_stats(std::function<bool(const locator::tablet_map&, locator::global_tablet_id)> tablet_filter) const noexcept {
     return _sg_manager->table_load_stats(std::move(tablet_filter));
+}
+
+locator::tablet_load_stats tablet_storage_group_manager::tablet_load_stats() const noexcept {
+    locator::tablet_load_stats tls;
+    for_each_storage_group([&] (size_t id, storage_group& sg) {
+        dht::token_range trange{_tablet_map->get_token_range(locator::tablet_id(id))};
+        locator::range_limited_tablet_id rl_tablet_id { schema()->id(), trange };
+        const uint64_t tablet_size = sg.live_disk_space_used();
+        tls.tablet_sizes[rl_tablet_id] = tablet_size;
+    });
+    return tls;
+}
+
+locator::tablet_load_stats table::tablet_load_stats() const noexcept {
+    return _sg_manager->tablet_load_stats();
 }
 
 void tablet_storage_group_manager::handle_tablet_split_completion(const locator::tablet_map& old_tmap, const locator::tablet_map& new_tmap) {
