@@ -42,6 +42,8 @@ static seastar::abort_source aborted;
 
 static const sstring dc = "dc1";
 
+static constexpr uint64_t huge_tablet_size_threshold = default_target_tablet_size * 10;
+
 static
 cql_test_config tablet_cql_test_config() {
     cql_test_config c;
@@ -115,6 +117,24 @@ void apply_plan(token_metadata& tm, const migration_plan& plan, locator::load_st
             tinfo.replicas = replace_replica(tinfo.replicas, mig.src, mig.dst);
             tmap.set_tablet(mig.tablet.tablet, tinfo);
         });
+        // Update load_stats
+        if (mig.src.host != mig.dst.host) {
+            const table_id& table = mig.tablet.table;
+            const locator::tablet_map& tmap = tm.tablets().get_tablet_map(table);
+            locator::range_limited_tablet_id rl_tid { table, tmap.get_token_range(mig.tablet.tablet) };
+            SCYLLA_ASSERT(load_stats.tablet_stats);
+            if (!(*load_stats.tablet_stats)[mig.src.host].tablet_sizes.contains(rl_tid)) {
+                throw std::runtime_error(format("Invalid src load_stats for migration: {}", mig));
+            }
+            if ((*load_stats.tablet_stats)[mig.dst.host].tablet_sizes.contains(rl_tid)) {
+                throw std::runtime_error(format("Invalid dst load_stats for migration: {}", mig));
+            }
+
+            auto& src_tablet_sizes = (*load_stats.tablet_stats)[mig.src.host].tablet_sizes;
+            auto& dst_tablet_sizes = (*load_stats.tablet_stats)[mig.dst.host].tablet_sizes;
+            dst_tablet_sizes[rl_tid] = src_tablet_sizes.at(rl_tid);
+            src_tablet_sizes.erase(rl_tid);
+        }
     }
     apply_resize_plan(tm, plan);
 }
@@ -201,6 +221,7 @@ struct params {
     int shards;
     int scale1 = 1;
     int scale2 = 1;
+    std::optional<unsigned> seed;
 };
 
 struct table_balance {
@@ -253,6 +274,34 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
+struct tablet_size_generator {
+    size_t tablet_count = 0;
+
+    tablet_size_generator(std::optional<unsigned> seed = std::nullopt) {
+        const size_t used_seed = seed.value_or(time(NULL));
+        testlog.info("random seed: {}", used_seed);
+        srand(used_seed);
+    }
+
+    uint64_t get(uint64_t range_min, uint64_t range_max) {
+        const double range = range_max - range_min;
+        const double factor = range / RAND_MAX;
+        return uint64_t(range_min + rand() * factor);
+    }
+
+    uint64_t generate() {
+        ++tablet_count;
+        if (tablet_count % 1000 == 0) {
+            return get(huge_tablet_size_threshold, huge_tablet_size_threshold * 5);
+        }
+        if (tablet_count % 51 == 0) {
+            return get(default_target_tablet_size * 2, huge_tablet_size_threshold);
+        }
+        return get(0, default_target_tablet_size * 2);
+    }
+};
+
+
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
     results global_res;
@@ -264,11 +313,15 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         topology_builder topo(e);
         std::vector<host_id> hosts;
         lw_shared_ptr<locator::load_stats> stats = make_lw_shared<locator::load_stats>();
+        stats->tablet_stats = tablet_load_stats_map{};
 
         auto add_host = [&] {
             auto host = topo.add_node(service::node_state::normal, shard_count);
             hosts.push_back(host);
-            stats->capacity[host] = default_target_tablet_size * shard_count;
+            const uint64_t capacity = default_target_tablet_size * shard_count;
+            const uint64_t available = capacity;
+            stats->capacity[host] = capacity;
+            (*stats->tablet_stats)[host] = tablet_load_stats{capacity, available, {}};
             testlog.info("Added new node: {}", host);
         };
 
@@ -296,6 +349,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             topo.set_node_state(host, service::node_state::left);
             testlog.info("Node decommissioned: {}", host);
             hosts.erase(hosts.begin() + i);
+            (*stats->tablet_stats).erase(host);
         };
 
         auto ks1 = add_keyspace(e, {{topo.dc(), p.rf1}}, p.tablets1.value_or(1));
@@ -304,6 +358,22 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         auto id2 = add_table(e, ks2).get();
         schema_ptr s1 = e.local_db().find_schema(id1);
         schema_ptr s2 = e.local_db().find_schema(id2);
+
+        // generate tablet sizes
+        tablet_size_generator tsg(p.seed);
+        for (auto&& [table, tmap] : stm.get()->tablets().all_tables()) {
+            tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
+                dht::token_range trange{tmap->get_token_range(tid)};
+                range_limited_tablet_id rng_tablet_id{table, trange};
+                for (const auto& replica : ti.replicas) {
+                    const uint64_t tablet_size = tsg.generate();
+                    locator::tablet_load_stats& tls = (*stats->tablet_stats)[replica.host];
+                    tls.tablet_sizes[rng_tablet_id] = tablet_size;
+                    testlog.debug("generated tablet size {} for {}:{}", tablet_size, table, tid);
+                }
+                return make_ready_future<>();
+            }).get();
+        }
 
         auto check_balance = [&] () -> cluster_balance {
             cluster_balance res;
@@ -457,6 +527,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
             ("rf1", bpo::value<int>(), "Replication factor for the first table.")
             ("rf2", bpo::value<int>(), "Replication factor for the second table.")
             ("shards", bpo::value<int>(), "Number of shards per node.")
+            ("seed", bpo::value<unsigned>(), "Tablet size random generator seed.")
             ("verbose", "Enables standard logging")
             ;
     return app.run(argc, argv, [&] {
@@ -483,6 +554,9 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                         .rf2 = app.configuration()["rf2"].as<int>(),
                         .shards = app.configuration()["shards"].as<int>(),
                     };
+                    if (app.configuration().count("seed")) {
+                        p.seed = app.configuration()["seed"].as<int>();
+                    }
                     run_simulation(p).get();
                 }
             } catch (seastar::abort_requested_exception&) {
