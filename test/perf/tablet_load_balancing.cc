@@ -38,9 +38,13 @@ using namespace locator;
 using namespace replica;
 using namespace service;
 
+static logging::logger testlblog("testlblog");
+
 static seastar::abort_source aborted;
 
 static const sstring dc = "dc1";
+
+static constexpr uint64_t huge_tablet_size_threshold = default_target_tablet_size * 10;
 
 static
 cql_test_config tablet_cql_test_config() {
@@ -100,7 +104,7 @@ void apply_resize_plan(token_metadata& tm, const migration_plan& plan) {
     }
     for (auto table_id : plan.resize_plan().finalize_resize) {
         auto& old_tmap = tm.tablets().get_tablet_map(table_id);
-        testlog.info("Setting new tablet map of size {}", old_tmap.tablet_count() * 2);
+        testlblog.info("Setting new tablet map of size {}", old_tmap.tablet_count() * 2);
         tablet_map tmap(old_tmap.tablet_count() * 2);
         tm.tablets().set_tablet_map(table_id, std::move(tmap));
     }
@@ -115,6 +119,24 @@ void apply_plan(token_metadata& tm, const migration_plan& plan, locator::load_st
             tinfo.replicas = replace_replica(tinfo.replicas, mig.src, mig.dst);
             tmap.set_tablet(mig.tablet.tablet, tinfo);
         });
+        // Update load_stats; ignore intranode migrations
+        if (mig.src.host != mig.dst.host) {
+            const table_id& table = mig.tablet.table;
+            const locator::tablet_map& tmap = tm.tablets().get_tablet_map(table);
+            locator::range_limited_tablet_id rl_tid { table, tmap.get_token_range(mig.tablet.tablet) };
+            SCYLLA_ASSERT(load_stats.tablet_stats);
+            if (!(*load_stats.tablet_stats)[mig.src.host].tablet_sizes.contains(rl_tid)) {
+                throw std::runtime_error(format("Invalid src load_stats for migration: {}", mig));
+            }
+            if ((*load_stats.tablet_stats)[mig.dst.host].tablet_sizes.contains(rl_tid)) {
+                throw std::runtime_error(format("Invalid dst load_stats for migration: {}", mig));
+            }
+
+            auto& src_tablet_sizes = (*load_stats.tablet_stats)[mig.src.host].tablet_sizes;
+            auto& dst_tablet_sizes = (*load_stats.tablet_stats)[mig.dst.host].tablet_sizes;
+            dst_tablet_sizes[rl_tid] = src_tablet_sizes.at(rl_tid);
+            src_tablet_sizes.erase(rl_tid);
+        }
     }
     apply_resize_plan(tm, plan);
 }
@@ -163,7 +185,7 @@ rebalance_stats rebalance_tablets(cql_test_env& e, locator::load_stats& load_sta
             .rebalance_count = 1,
         };
         stats += iteration_stats;
-        testlog.debug("Rebalance iteration {} took {:.3f} [s]: mig={}, bad={}, first_bad={}, eval={}, skiplist={}, skip: (load={}, rack={}, node={})",
+        testlblog.debug("Rebalance iteration {} took {:.3f} [s]: mig={}, bad={}, first_bad={}, eval={}, skiplist={}, skip: (load={}, rack={}, node={})",
                       i + 1, elapsed.count(),
                       lb_stats.migrations_produced,
                       lb_stats.bad_migrations,
@@ -180,7 +202,7 @@ rebalance_stats rebalance_tablets(cql_test_env& e, locator::load_stats& load_sta
             // causing test flakiness.
             save_tablet_metadata(e.local_db(), stm.get()->tablets(), guard.write_timestamp()).get();
             e.get_storage_service().local().load_tablet_metadata({}).get();
-            testlog.info("Rebalance took {:.3f} [s] after {} iteration(s)", stats.elapsed_time.count(), i + 1);
+            testlblog.info("Rebalance took {:.3f} [s] after {} iteration(s)", stats.elapsed_time.count(), i + 1);
             return stats;
         }
         stm.mutate_token_metadata([&] (token_metadata& tm) {
@@ -201,6 +223,7 @@ struct params {
     int shards;
     int scale1 = 1;
     int scale2 = 1;
+    std::optional<unsigned> seed;
 };
 
 struct table_balance {
@@ -253,6 +276,34 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
+struct tablet_size_generator {
+    size_t tablet_count = 0;
+
+    tablet_size_generator(std::optional<unsigned> seed = std::nullopt) {
+        const size_t used_seed = seed.value_or(time(NULL));
+        testlblog.info("random seed: {}", used_seed);
+        srand(used_seed);
+    }
+
+    uint64_t get(uint64_t range_min, uint64_t range_max) {
+        const double range = range_max - range_min;
+        const double factor = range / RAND_MAX;
+        return uint64_t(range_min + rand() * factor);
+    }
+
+    uint64_t generate() {
+        ++tablet_count;
+        if (tablet_count % 1000 == 0) {
+            return get(huge_tablet_size_threshold, huge_tablet_size_threshold * 5);
+        }
+        if (tablet_count % 51 == 0) {
+            return get(default_target_tablet_size * 2, huge_tablet_size_threshold);
+        }
+        return get(0, default_target_tablet_size * 2);
+    }
+};
+
+
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
     results global_res;
@@ -264,12 +315,16 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         topology_builder topo(e);
         std::vector<host_id> hosts;
         locator::load_stats stats;
+        stats.tablet_stats = tablet_load_stats_map{};
 
         auto add_host = [&] {
             auto host = topo.add_node(service::node_state::normal, shard_count);
             hosts.push_back(host);
-            stats.capacity[host] = default_target_tablet_size * shard_count;
-            testlog.info("Added new node: {}", host);
+            const uint64_t capacity = default_target_tablet_size * shard_count;
+            const uint64_t available = capacity;
+            stats.capacity[host] = capacity;
+            (*stats.tablet_stats)[host] = tablet_load_stats{capacity, available, {}};
+            testlblog.info("Added new node: {}", host);
         };
 
         for (int i = 0; i < n_hosts; ++i) {
@@ -294,8 +349,9 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 throw std::runtime_error(format("Host {} still has replicas!", host));
             }
             topo.set_node_state(host, service::node_state::left);
-            testlog.info("Node decommissioned: {}", host);
+            testlblog.info("Node decommissioned: {}", host);
             hosts.erase(hosts.begin() + i);
+            (*stats.tablet_stats).erase(host);
         };
 
         auto ks1 = add_keyspace(e, {{topo.dc(), p.rf1}}, p.tablets1.value_or(1));
@@ -305,10 +361,26 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         schema_ptr s1 = e.local_db().find_schema(id1);
         schema_ptr s2 = e.local_db().find_schema(id2);
 
+        // generate tablet sizes
+        tablet_size_generator tsg(p.seed);
+        for (auto&& [table, tmap] : stm.get()->tablets().all_tables()) {
+            tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
+                dht::token_range trange{tmap->get_token_range(tid)};
+                range_limited_tablet_id rng_tablet_id{table, trange};
+                for (const auto& replica : ti.replicas) {
+                    const uint64_t tablet_size = tsg.generate();
+                    locator::tablet_load_stats& tls = (*stats.tablet_stats)[replica.host];
+                    tls.tablet_sizes[rng_tablet_id] = tablet_size;
+                    testlblog.debug("generated tablet size {} for {}:{}", tablet_size, table, tid);
+                }
+                return make_ready_future<>();
+            }).get();
+        }
+
         auto check_balance = [&] () -> cluster_balance {
             cluster_balance res;
 
-            testlog.debug("tablet metadata: {}", stm.get()->tablets());
+            testlblog.debug("tablet metadata: {}", stm.get()->tablets());
 
             int table_index = 0;
             for (auto s : {s1, s2}) {
@@ -326,7 +398,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                     auto overcommit = double(minmax.max()) / avg_shard_load;
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);
-                    testlog.info("Load on host {} for table {}: total={}, min={}, max={}, spread={}, avg={:.2f}, overcommit={:.2f}",
+                    testlblog.info("Load on host {} for table {}: total={}, min={}, max={}, spread={}, avg={:.2f}, overcommit={:.2f}",
                                  h, s->cf_name(), node_load, minmax.min(), minmax.max(), minmax.max() - minmax.min(), avg_shard_load, overcommit);
                     node_load_minmax.update(node_load);
                     sum_node_load += node_load;
@@ -336,12 +408,12 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 auto shard_overcommit = shard_load_minmax.max() / avg_shard_load;
                 // Overcommit given the best distribution of tablets given current number of tablets.
                 auto best_shard_overcommit = div_ceil(sum_node_load, shard_count) / avg_shard_load;
-                testlog.info("Shard overcommit: {:.2f}, best={:.2f}", shard_overcommit, best_shard_overcommit);
+                testlblog.info("Shard overcommit: {:.2f}, best={:.2f}", shard_overcommit, best_shard_overcommit);
 
                 auto node_imbalance = node_load_minmax.max() - node_load_minmax.min();
                 auto avg_node_load = double(sum_node_load) / hosts.size();
                 auto node_overcommit = node_load_minmax.max() / avg_node_load;
-                testlog.info("Node imbalance: min={}, max={}, spread={}, avg={:.2f}, overcommit={:.2f}",
+                testlblog.info("Node imbalance: min={}, max={}, spread={}, avg={:.2f}, overcommit={:.2f}",
                               node_load_minmax.min(), node_load_minmax.max(), node_imbalance, avg_node_load, node_overcommit);
 
                 res.tables[table_index++] = {
@@ -357,11 +429,11 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 global_res.worst.tables[i].node_overcommit = std::max(global_res.worst.tables[i].node_overcommit, t.node_overcommit);
             }
 
-            testlog.info("Overcommit: {}", res);
+            testlblog.info("Overcommit: {}", res);
             return res;
         };
 
-        testlog.debug("tablet metadata: {}", stm.get()->tablets());
+        testlblog.debug("tablet metadata: {}", stm.get()->tablets());
 
         e.get_tablet_allocator().local().set_use_table_aware_balancing(tablet_aware);
 
@@ -383,37 +455,37 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 }
 
 future<> run_simulation(const params& p, const sstring& name = "") {
-    testlog.info("[run {}] params: {}", name, p);
+    testlblog.info("[run {}] params: {}", name, p);
 
     auto total_tablet_count = p.tablets1.value_or(0) * p.rf1 + p.tablets2.value_or(0) * p.rf2;
-    testlog.info("[run {}] tablet count: {}", name, total_tablet_count);
-    testlog.info("[run {}] tablet count / shard: {:.3f}", name, double(total_tablet_count) / (p.nodes * p.shards));
+    testlblog.info("[run {}] tablet count: {}", name, total_tablet_count);
+    testlblog.info("[run {}] tablet count / shard: {:.3f}", name, double(total_tablet_count) / (p.nodes * p.shards));
 
     auto res = co_await test_load_balancing_with_many_tables(p, true);
-    testlog.info("[run {}] Overcommit       : init : {}", name, res.init);
-    testlog.info("[run {}] Overcommit       : worst: {}", name, res.worst);
-    testlog.info("[run {}] Overcommit       : last : {}", name, res.last);
-    testlog.info("[run {}] Overcommit       : time : {:.3f} [s], max={:.3f} [s], count={}", name,
+    testlblog.info("[run {}] Overcommit       : init : {}", name, res.init);
+    testlblog.info("[run {}] Overcommit       : worst: {}", name, res.worst);
+    testlblog.info("[run {}] Overcommit       : last : {}", name, res.last);
+    testlblog.info("[run {}] Overcommit       : time : {:.3f} [s], max={:.3f} [s], count={}", name,
                  res.stats.elapsed_time.count(), res.stats.max_rebalance_time.count(), res.stats.rebalance_count);
 
     if (res.stats.elapsed_time > seconds_double(1)) {
-        testlog.warn("[run {}] Scheduling took longer than 1s!", name);
+        testlblog.warn("[run {}] Scheduling took longer than 1s!", name);
     }
 
     auto old_res = co_await test_load_balancing_with_many_tables(p, false);
-    testlog.info("[run {}] Overcommit (old) : init : {}", name, old_res.init);
-    testlog.info("[run {}] Overcommit (old) : worst: {}", name, old_res.worst);
-    testlog.info("[run {}] Overcommit (old) : last : {}", name, old_res.last);
-    testlog.info("[run {}] Overcommit       : time : {:.3f} [s], max={:.3f} [s], count={}", name,
+    testlblog.info("[run {}] Overcommit (old) : init : {}", name, old_res.init);
+    testlblog.info("[run {}] Overcommit (old) : worst: {}", name, old_res.worst);
+    testlblog.info("[run {}] Overcommit (old) : last : {}", name, old_res.last);
+    testlblog.info("[run {}] Overcommit       : time : {:.3f} [s], max={:.3f} [s], count={}", name,
                  old_res.stats.elapsed_time.count(), old_res.stats.max_rebalance_time.count(), old_res.stats.rebalance_count);
 
     for (int i = 0; i < nr_tables; ++i) {
         if (res.worst.tables[i].shard_overcommit > old_res.worst.tables[i].shard_overcommit) {
-            testlog.warn("[run {}] table{} shard overcommit worse!", name, i + 1);
+            testlblog.warn("[run {}] table{} shard overcommit worse!", name, i + 1);
         }
         auto overcommit = res.worst.tables[i].shard_overcommit;
         if (overcommit > 1.2) {
-            testlog.warn("[run {}] table{} shard overcommit {:.2f} > 1.2!", name, i + 1, overcommit);
+            testlblog.warn("[run {}] table{} shard overcommit {:.2f} > 1.2!", name, i + 1, overcommit);
         }
     }
 }
@@ -457,14 +529,15 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
             ("rf1", bpo::value<int>(), "Replication factor for the first table.")
             ("rf2", bpo::value<int>(), "Replication factor for the second table.")
             ("shards", bpo::value<int>(), "Number of shards per node.")
+            ("seed", bpo::value<unsigned>(), "Tablet size random generator seed.")
             ("verbose", "Enables standard logging")
             ;
     return app.run(argc, argv, [&] {
         return seastar::async([&] {
             if (!app.configuration().contains("verbose")) {
-                auto testlog_level = logging::logger_registry().get_logger_level("testlog");
+                auto testlblog_level = logging::logger_registry().get_logger_level("testlblog");
                 logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
-                logging::logger_registry().set_logger_level("testlog", testlog_level);
+                logging::logger_registry().set_logger_level("testlblog", testlblog_level);
             }
             auto stop_test = defer([] {
                 aborted.request_abort();
@@ -483,6 +556,9 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                         .rf2 = app.configuration()["rf2"].as<int>(),
                         .shards = app.configuration()["shards"].as<int>(),
                     };
+                    if (app.configuration().count("seed")) {
+                        p.seed = app.configuration()["seed"].as<int>();
+                    }
                     run_simulation(p).get();
                 }
             } catch (seastar::abort_requested_exception&) {
