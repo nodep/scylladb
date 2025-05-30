@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "service/tablet_allocator_fwd.hh"
 #include "locator/topology.hh"
 #include "locator/token_metadata.hh"
 #include "locator/tablets.hh"
@@ -26,58 +27,88 @@ namespace locator {
 /// on shards of the whole cluster.
 class load_sketch {
     using shard_id = seastar::shard_id;
-    using load_type = ssize_t; // In tablets.
+    using load_type = double; // Disk usage percentage (0.0 to 1.0)
+
+    struct disk_usage {
+        uint64_t capacity = 0;
+        uint64_t used = 0;
+
+        load_type get_load() const {
+            if (capacity == 0) {
+                return 0;
+            }
+            return load_type(used) / capacity;
+        }
+    };
 
     struct shard_load {
         shard_id id;
-        load_type load;
+        disk_usage du;
+        size_t tablet_count = 0;
+
+        load_type get_load() const {
+            return du.get_load();
+        }
     };
 
     // Less-comparator which orders by load first (ascending), and then by shard id (ascending).
     struct shard_load_cmp {
-        bool operator()(const shard_load& a, const shard_load& b) const {
-            return a.load == b.load ? a.id < b.id : a.load < b.load;
+        std::vector<shard_load>& shards;
+        shard_load_cmp(std::vector<shard_load>& sl)
+            : shards(sl) {
+        }
+
+        bool operator()(shard_id aid, shard_id bid) const {
+            auto load_a = shards[aid].get_load();
+            auto load_b = shards[bid].get_load();
+            return load_a == load_b ? aid < bid : load_a < load_b;
         }
     };
 
     struct node_load {
-        absl::btree_set<shard_load, shard_load_cmp> _shards_by_load;
-        std::vector<load_type> _shards;
-        load_type _load = 0;
+        std::vector<shard_load> _shards;
+        std::set<shard_id, shard_load_cmp> _shards_by_load;
+        disk_usage _du;
 
-        node_load(size_t shard_count) : _shards(shard_count) {
+        node_load(const node_load& c)
+                : _shards(c._shards)
+                , _shards_by_load(shard_load_cmp(_shards))
+                , _du(c._du) {
+        }
+
+        node_load(size_t shard_count, uint64_t capacity)
+                : _shards(shard_count)
+                , _shards_by_load(shard_load_cmp(_shards))
+                , _du{} {
+            uint64_t shard_capacity = capacity / shard_count;
             for (shard_id i = 0; i < shard_count; ++i) {
-                _shards[i] = 0;
+                _shards[i].du.capacity = shard_capacity;
             }
         }
 
-        void update_shard_load(shard_id shard, load_type load_delta) {
-            _load += load_delta;
-
-            auto old_load = _shards[shard];
-            auto new_load = old_load + load_delta;
-            _shards_by_load.erase(shard_load{shard, old_load});
-            _shards[shard] = new_load;
-            _shards_by_load.insert(shard_load{shard, new_load});
+        void update_shard_load(shard_id shard, int64_t tablet_size_delta) {
+            _shards_by_load.erase(shard);
+            _shards[shard].du.used += tablet_size_delta;
+            _shards_by_load.insert(shard);
+            _du.used += tablet_size_delta;
         }
 
         void populate_shards_by_load() {
             _shards_by_load.clear();
             for (shard_id i = 0; i < _shards.size(); ++i) {
-                _shards_by_load.insert(shard_load{i, _shards[i]});
+                _shards_by_load.insert(i);
             }
         }
 
-        load_type& load() noexcept {
-            return _load;
-        }
-
-        const load_type& load() const noexcept {
-            return _load;
+        load_type get_load() const noexcept {
+            return _du.get_load();
         }
     };
     std::unordered_map<host_id, node_load> _nodes;
     token_metadata_ptr _tm;
+    load_stats_ptr _load_stats;
+
+
 private:
     tablet_replica_set get_replicas_for_tablet_load(const tablet_info& ti, const tablet_transition_info* trinfo) const {
         // We reflect migrations in the load as if they already happened,
@@ -85,7 +116,26 @@ private:
         return trinfo ? trinfo->next : ti.replicas;
     }
 
-    future<> populate_table(const tablet_map& tmap, std::optional<host_id> host, std::optional<sstring> only_dc) {
+    uint64_t get_disk_capacity_for_node(host_id node) {
+        if (_load_stats && _load_stats->tablet_stats) {
+            const tablet_load_stats& tls = _load_stats->tablet_stats->at(node);
+            return tls.capacity;
+        }
+        return 1;
+    }
+
+    uint64_t get_tablet_size(host_id node, const range_limited_tablet_id& rl_tid) {
+        if (_load_stats && _load_stats->tablet_stats) {
+            const tablet_load_stats& tls = _load_stats->tablet_stats->at(node);
+            auto ts_i = tls.tablet_sizes.find(rl_tid); 
+            if (ts_i != tls.tablet_sizes.end()) {
+                return ts_i->second;
+            }
+        }
+        return service::default_target_tablet_size;
+    }
+
+    future<> populate_table(table_id table, const tablet_map& tmap, std::optional<host_id> host, std::optional<sstring> only_dc) {
         const topology& topo = _tm->get_topology();
         co_await tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
             for (auto&& replica : get_replicas_for_tablet_load(ti, tmap.get_tablet_transition_info(tid))) {
@@ -97,12 +147,13 @@ private:
                     if (only_dc && node->dc_rack().dc != *only_dc) {
                         continue;
                     }
-                    _nodes.emplace(replica.host, node_load{node->get_shard_count()});
+                    _nodes.emplace(replica.host, node_load{node->get_shard_count(), get_disk_capacity_for_node(replica.host)});
                 }
                 node_load& n = _nodes.at(replica.host);
                 if (replica.shard < n._shards.size()) {
-                    n.load() += 1;
-                    n._shards[replica.shard] += 1;
+                    auto tablet_size = get_tablet_size(replica.host, {table, tmap.get_token_range(tid)});
+                    n._du.used += tablet_size;
+                    n._shards[replica.shard].du.used += tablet_size;
                     // Note: as an optimization, _shards_by_load is populated later in populate_shards_by_load()
                 }
             }
@@ -110,8 +161,8 @@ private:
         });
     }
 public:
-    load_sketch(token_metadata_ptr tm)
-        : _tm(std::move(tm)) {
+    load_sketch(token_metadata_ptr tm, load_stats_ptr load_stats = {})
+        : _tm(std::move(tm)), _load_stats(std::move(load_stats)){
     }
 
     future<> populate(std::optional<host_id> host = std::nullopt,
@@ -122,11 +173,11 @@ public:
         if (only_table) {
             if (_tm->tablets().has_tablet_map(*only_table)) {
                 auto& tmap = _tm->tablets().get_tablet_map(*only_table);
-                co_await populate_table(tmap, host, only_dc);
+                co_await populate_table(*only_table, tmap, host, only_dc);
             }
         } else {
             for (auto&& [table, tmap]: _tm->tablets().all_tables()) {
-                co_await populate_table(*tmap, host, only_dc);
+                co_await populate_table(table, *tmap, host, only_dc);
             }
         }
 
@@ -152,7 +203,7 @@ public:
             if (shard_count == 0) {
                 throw std::runtime_error(format("Shard count not known for node {}", node));
             }
-            auto [i, _] = _nodes.emplace(node, node_load{shard_count});
+            auto [i, _] = _nodes.emplace(node, node_load{shard_count, get_disk_capacity_for_node(node)});
             i->second.populate_shards_by_load();
         }
         return _nodes.at(node);
@@ -160,39 +211,29 @@ public:
 
     shard_id get_least_loaded_shard(host_id node) {
         auto& n = ensure_node(node);
-        const shard_load& s = *n._shards_by_load.begin();
-        return s.id;
+        return *n._shards_by_load.begin();
     }
 
     shard_id get_most_loaded_shard(host_id node) {
         auto& n = ensure_node(node);
-        const shard_load& s = *std::prev(n._shards_by_load.end());
-        return s.id;
+        return *std::prev(n._shards_by_load.end());
     }
 
-    void unload(host_id node, shard_id shard) {
+    void unload(host_id node, shard_id shard, uint64_t tablet_size = service::default_target_tablet_size) {
         auto& n = _nodes.at(node);
-        n.update_shard_load(shard, -1);
+        n.update_shard_load(shard, -int64_t(tablet_size));
     }
 
-    void pick(host_id node, shard_id shard) {
+    void pick(host_id node, shard_id shard, uint64_t tablet_size = service::default_target_tablet_size) {
         auto& n = _nodes.at(node);
-        n.update_shard_load(shard, 1);
+        n.update_shard_load(shard, int64_t(tablet_size));
     }
 
     load_type get_load(host_id node) const {
         if (!_nodes.contains(node)) {
             return 0;
         }
-        return _nodes.at(node).load();
-    }
-
-    load_type total_load() const {
-        load_type total = 0;
-        for (auto&& n : _nodes) {
-            total += n.second.load();
-        }
-        return total;
+        return _nodes.at(node).get_load();
     }
 
     load_type get_avg_shard_load(host_id node) const {
@@ -200,15 +241,14 @@ public:
             return 0;
         }
         auto& n = _nodes.at(node);
-        return div_ceil(n.load(), n._shards.size());
+        return n.get_load() / n._shards.size();
     }
 
-    double get_real_avg_shard_load(host_id node) const {
+    uint64_t get_disk_used(host_id node) {
         if (!_nodes.contains(node)) {
             return 0;
         }
-        auto& n = _nodes.at(node);
-        return double(n.load()) / n._shards.size();
+        return _nodes.at(node)._du.used;
     }
 
     shard_id get_shard_count(host_id node) const {
@@ -230,8 +270,8 @@ public:
         min_max_tracker<load_type> minmax;
         if (_nodes.contains(node)) {
             auto& n = _nodes.at(node);
-            for (auto&& load: n._shards) {
-                minmax.update(load);
+            for (auto&& shard: n._shards) {
+                minmax.update(shard.get_load());
             }
         } else {
             minmax.update(0);
@@ -240,7 +280,7 @@ public:
     }
 
     // Returns nullopt if capacity is not known.
-    std::optional<double> get_allocated_utilization(host_id node, const locator::load_stats& stats, uint64_t target_tablet_size) const {
+    std::optional<double> get_allocated_utilization(host_id node, const locator::load_stats& stats) const {
         if (!_nodes.contains(node)) {
             return std::nullopt;
         }
@@ -248,8 +288,7 @@ public:
         if (!stats.capacity.contains(node)) {
             return std::nullopt;
         }
-        auto capacity = stats.capacity.at(node);
-        return capacity > 0 ? double(n.load() * target_tablet_size) / capacity : 0;
+        return n.get_load();
     }
 };
 

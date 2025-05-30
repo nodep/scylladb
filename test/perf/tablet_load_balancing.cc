@@ -132,7 +132,7 @@ void apply_plan(token_metadata& tm, const migration_plan& plan, locator::load_st
                 throw std::runtime_error(format("Invalid dst load_stats for migration: {}", mig));
             }
 
-            auto& src_tablet_sizes = (*load_stats.tablet_stats)[mig.src.host].tablet_sizes;
+            auto& src_tablet_sizes = (*load_stats.tablet_stats)[mig.dst.host].tablet_sizes;
             auto& dst_tablet_sizes = (*load_stats.tablet_stats)[mig.dst.host].tablet_sizes;
             dst_tablet_sizes[rl_tid] = src_tablet_sizes.at(rl_tid);
             src_tablet_sizes.erase(rl_tid);
@@ -171,9 +171,10 @@ rebalance_stats rebalance_tablets(cql_test_env& e, locator::load_stats& load_sta
 
     for (size_t i = 0; i < max_iterations; ++i) {
         auto prev_lb_stats = talloc.stats().for_dc(dc);
+        auto load_stats_p = make_lw_shared<locator::load_stats>(load_stats);
         auto start_time = std::chrono::steady_clock::now();
 
-        auto plan = talloc.balance_tablets(stm.get(), make_lw_shared<locator::load_stats>(load_stats), skiplist).get();
+        auto plan = talloc.balance_tablets(stm.get(), load_stats_p, skiplist).get();
 
         auto end_time = std::chrono::steady_clock::now();
         auto lb_stats = talloc.stats().for_dc(dc) - prev_lb_stats;
@@ -314,7 +315,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
         topology_builder topo(e);
         std::vector<host_id> hosts;
-        locator::load_stats stats;
+        locator::load_stats_ptr stats;
         stats.tablet_stats = tablet_load_stats_map{};
 
         auto add_host = [&] {
@@ -384,7 +385,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
             int table_index = 0;
             for (auto s : {s1, s2}) {
-                load_sketch load(stm.get());
+                load_sketch load(stm.get(), );
                 load.populate(std::nullopt, s->id()).get();
 
                 min_max_tracker<uint64_t> shard_load_minmax;
@@ -394,7 +395,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 for (auto h: hosts) {
                     auto minmax = load.get_shard_minmax(h);
                     auto node_load = load.get_load(h);
-                    auto avg_shard_load = load.get_real_avg_shard_load(h);
+                    auto avg_shard_load = load.get_avg_shard_load(h);
                     auto overcommit = double(minmax.max()) / avg_shard_load;
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);
@@ -538,6 +539,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                 auto testlblog_level = logging::logger_registry().get_logger_level("testlblog");
                 logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
                 logging::logger_registry().set_logger_level("testlblog", testlblog_level);
+                logging::logger_registry().set_logger_level(yellow("dbglog"), seastar::log_level::info);
             }
             auto stop_test = defer([] {
                 aborted.request_abort();
