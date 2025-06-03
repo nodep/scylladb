@@ -1113,7 +1113,7 @@ public:
                 set_cell(r.cells(), "ip", data_value(inet_address(*ip)));
             }
             set_cell(r.cells(), "tablets_allocated", int64_t(load.get_tablet_count(host)));
-            set_cell(r.cells(), "tablets_allocated_per_shard", data_value(load.get_avg_tablet_count(host)));
+            set_cell(r.cells(), "tablets_allocated_per_shard", data_value(int64_t(load.get_avg_tablet_count(host))));
             set_cell(r.cells(), "storage_allocated_load", data_value(int64_t(load.get_disk_used(host))));
 
             if (stats && stats->capacity.contains(host)) {

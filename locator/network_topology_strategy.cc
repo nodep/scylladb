@@ -384,7 +384,7 @@ future<tablet_replica_set> network_topology_strategy::add_tablets_in_dc(schema_p
     candidates_list existing_racks;
 
     // We use this list to start allocating from an
-    // unpoplated rack.
+    // unpopulated rack.
     candidates_list new_racks;
 
     for (const auto& [rack, nodes] : all_dc_racks) {

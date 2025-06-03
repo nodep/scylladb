@@ -71,7 +71,7 @@ class load_sketch {
         std::vector<shard_load> _shards;
         absl::btree_set<shard_id, shard_load_cmp> _shards_by_load;
         disk_usage _du;
-        size_t tablet_count = 0;
+        size_t _tablet_count = 0;
 
         node_load(const node_load& c)
                 : _shards(c._shards)
@@ -117,6 +117,7 @@ class load_sketch {
             }
             _shards_by_load.insert(shard);
             _du.used += tablet_size_delta;
+            _tablet_count += count_delta;
         }
 
         void populate_shards_by_load() {
@@ -151,7 +152,7 @@ private:
                 return _load_stats->capacity.at(node);
             }
         }
-        return 650UL * 1024 * 1024 * 1024;
+        return service::default_target_tablet_size;
     }
 
     uint64_t get_tablet_size(host_id node, const range_limited_tablet_id& rl_tid) {
@@ -183,7 +184,7 @@ private:
                 if (replica.shard < n._shards.size()) {
                     auto tablet_size = get_tablet_size(replica.host, {table, tmap.get_token_range(tid)});
                     n._du.used += tablet_size;
-                    n.tablet_count++;
+                    n._tablet_count++;
                     n._shards[replica.shard].du.used += tablet_size;
                     n._shards[replica.shard].tablet_count++;
                     // Note: as an optimization, _shards_by_load is populated later in populate_shards_by_load()
@@ -272,15 +273,23 @@ public:
         if (!_nodes.contains(node)) {
             return 0;
         }
-        return _nodes.at(node).tablet_count;
+        return _nodes.at(node)._tablet_count;
     }
 
-    load_type get_avg_tablet_count(host_id node) const {
+    uint64_t get_avg_tablet_count(host_id node) const {
         if (!_nodes.contains(node)) {
             return 0;
         }
         auto& n = _nodes.at(node);
-        return n.tablet_count / n._shards.size();
+        return div_ceil(n._tablet_count, n._shards.size());
+    }
+
+    double get_real_avg_tablet_count(host_id node) const {
+        if (!_nodes.contains(node)) {
+            return 0;
+        }
+        auto& n = _nodes.at(node);
+        return double(n._tablet_count) / n._shards.size();
     }
 
     uint64_t get_disk_used(host_id node) {
@@ -320,13 +329,10 @@ public:
 
     // Returns nullopt if capacity is not known.
     std::optional<double> get_allocated_utilization(host_id node) const {
-        if (!_nodes.contains(node)  ||  !_load_stats) {
+        if (!_nodes.contains(node)) {
             return std::nullopt;
         }
         auto& n = _nodes.at(node);
-        if (!_load_stats->tablet_stats->contains(node)) {
-            return std::nullopt;
-        }
         return n.get_load();
     }
 

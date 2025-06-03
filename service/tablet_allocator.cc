@@ -3330,3 +3330,26 @@ auto fmt::formatter<service::tablet_migration_info>::format(const service::table
         -> decltype(ctx.out()) {
     return fmt::format_to(ctx.out(), "{{tablet: {}, src: {}, dst: {}}}", mig.tablet, mig.src, mig.dst);
 }
+
+template<>
+struct fmt::formatter<locator::disk_usage> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const locator::disk_usage& du, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "capacity {} used {} load {:.3f}",
+                              size2gb(du.capacity), size2gb(du.used), du.get_load());
+    }
+};
+
+void locator::load_sketch::dump(sstring reason) {
+    dbglog("------ dumping load {}", reason);
+    uint64_t total_used = 0;
+    for (const auto& [host, n] : _nodes) {
+        dbglog("node {}: load {} tablets {}", host, n._du, n._tablet_count);
+        for (const shard_id shard: n._shards_by_load) {
+            const shard_load& sload = n._shards[shard];
+            dbglog("  shard {}: load {} tablets {}", shard, sload.du, sload.tablet_count);
+            total_used += sload.du.used;
+        }
+    }
+    dbglog("total used: {}", size2gb(total_used));
+}

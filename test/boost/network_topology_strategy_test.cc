@@ -219,7 +219,7 @@ void check_tablets_balance(const tablet_map& tmap,
             load_map[node.dc_rack().dc][node.dc_rack().rack][r.host][r.shard]++;
         }
     }
-    testlog.debug("load_map={}", load_map);
+    testlog.info("load_map={}", load_map);
 
     for (const auto& [dc, dc_racks] : load_map) {
         size_t replicas_in_dc = 0;
@@ -530,7 +530,7 @@ SEASTAR_THREAD_TEST_CASE(NetworkTopologyStrategy_tablets_test) {
 
 // Called in a seastar thread
 static void test_random_balancing(sharded<snitch_ptr>& snitch, gms::inet_address my_address) {
-    auto seed = tests::random::get_int<int64_t>();
+    int64_t seed = 3;//tests::random::get_int<int64_t>();
     testlog.info("test_random_balancing: seed={}", seed);
     std::default_random_engine rand(seed);
 
@@ -607,6 +607,7 @@ static void test_random_balancing(sharded<snitch_ptr>& snitch, gms::inet_address
     BOOST_REQUIRE(tab_awr_ptr);
     auto tmap = tab_awr_ptr->allocate_tablets_for_new_table(s, tmptr, tablet_count).get();
     full_ring_check(tmap, ars_ptr, stm.get());
+    dbglog("checking 1");
     check_tablets_balance(tmap, nts_ptr, topo);
 
     if (rf_per_dc < nodes_per_dc) {
@@ -620,6 +621,7 @@ static void test_random_balancing(sharded<snitch_ptr>& snitch, gms::inet_address
         BOOST_REQUIRE(inc_tab_awr_ptr);
         auto inc_tmap = inc_tab_awr_ptr->reallocate_tablets(s, tmptr, tmap).get();
         full_ring_check(inc_tmap, ars_ptr, stm.get());
+        dbglog("checking 2");
         check_tablets_balance(inc_tmap, inc_nts_ptr, topo);
     }
 
@@ -634,6 +636,7 @@ static void test_random_balancing(sharded<snitch_ptr>& snitch, gms::inet_address
         BOOST_REQUIRE(dec_tab_awr_ptr);
         auto dec_tmap = dec_tab_awr_ptr->reallocate_tablets(s, tmptr, tmap).get();
         full_ring_check(dec_tmap, ars_ptr, stm.get());
+        dbglog("checking 3");
         check_tablets_balance(dec_tmap, dec_nts_ptr, topo);
     }
 }

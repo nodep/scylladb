@@ -274,29 +274,6 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
-template<>
-struct fmt::formatter<locator::disk_usage> : fmt::formatter<string_view> {
-    template <typename FormatContext>
-    auto format(const locator::disk_usage& du, FormatContext& ctx) const {
-        return fmt::format_to(ctx.out(), "capacity {} used {} load {:.3f}",
-                              size2gb(du.capacity), size2gb(du.used), du.get_load());
-    }
-};
-
-void locator::load_sketch::dump(sstring reason) {
-    dbglog("------ dumping load {}", reason);
-    uint64_t total_used = 0;
-    for (const auto& [host, n] : _nodes) {
-        dbglog("node {}: load {} tablets {}", host, n._du, n.tablet_count);
-        for (const shard_id shard: n._shards_by_load) {
-            const shard_load& sload = n._shards[shard];
-            dbglog("  shard {}: load {} tablets {}", shard, sload.du, sload.tablet_count);
-            total_used += sload.du.used;
-        }
-    }
-    dbglog("total used: {}", size2gb(total_used));
-}
-
 struct tablet_size_generator {
     size_t tablet_count = 0;
 
@@ -327,6 +304,7 @@ struct tablet_size_generator {
 
 future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware) {
     auto cfg = tablet_cql_test_config();
+    cfg.db_config->rf_rack_valid_keyspaces.set(false);
     results global_res;
     co_await do_with_cql_env_thread([&] (auto& e) {
         const int n_hosts = p.nodes;
@@ -377,6 +355,27 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         auto ks1 = add_keyspace(e, {{topo.dc(), p.rf1}}, p.tablets1.value_or(1));
         auto ks2 = add_keyspace(e, {{topo.dc(), p.rf2}}, p.tablets2.value_or(1));
         auto id1 = add_table(e, ks1).get();
+        std::map<table_id, std::map<host_id, std::map<shard_id, size_t>>> load_map;
+        for (auto&& [table, tmap] : stm.get()->tablets().all_tables()) {
+            tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
+                for (const auto& replica : ti.replicas) {
+                    load_map[table][replica.host][replica.shard]++;
+                }
+                return make_ready_future<>();
+            }).get();
+        }
+        for (const auto& [table, nodes]: load_map) {
+            dbglog("table {}", table);
+            for (const auto& [host, shards]: nodes) {
+                dbglog("  host {}", host);
+                for (const auto& [shard, count]: shards) {
+                    dbglog("    shard {} count {}", shard, count);
+                }
+            }
+        }
+
+        throw std::runtime_error("done!");
+
         auto id2 = add_table(e, ks2).get();
         schema_ptr s1 = e.local_db().find_schema(id1);
         schema_ptr s2 = e.local_db().find_schema(id2);
@@ -423,7 +422,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 for (auto h: hosts) {
                     auto minmax = load.get_shard_minmax(h);
                     auto node_load = load.get_load(h);
-                    auto avg_shard_load = load.get_avg_tablet_count(h);
+                    auto avg_shard_load = load.get_real_avg_tablet_count(h);
                     auto overcommit = double(minmax.max()) / avg_shard_load;
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);
@@ -567,6 +566,7 @@ int scylla_tablet_load_balancing_main(int argc, char** argv) {
                 auto testlog_level = logging::logger_registry().get_logger_level("testlog");
                 logging::logger_registry().set_all_loggers_level(seastar::log_level::warn);
                 logging::logger_registry().set_logger_level("testlog", testlog_level);
+                logging::logger_registry().set_logger_level(yellow("dbglog"), testlog_level);
             }
             auto stop_test = defer([] {
                 aborted.request_abort();
