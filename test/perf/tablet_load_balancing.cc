@@ -274,6 +274,29 @@ struct fmt::formatter<params> : fmt::formatter<string_view> {
     }
 };
 
+template<>
+struct fmt::formatter<locator::disk_usage> : fmt::formatter<string_view> {
+    template <typename FormatContext>
+    auto format(const locator::disk_usage& du, FormatContext& ctx) const {
+        return fmt::format_to(ctx.out(), "capacity {} used {} load {:.3f}",
+                              size2gb(du.capacity), size2gb(du.used), du.get_load());
+    }
+};
+
+void locator::load_sketch::dump(sstring reason) {
+    dbglog("------ dumping load {}", reason);
+    uint64_t total_used = 0;
+    for (const auto& [host, n] : _nodes) {
+        dbglog("node {}: load {} tablets {}", host, n._du, n.tablet_count);
+        for (const shard_id shard: n._shards_by_load) {
+            const shard_load& sload = n._shards[shard];
+            dbglog("  shard {}: load {} tablets {}", shard, sload.du, sload.tablet_count);
+            total_used += sload.du.used;
+        }
+    }
+    dbglog("total used: {}", size2gb(total_used));
+}
+
 struct tablet_size_generator {
     size_t tablet_count = 0;
 
@@ -318,10 +341,9 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
         auto add_host = [&] {
             auto host = topo.add_node(service::node_state::normal, shard_count);
             hosts.push_back(host);
-            const uint64_t capacity = default_target_tablet_size * shard_count;
-            const uint64_t available = capacity;
+            const uint64_t capacity = 650UL * 1024 * 1024 * 1024;
             stats->capacity[host] = capacity;
-            (*stats->tablet_stats)[host] = tablet_load_stats{capacity, available, {}};
+            (*stats->tablet_stats)[host] = tablet_load_stats{0, capacity, {}};
             testlog.info("Added new node: {}", host);
         };
 
@@ -361,6 +383,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
 
         // generate tablet sizes
         tablet_size_generator tsg(p.seed);
+        uint64_t total_tablet_sizes = 0;
         for (auto&& [table, tmap] : stm.get()->tablets().all_tables()) {
             tmap->for_each_tablet([&] (tablet_id tid, const tablet_info& ti) -> future<> {
                 dht::token_range trange{tmap->get_token_range(tid)};
@@ -370,19 +393,27 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                     locator::tablet_load_stats& tls = (*stats->tablet_stats)[replica.host];
                     tls.tablet_sizes[rng_tablet_id] = tablet_size;
                     testlog.debug("generated tablet size {} for {}:{}", tablet_size, table, tid);
+                    total_tablet_sizes += tablet_size;
                 }
                 return make_ready_future<>();
             }).get();
         }
+        testlog.info("Total tablet sizes {}", size2gb(total_tablet_sizes));
 
         auto check_balance = [&] () -> cluster_balance {
             cluster_balance res;
 
             testlog.debug("tablet metadata: {}", stm.get()->tablets());
 
+            {
+                load_sketch load(stm.get(), stats);
+                load.populate().get();
+                load.dump("all nodes; all tables");
+            }
+
             int table_index = 0;
             for (auto s : {s1, s2}) {
-                load_sketch load(stm.get());
+                load_sketch load(stm.get(), stats);
                 load.populate(std::nullopt, s->id()).get();
 
                 min_max_tracker<uint64_t> shard_load_minmax;
@@ -392,7 +423,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
                 for (auto h: hosts) {
                     auto minmax = load.get_shard_minmax(h);
                     auto node_load = load.get_load(h);
-                    auto avg_shard_load = load.get_real_avg_shard_load(h);
+                    auto avg_shard_load = load.get_avg_tablet_count(h);
                     auto overcommit = double(minmax.max()) / avg_shard_load;
                     shard_load_minmax.update(minmax.max());
                     shard_count += load.get_shard_count(h);

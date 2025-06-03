@@ -727,6 +727,16 @@ public:
         const locator::topology& topo = _tm->get_topology();
         migration_plan plan;
 
+        //if (_table_load_stats  &&  _table_load_stats->tablet_stats) {
+        //    dbglog("-- dump of load_stats in make_plan()");
+        //    for (const auto& [host, tls] : *_table_load_stats->tablet_stats) {
+        //        dbglog("  host {}", host);
+        //        for (const auto& [rl_tid, tablet_size] : tls.tablet_sizes) {
+        //            dbglog("    tablet {} {} size {}", rl_tid.table, rl_tid.token_range, size2gb(tablet_size));
+        //        }
+        //    }
+        //}
+
         // Prepare plans for each DC separately and combine them to be executed in parallel.
         for (auto&& dc : topo.get_datacenters()) {
             auto dc_plan = co_await make_plan(dc);
