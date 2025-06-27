@@ -528,6 +528,16 @@ class load_balancer {
     // Data structure used for making load-balancing decisions over a set of nodes.
     using node_load_map = std::unordered_map<host_id, node_load>;
 
+    void dump(const node_load_map& nlm, sstring reason = "") {
+        lblogger.info("--- nodes {}", reason);
+        for (const auto& [host, nl] : nlm) {
+            lblogger.info(" node: {} tablets: {} du: {}", host, nl.tablet_count, nl.dusage);
+            for (shard_id id = 0; id < nl.shards.size(); id++) {
+                lblogger.info("  shard: {} tablets: {} du: {}", id, nl.shards[id].tablet_count, nl.shards[id].dusage);
+            }
+        }
+    }
+
     // Less-comparator which orders nodes by load.
     struct nodes_by_load_cmp {
         node_load_map& nodes;
@@ -3067,6 +3077,7 @@ public:
 
         _load_sketch = locator::load_sketch(_tm, _table_load_stats, _force_capacity_based_balancing ? _target_tablet_size : 0);
         co_await _load_sketch->populate_dc(dc);
+        _load_sketch->dump("after populate in: make_plan(dc)");
         _tablet_count_per_table.clear();
         _disk_used_per_table.clear();
 
@@ -3238,6 +3249,8 @@ public:
                          load.tablets_per_shard(), load.state(), load.dusage->capacity, read, write);
         }
 
+        dump(nodes, "after compute imbalance");
+        
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || dc_load.max_load != dc_load.min_load))) {
             if (_db.get_config().rf_rack_valid_keyspaces()) {
                 for (auto& [rack, rload] : rack_load) {
