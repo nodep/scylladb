@@ -38,6 +38,21 @@ struct disk_usage {
     }
 };
 
+inline sstring bytes2gb(uint64_t bytes) {
+    if (bytes <= 1024) {
+        return fmt::format("{} B", bytes);
+    } else if (bytes <= 1024UL * 1024UL) {
+        double kb = bytes / 1024.0;
+        return fmt::format("{:.2f} KB", kb);
+    } else if (bytes <= 1024UL * 1024UL * 1024UL) {
+        double mb = bytes / 1024.0 / 1024.0;
+        return fmt::format("{:.2f} MB", mb);
+    }
+
+    double gb = bytes / 1024.0 / 1024.0 / 1024.0;
+    return fmt::format("{:.2f} GB", gb);
+}
+
 /// A data structure which keeps track of load associated with data ownership
 /// on shards of the whole cluster.
 class load_sketch {
@@ -346,6 +361,8 @@ public:
         }
         return _nodes.at(node).get_load();
     }
+
+    void dump(sstring reason);
 };
 
 } // namespace locator
@@ -355,6 +372,6 @@ struct fmt::formatter<locator::disk_usage> : fmt::formatter<string_view> {
     template <typename FormatContext>
     auto format(const locator::disk_usage& du, FormatContext& ctx) const {
         return fmt::format_to(ctx.out(), "cap: {} used: {} load: {}",
-                              utils::pretty_printed_data_size(du.capacity), utils::pretty_printed_data_size(du.used), du.get_load());
+                              locator::bytes2gb(du.capacity), locator::bytes2gb(du.used), du.get_load());
     }
 };
