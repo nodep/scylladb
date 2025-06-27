@@ -342,6 +342,8 @@ public:
         }
         return _nodes.at(node).get_load();
     }
+
+    void dump(sstring reason);
 };
 
 } // namespace locator
