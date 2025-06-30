@@ -3343,6 +3343,8 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
                                                                                             dst,
                                                                                             as,
                                                                                             dst_server);
+
+                co_await node_stats.dump(format("received from host: {}", dst), true);
             } else {
                 node_stats = locator::load_stats::from_v1(
                     co_await ser::storage_service_rpc_verbs::send_table_load_stats_v1(&_messaging,
@@ -3395,7 +3397,7 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
         stats.tables.clear();
     }
 
-    rtlogger.debug("raft topology: Refreshed table load stats for all DC(s).");
+    rtlogger.info("raft topology: Refreshed table load stats for all DC(s).");
 
     _tablet_allocator.set_load_stats(make_lw_shared<const locator::load_stats>(std::move(stats)));
 }

@@ -442,6 +442,8 @@ struct load_stats {
 
     uint64_t get_tablet_size(host_id host, const range_based_tablet_id& rb_tid, uint64_t default_tablet_size) const;
     void reconcile_tablets_resize(token_metadata_ptr tmptr);
+
+    future<> dump(sstring reason = "", bool log_tablet_sizes = false) const;
 };
 
 using load_stats_v2 = load_stats;
