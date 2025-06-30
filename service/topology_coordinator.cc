@@ -3246,7 +3246,7 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
         stats.tables.clear();
     }
 
-    rtlogger.debug("raft topology: Refreshed table load stats for all DC(s).");
+    rtlogger.info("raft topology: Refreshed table load stats for all DC(s).");
 
     _tablet_allocator.set_load_stats(make_lw_shared<const locator::load_stats>(std::move(stats)));
 }

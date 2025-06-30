@@ -2875,6 +2875,8 @@ public:
 
         const locator::topology& topo = _tm->get_topology();
 
+        _table_load_stats->dump("for balancing");
+
         // Select subset of nodes to balance.
 
         node_load_map nodes;
@@ -3521,4 +3523,16 @@ void locator::load_sketch::dump(sstring reason) {
     }
     double total_load = total_capacity == 0 ? 0 : double(total_used) / total_capacity;
     service::lblogger.info("total_load: {} total used: {} total available: {}", total_load, bytes2gb(total_used), bytes2gb(total_capacity));
+}
+
+void locator::load_stats::dump(sstring reason, bool log_tablet_sizes) const {
+    service::lblogger.info("-- load_stats {}", reason);
+    for (const auto& [host, tls] : tablet_stats) {
+        service::lblogger.info(" node: {} effective_cap: {} tablet_count: {}", host, locator::bytes2gb(tls.effective_capacity), tls.tablet_sizes.size());
+        if (log_tablet_sizes) {
+            for (const auto& [rb_tid, size] : tls.tablet_sizes) {
+                service::lblogger.info("  tablet: {} size: {}", rb_tid, locator::bytes2gb(size));
+            }
+        }
+    }
 }
