@@ -1,6 +1,6 @@
 /* 1
  * Copyright (C) 2024-present ScyllaDB
- */
+ 2*/
 
 /*
  * SPDX-License-Identifier: LicenseRef-ScyllaDB-Source-Available-1.0
