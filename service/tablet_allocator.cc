@@ -3263,6 +3263,7 @@ class tablet_allocator_impl : public tablet_allocator::impl
     bool _stopped = false;
     bool _use_tablet_aware_balancing = true;
     locator::load_stats_ptr _load_stats;
+    std::unordered_set<table_id> _new_tables;
 private:
     load_balancer make_load_balancer(token_metadata_ptr tm,
             locator::load_stats_ptr table_load_stats,
@@ -3405,6 +3406,12 @@ public:
     void on_leadership_lost() {
         _load_balancer_stats.unregister();
         _load_stats = {};
+    }
+
+    void on_create_column_family(const sstring& ks_name, const sstring& cf_name) override {
+        auto table_id = _db.find_uuid(ks_name, cf_name);
+        _new_tables.insert(table_id);
+        lblogger.debug("Created table {}.{} id={}", ks_name, cf_name, table_id);
     }
 
     load_balancer_stats_manager& stats() {
