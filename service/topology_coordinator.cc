@@ -1320,6 +1320,8 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
             auto last_token = tmap.get_last_token(gid.tablet);
             auto& tablet_state = _tablets[gid];
 
+            rtlogger.info("trinfo.stage: {} next: {}", trinfo.stage, trinfo.next);
+
             auto get_mutation_builder = [&] () {
                 return replica::tablet_mutation_builder(guard.write_timestamp(), base_table);
             };
@@ -1363,6 +1365,7 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
 
             switch (trinfo.stage) {
                 case locator::tablet_transition_stage::allow_write_both_read_old:
+                    rtlogger.info("allow_write_both_read_old for: {}", trinfo.pending_replica);
                     if (action_failed(tablet_state.barriers[trinfo.stage])) {
                         if (check_excluded_replicas()) {
                             transition_to_with_barrier(locator::tablet_transition_stage::cleanup_target);
@@ -1582,6 +1585,48 @@ class topology_coordinator : public endpoint_lifecycle_subscriber {
                 case locator::tablet_transition_stage::end_migration: {
                     // Need a separate stage and a barrier after cleanup RPC to cut off stale RPCs.
                     // See do_tablet_operation() doc.
+                    /*
+                    rtlogger.info("end_migration for: {}", trinfo.pending_replica);
+                    auto leaving = locator::get_leaving_replica(tmap.get_tablet_info(gid.tablet), trinfo);
+                    auto pending = trinfo.pending_replica;
+                    if (leaving && _load_stats_per_node.contains(leaving->host)) {
+                        if (pending && _load_stats_per_node.contains(pending->host)) {
+                            rtlogger.info("moving tablet: {} from: {} to: {}", gid, *leaving, *pending);
+                            locator::range_based_tablet_id rb_tid {gid.table, tmap.get_token_range(gid.tablet)};
+                            auto& leaving_tls = _load_stats_per_node[leaving->host].tablet_stats[leaving->host];
+                            auto& pending_tls = _load_stats_per_node[pending->host].tablet_stats[pending->host];
+                            if (leaving_tls.tablet_sizes.contains(rb_tid)) {
+                                if (!pending_tls.tablet_sizes.contains(rb_tid)) {
+                                    const uint64_t tablet_size = leaving_tls.tablet_sizes.at(rb_tid);
+                                    leaving_tls.effective_capacity += tablet_size;
+                                    leaving_tls.tablet_sizes.erase(rb_tid);
+
+                                    pending_tls.tablet_sizes[rb_tid] = tablet_size;
+                                    leaving_tls.effective_capacity += tablet_size;
+                                } else {
+                                    rtlogger.info("false == !pending_tls.tablet_sizes.contains(rb_tid)");
+                                }
+                            } else {
+                                rtlogger.info("false == leaving_tls.tablet_sizes.contains(rb_tid)");
+                                rtlogger.info("looking for: {}", rb_tid);
+                                for (const auto& [host_out, out_ls] : _load_stats_per_node) {
+                                    rtlogger.info("load_stats for node: {}", host_out);
+                                    for (const auto& [host, tls] : out_ls.tablet_stats) {
+                                        rtlogger.info(" load_stats node: {} effective_cap: {} tablet count: {}", host, tls.effective_capacity, tls.tablet_sizes.size());
+                                        for (const auto& [i, size] : tls.tablet_sizes) {
+                                            rtlogger.info("  tablet: {} size: {}", i, size);
+                                        }
+                                    }
+                                }
+                            }
+                        } else {
+                            rtlogger.info("false == pending && _load_stats_per_node.contains(pending->host)");
+                        }
+                    } else {
+                        rtlogger.info("false == leaving && _load_stats_per_node.contains(leaving->host)");
+                    }
+                    */
+
                     bool defer_transition = utils::get_local_injector().enter("handle_tablet_migration_end_migration");
                     if (!defer_transition && do_barrier()) {
                         _tablets.erase(gid);

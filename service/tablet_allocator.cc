@@ -3098,7 +3098,7 @@ public:
                             tablet_sizes.push_back(_target_tablet_size);
                         } else {
                             const range_based_tablet_id rb_tid {table, tmap.get_token_range(tid)};
-                            uint64_t tablet_size = _table_load_stats->get_tablet_size(replica.host, rb_tid, _target_tablet_size);
+                            uint64_t tablet_size = _table_load_stats->get_tablet_size(replica.host, rb_tid, 0);
                             tablet_sizes_sum += tablet_size;
                             tablet_sizes.push_back(tablet_size);
                         }

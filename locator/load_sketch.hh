@@ -163,9 +163,9 @@ private:
 
     uint64_t get_tablet_size(host_id host, const range_based_tablet_id& rb_tid) const {
         if (_load_stats) {
-            return _load_stats->get_tablet_size(host, rb_tid, service::default_target_tablet_size);
+            return _load_stats->get_tablet_size(host, rb_tid, 0);
         }
-        return service::default_target_tablet_size;
+        return 0;
     }
 
     future<> populate_table(table_id table, const tablet_map& tmap, std::optional<host_id> host, std::optional<sstring> only_dc) {
