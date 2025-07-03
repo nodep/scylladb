@@ -136,10 +136,9 @@ args = ap.parse_args()
 
 executables_scylla = [
                 '{}/scylla'.format(args.build_dir),
-                '{}/iotune'.format(args.build_dir),
-                '{}/patchelf'.format(args.build_dir),
-                ]
+                '{}/iotune'.format(args.build_dir)]
 executables_distrocmd = [
+                '/usr/bin/patchelf',
                 '/usr/bin/lscpu',
                 '/usr/bin/gawk',
                 '/usr/bin/gzip',
