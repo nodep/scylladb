@@ -784,11 +784,13 @@ public:
         migration_plan plan;
 
         // Prepare plans for each DC separately and combine them to be executed in parallel.
-        for (auto&& dc : topo.get_datacenters()) {
-            auto dc_plan = co_await make_plan(dc);
-            auto level = dc_plan.size() > 0 ? seastar::log_level::info : seastar::log_level::debug;
-            lblogger.log(level, "Prepared {} migrations in DC {}", dc_plan.size(), dc);
-            plan.merge(std::move(dc_plan));
+        for (auto& [dc, racks] : topo.get_datacenter_racks()) {
+            for (auto& [rack, nodes] : racks) {
+                auto rack_plan = co_await make_plan(dc, rack);
+                auto level = rack_plan.size() > 0 ? seastar::log_level::info : seastar::log_level::debug;
+                lblogger.log(level, "Prepared {} migrations in DC {} rack {}", rack_plan.size(), dc, rack);
+                plan.merge(std::move(rack_plan));
+            }
         }
 
         // Merge table-wide resize decisions, may emit new decisions, revoke or finalize ongoing ones.
@@ -2513,7 +2515,7 @@ public:
         lblogger.debug("Table {} shard overcommit: {}", table, overcommit);
     }
 
-    future<migration_plan> make_internode_plan(const dc_name& dc, node_load_map& nodes,
+    future<migration_plan> make_internode_plan(const dc_name& dc, sstring rack_name, node_load_map& nodes,
                                                const std::unordered_set<host_id>& nodes_to_drain,
                                                host_id target) {
         migration_plan plan;
@@ -2673,7 +2675,7 @@ public:
                 // to handle the case of off-candidates being empty. In that case, max_off_candidate_load is 0.
                 load_type curr_delta = std::abs(std::max(max_off_candidate_load, src_node_info.avg_load) - target_info.avg_load);
                 if (curr_delta < _size_based_balance_threshold) {
-                    lblogger.debug("Balance achieved.");
+                    lblogger.debug("Balance achieved on DC {} rack {}.", dc, rack_name);
                     _stats.for_dc(dc).stop_balance++;
                     break;
                 }
@@ -2861,7 +2863,7 @@ public:
         }
     };
 
-    future<migration_plan> make_plan(dc_name dc) {
+    future<migration_plan> make_plan(dc_name dc, sstring rack_name) {
         migration_plan plan;
 
         _dc = dc;
@@ -2917,7 +2919,7 @@ public:
         };
 
         _tm->for_each_token_owner([&] (const locator::node& node) {
-            if (node.dc_rack().dc != dc) {
+            if (node.dc_rack().dc != dc || node.dc_rack().rack != rack_name) {
                 return;
             }
             bool is_drained = node.get_state() == locator::node::state::being_decommissioned
@@ -3084,6 +3086,16 @@ public:
                 auto get_table_desc = [&] (tablet_id tid) {
                     return tid == t1.tid ? t1 : t2;
                 };
+                auto get_leaving_replica = [] (const tablet_desc& td, const tablet_replica& replica) {
+                    if (td.transition) {
+                        for (size_t i = 0; i < td.transition->next.size(); i++) {
+                            if (td.transition->next[i] == replica) {
+                                return td.info->replicas[i];
+                            }
+                        }
+                    }
+                    return replica;
+                };
 
                 while (auto next = processor.next_replica()) {
                     auto& [replica, tids] = *next;
@@ -3097,8 +3109,11 @@ public:
                             tablet_sizes_sum += _target_tablet_size;
                             tablet_sizes.push_back(_target_tablet_size);
                         } else {
+                            // If the replica is in migration, search for the tablet size in the leaving replica
+                            auto maybe_leaving_replica = (tid == t1.tid ? get_leaving_replica(t1, replica) : get_leaving_replica(*t2, replica));
                             const range_based_tablet_id rb_tid {table, tmap.get_token_range(tid)};
-                            uint64_t tablet_size = _table_load_stats->get_tablet_size(replica.host, rb_tid, 0);
+                            uint64_t tablet_size = _table_load_stats->get_tablet_size(maybe_leaving_replica.host, rb_tid, 0);
+                            tablet_size = std::max(tablet_size, uint64_t(1));
                             tablet_sizes_sum += tablet_size;
                             tablet_sizes.push_back(tablet_size);
                         }
@@ -3191,7 +3206,7 @@ public:
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || max_load != min_load))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
-            plan.merge(co_await make_internode_plan(dc, nodes, nodes_to_drain, target));
+            plan.merge(co_await make_internode_plan(dc, rack_name, nodes, nodes_to_drain, target));
         } else {
             _stats.for_dc(dc).stop_balance++;
         }
