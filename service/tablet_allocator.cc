@@ -251,6 +251,7 @@ template<>
 struct fmt::formatter<service::migration_tablet_set> : fmt::formatter<std::string_view> {
     template <typename FormatContext>
     auto format(const service::migration_tablet_set& tablet_set, FormatContext& ctx) const {
+        fmt::format_to(ctx.out(), "size: {} ", locator::bytes2gb(tablet_set.tablet_set_disk_size));
         if (tablet_set.colocated()) {
             return fmt::format_to(ctx.out(), "{{colocated: {}}}", tablet_set.tablets());
         }
@@ -2404,6 +2405,7 @@ public:
         };
 
         if (min_candidate.badness.is_bad() && _use_table_aware_balancing) {
+            lblogger.debug("Bad first candidate; considering better ones");
             _stats.for_dc(_dc).bad_first_candidates++;
 
             // Consider better alternatives.
@@ -2458,6 +2460,8 @@ public:
                     }
                 }
             }
+        } else {
+            lblogger.debug("Picked first candidate");
         }
 
         lblogger.trace("best candidate: {}", min_candidate);
@@ -2567,6 +2571,15 @@ public:
             } else {
                 nodes_by_load_dst.push_back(host);
             }
+        }
+
+        lblogger.info("-- sources");
+        for (auto h : nodes_by_load) {
+            lblogger.info(" {}", h);
+        }
+        lblogger.info("-- destinations");
+        for (auto h : nodes_by_load_dst) {
+            lblogger.info(" {}", h);
         }
 
         std::make_heap(nodes_by_load.begin(), nodes_by_load.end(), nodes_cmp);
@@ -2727,6 +2740,7 @@ public:
             if (can_check_convergence && !check_convergence(src_node_info, target_info, source_tablets)) {
                 if (_force_capacity_based_balancing) {
                     lblogger.debug("No more candidates. Load would be inverted.");
+                    lblogger.debug("Offending candidate: {}", candidate);
                     _stats.for_dc(dc).stop_load_inversion++;
                     break;
                 }
