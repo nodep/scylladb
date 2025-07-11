@@ -3308,6 +3308,30 @@ public:
 
         dump(nodes, "after compute imbalance");
 
+        // log table load
+        for (auto table : std::views::keys(_tm->tablets().all_table_groups())) {
+            lblogger.debug("-- table load for {}", table);
+            for (const auto& [host, n] : nodes) {
+                locator::disk_usage node_du {n.dusage->capacity, 0};
+                size_t node_tablet_count = 0;
+                if (n.tablet_sizes_per_table.contains(table)) {
+                    node_du.used = n.tablet_sizes_per_table.at(table);
+                    node_tablet_count = n.tablet_count_per_table.at(table);
+                }
+                lblogger.debug(" node: {} tablets: {} load: {}", n.id, node_tablet_count, node_du);
+                for (shard_id sid = 0; sid < n.shards.size(); sid++) {
+                    const auto& shard_load = n.shards[sid];
+                    locator::disk_usage shard_du { shard_load.dusage->capacity, 0 };
+                    size_t shard_tablet_count = 0;
+                    if (shard_load.tablet_sizes_per_table.contains(table)) {
+                        shard_du.used = shard_load.tablet_sizes_per_table.at(table);
+                        shard_tablet_count = shard_load.tablet_count_per_table.at(table);
+                    }
+                    lblogger.debug("  shard: {} tablets: {} load: {}", sid, shard_tablet_count, shard_du);
+                }
+            }
+        }
+
         bool was_balanced = true;
         if (_db.get_config().rf_rack_valid_keyspaces()) {
             for (auto& [rack, rload] : rack_load) {
