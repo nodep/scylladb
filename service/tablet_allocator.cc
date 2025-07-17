@@ -3291,7 +3291,8 @@ public:
 
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || dc_load.max_load != dc_load.min_load))) {
-            if (_db.get_config().rf_rack_valid_keyspaces()) {
+            lblogger.info("rf_rack_valid_keyspaces == {}", _db.get_config().rf_rack_valid_keyspaces());
+            if (true /*_db.get_config().rf_rack_valid_keyspaces()*/) {
                 for (auto& [rack, rload] : rack_load) {
                     if (!rload.min_load_node) {
                         throw std::runtime_error(format("There are nodes with tablets to drain but no candidate nodes in rack {} of DC {}."
