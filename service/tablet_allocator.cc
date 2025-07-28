@@ -1743,12 +1743,14 @@ public:
             auto dc_rack = std::make_pair(n.dc(), n.rack());
             auto dc_rack_i = _disk_used_per_rack_per_table.find(dc_rack);
             if (dc_rack_i == _disk_used_per_rack_per_table.end()) {
+                lblogger.warn("dbglog dc_rack: {} not found in _disk_used_per_rack_per_table", dc_rack);
                 return 0;
             }
 
             const auto& tables_in_rack = dc_rack_i->second;
             auto table_i = tables_in_rack.find(table);
             if (table_i == tables_in_rack.end()) {
+                lblogger.warn("dbglog table: {} in dc_rack: {} not found in _disk_used_per_rack_per_table", table, dc_rack);
                 return 0;
             }
 
