@@ -27,6 +27,8 @@
 #include <seastar/coroutine/maybe_yield.hh>
 #include <absl/container/flat_hash_map.h>
 
+#include "utils/unordered_map.hh"
+
 using namespace locator;
 using namespace replica;
 
@@ -389,14 +391,14 @@ class load_balancer {
     // So we equalize: sum of tablet_sizes / capacity_in_bytes.
     using load_type = double;
 
-    using table_candidates_map = std::unordered_map<table_id, std::unordered_set<migration_tablet_set>>;
+    using table_candidates_map = utils::unordered_map<table_id, std::unordered_set<migration_tablet_set>>;
 
     struct shard_load {
         size_t tablet_count = 0;
         std::optional<disk_usage> dusage;
 
-        absl::flat_hash_map<table_id, size_t> tablet_count_per_table;
-        absl::flat_hash_map<table_id, uint64_t> tablet_sizes_per_table;
+        utils::unordered_map<table_id, size_t> tablet_count_per_table;
+        utils::unordered_map<table_id, uint64_t> tablet_sizes_per_table;
 
         // Number of tablets which are streamed from this shard.
         size_t streaming_read_load = 0;
@@ -452,8 +454,8 @@ class load_balancer {
         // Valid only when "dusage" is set.
         load_type avg_load = 0;
 
-        absl::flat_hash_map<table_id, size_t> tablet_count_per_table;
-        absl::flat_hash_map<table_id, uint64_t> tablet_sizes_per_table;
+        utils::unordered_map<table_id, size_t> tablet_count_per_table;
+        utils::unordered_map<table_id, uint64_t> tablet_sizes_per_table;
 
         // heap which tracks most-loaded shards using shards_by_load_cmp().
         // Valid during intra-node plan-making for nodes which are in the source node set.
@@ -529,7 +531,7 @@ class load_balancer {
     };
 
     // Data structure used for making load-balancing decisions over a set of nodes.
-    using node_load_map = std::unordered_map<host_id, node_load>;
+    using node_load_map = utils::unordered_map<host_id, node_load>;
 
     void dump(const node_load_map& nlm, sstring reason = "") {
         lblogger.info("--- nodes {}", reason);
@@ -679,7 +681,7 @@ class load_balancer {
     token_metadata_ptr _tm;
     std::optional<locator::load_sketch> _load_sketch;
     // Holds tablet replica count per table in the balanced node set (within a single DC).
-    absl::flat_hash_map<table_id, size_t> _tablet_count_per_table;
+    utils::unordered_map<table_id, size_t> _tablet_count_per_table;
     // Holds total used storage per table in the DC
     absl::flat_hash_map<table_id, uint64_t> _disk_used_per_dc_per_table;
     // Holds total used storage per table per rack in the current DC
@@ -1064,7 +1066,7 @@ public:
                 // tablet 1 replicas: [n1:s0, n2:s0]
                 // Replica in n1:s0 cannot follow sibling replica in n2:s1. Otherwise, RF invariant is broken.
                 // Instead, tablet 1 in n2:s0 will be co-located with tablet 0 in n2:s1.
-                std::unordered_map<host_id, tablet_replica> r1_map;
+                utils::unordered_map<host_id, tablet_replica> r1_map;
                 std::ranges::transform(r1, std::inserter(r1_map, r1_map.begin()), [] (tablet_replica r) {
                     return std::make_pair(r.host, r);
                 });
@@ -1088,7 +1090,7 @@ public:
                 //   3) Avoid overloading racks temporarily, which is an availability risk in case the rack goes down.
                 //      Otherwise, n3:rack2 would be migrated to n1:rack3, and tablet 1 would have two replicas in rack3.
                 //
-                std::unordered_map<sstring, tablet_replica> r1_rack_map;
+                utils::unordered_map<sstring, tablet_replica> r1_rack_map;
                 for (auto&& r : r1) {
                     auto&& rack = rack_of(r);
                     auto i = r1_rack_map.find(rack);
@@ -1240,7 +1242,7 @@ public:
     };
 
     struct sizing_plan {
-        std::unordered_map<table_id, table_sizing> tables;
+        utils::unordered_map<table_id, table_sizing> tables;
     };
 
     struct tablet_count_and_reason {
@@ -1249,7 +1251,7 @@ public:
     };
 
     tablet_count_and_reason tablet_count_from_min_per_shard_tablet_count(const schema& s,
-            const std::unordered_map<sstring, unsigned>& shards_per_dc,
+            const utils::unordered_map<sstring, unsigned>& shards_per_dc,
             const tablet_aware_replication_strategy& rs,
             double min_per_shard_tablet_count)
     {
@@ -1281,10 +1283,10 @@ public:
     }
 
     future<sizing_plan> make_sizing_plan(schema_ptr new_table = nullptr, const tablet_aware_replication_strategy* new_rs = nullptr) {
-        std::unordered_map<table_id, const tablet_aware_replication_strategy*> rs_by_table;
+        utils::unordered_map<table_id, const tablet_aware_replication_strategy*> rs_by_table;
         sizing_plan plan;
 
-        std::unordered_map<sstring, unsigned> shards_per_dc;
+        utils::unordered_map<sstring, unsigned> shards_per_dc;
         _tm->for_each_token_owner([&] (const node& n) {
             if (n.is_normal()) {
                 shards_per_dc[n.dc_rack().dc] += n.get_shard_count();
@@ -1428,7 +1430,7 @@ public:
         // we have a problem of making sure that the choice is stable across scheduler invocations to avoid
         // oscillations of decisions.
 
-        std::unordered_map<table_id, double> table_scaling;
+        utils::unordered_map<table_id, double> table_scaling;
 
         for (auto&& [dc, shard_count] : shards_per_dc) {
             double cur_avg_tablets_per_shard = 0;
@@ -2215,7 +2217,7 @@ public:
                                                bool need_viable_targets)
     {
         int max_rack_load;
-        std::unordered_map<sstring, int> rack_load;
+        utils::unordered_map<sstring, int> rack_load;
 
         auto get_viable_targets = [&] () {
             std::unordered_set<host_id> viable_targets;
@@ -2309,8 +2311,8 @@ public:
                       node_load& dst_info,
                       migration_tablet_set tablet_set,
                       bool need_viable_targets) {
-        std::unordered_map<host_id, unsigned> viable_targets_count;
-        std::unordered_map<global_tablet_id, skip_info> skip_info_per_tablet;
+        utils::unordered_map<host_id, unsigned> viable_targets_count;
+        utils::unordered_map<global_tablet_id, skip_info> skip_info_per_tablet;
         std::unordered_set<host_id> shared_viable_targets;
         const size_t tablet_count = tablet_set.tablets().size();
 
@@ -3291,7 +3293,7 @@ public:
         _total_capacity_storage = 0;
         _rack_capacity_storage.clear();
         load_data dc_load;
-        std::unordered_map<sstring, load_data> rack_load;
+        utils::unordered_map<sstring, load_data> rack_load;
         for (auto&& [host, load] : nodes) {
             load.update();
             _stats.for_node(dc, host).load = load.avg_load;
@@ -3470,7 +3472,7 @@ public:
         if (auto&& tablet_rs = rs->maybe_as_tablet_aware()) {
             auto tm = _db.get_shared_token_metadata().get();
 
-            std::unordered_map<table_id, schema_ptr> new_cfms_map;
+            utils::unordered_map<table_id, schema_ptr> new_cfms_map;
             for (auto s : cfms) {
                 new_cfms_map[s->id()] = s;
             }
@@ -3478,7 +3480,7 @@ public:
             // Group the new tables by co-location groups.
             // The key is the base table id, which may be a new table or an existing table.
             const bool colocated_tablets_enabled = _db.features().colocated_tablets;
-            std::unordered_map<table_id, std::vector<schema_ptr>> table_groups;
+            utils::unordered_map<table_id, std::vector<schema_ptr>> table_groups;
             for (auto s : cfms) {
                 std::optional<table_id> base_id;
                 if (colocated_tablets_enabled) {
