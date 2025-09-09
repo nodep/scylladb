@@ -1563,6 +1563,17 @@ void do_rebalance_tablets(cql_test_env& e,
             return apply_plan(tm, plan);
         }).get();
 
+        if (load_stats) {
+            auto& tm = stm.get()->tablets();
+            for (auto&& mig : plan.migrations()) {
+                if (mig.src != mig.dst) {
+                    auto& tmap = tm.get_tablet_map(mig.tablet.table);
+                    locator::range_based_tablet_id rb_tid {mig.tablet.table, tmap.get_token_range(mig.tablet.tablet)};
+                    load_stats->migrate_tablet_size(mig.src.host, mig.dst.host, rb_tid);
+                }
+            }
+        }
+
         if (auto_split && load_stats) {
             auto& tm = *stm.get();
             for (const auto& [table, tmap]: tm.tablets().all_tables_ungrouped()) {
@@ -3712,6 +3723,177 @@ SEASTAR_THREAD_TEST_CASE(test_load_balancing_resize_requests) {
         }
 
     }).get();
+}
+
+static constexpr uint64_t GB = 1024UL * 1024 * 1024;
+
+std::vector<uint64_t> generate_tablet_sizes(uint64_t total_size, size_t tablet_count) {
+    BOOST_REQUIRE_GT(tablet_count, 0);
+
+    std::vector<uint64_t> result(tablet_count, 0);
+
+    if (total_size > 0) {
+        double avg_tablet_size = double(total_size) / tablet_count;
+        std::normal_distribution<> dist(avg_tablet_size, avg_tablet_size / 2);
+
+        // generate sizes and compute their sum
+        uint64_t generated_sum = 0;
+        std::ranges::generate(result, [&] () {
+            uint64_t tbl_size = std::max(0.0, dist(tests::random::gen()));
+            generated_sum += tbl_size;
+            return tbl_size;
+        });
+
+        // normalize the sizes so that their sum equals total_size
+        const double factor = double(generated_sum) / total_size;
+        uint64_t actual_sum = 0;
+        std::ranges::for_each(result, [&] (uint64_t& s) {
+            s /= factor;
+            actual_sum += s;
+        });
+
+        // add the rounding error to the last element
+        result.back() += total_size - actual_sum;
+    }
+
+    return result;
+}
+
+future<> add_table_with_id(cql_test_env& e, sstring test_ks_name, std::map<sstring, sstring> tablet_options, table_id id) {
+    co_await e.create_table([&] (std::string_view ks_name) {
+        if (!test_ks_name.empty()) {
+            ks_name = test_ks_name;
+        }
+        auto builder = schema_builder(ks_name, id.to_sstring(), id)
+                .with_column("p1", utf8_type, column_kind::partition_key)
+                .with_column("r1", int32_type);
+        if (!tablet_options.empty()) {
+            builder.set_tablet_options(std::move(tablet_options));
+        }
+
+        return *builder.build();
+    });
+}
+
+static table_id create_table_and_set_tablet_sizes(cql_test_env& e, topology_builder& topo, sstring ks_name, uint64_t table_size_bytes, size_t tablet_count,
+                                                    std::optional<std::vector<uint64_t>> tablet_sizes = std::nullopt) {
+    std::map<sstring, sstring> tablet_options = {{"min_tablet_count", std::to_string(tablet_count)}};
+    sstring table_str = format("{}", table_size_bytes / GB) + "-0000-0000-0000-000000000000";
+    while (table_str.size() < 36) {
+        table_str = "0" + table_str;
+    }
+    auto table = table_id(utils::UUID(table_str));
+    add_table_with_id(e, ks_name, tablet_options, table).get();
+
+    auto& load_stats = topo.get_shared_load_stats();
+    load_stats.set_size(table, table_size_bytes);
+
+    if (!tablet_sizes) {
+        tablet_sizes = generate_tablet_sizes(table_size_bytes, tablet_count);
+    }
+
+    auto& stm = e.shared_token_metadata().local();
+    auto& tmap = stm.get()->tablets().get_tablet_map(table);
+    tmap.for_each_tablet([&] (tablet_id tid, const tablet_info& tinfo) {
+        auto replicas = tinfo.replicas;
+        for (auto& r : tinfo.replicas) {
+            locator::range_based_tablet_id rb_tid {table, tmap.get_token_range(tid)};
+            load_stats.set_tablet_size(r.host, rb_tid, tablet_sizes->back());
+            tablet_sizes->pop_back();
+        }
+        return make_ready_future<>();
+    }).get();
+
+    BOOST_REQUIRE(tablet_sizes->empty());
+
+    testlog.info("Created table {} of size {} GB with {} tablets", table, double(table_size_bytes) / GB, tablet_count);
+
+    return table;
+}
+
+SEASTAR_THREAD_TEST_CASE(test_size_based_load_balancing_table_load) {
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->size_based_balance_threshold_percentage(0.3);
+    cfg.host_id = host_id(utils::UUID("00000000-0000-0000-0000-000000000001"));
+    do_with_cql_env_thread([] (auto& e) {
+        logging::logger_registry().set_logger_level("load_balancer", logging::log_level::debug);
+
+        topology_builder topo(e);
+
+        endpoint_dc_rack dc_rack;
+        const uint64_t shard_capacity = 250 * GB;
+        uint64_t total_capacity = 0;
+
+        std::vector<host_id> hosts;
+
+        // Add disk capacity for the default node. Add all subsequent nodes to the same DC/rack
+        e.shared_token_metadata().local().get()->get_topology().for_each_node([&] (const auto& node) {
+            dc_rack = node.dc_rack();
+            auto host = node.host_id();
+            auto num_shards = node.get_shard_count();
+            auto node_capacity = node.get_shard_count() * shard_capacity;
+            topo.get_shared_load_stats().set_capacity(host, node_capacity);
+            total_capacity += node_capacity;
+            testlog.info("Default node {} has {} shards and {} GB disk capacity", host, num_shards, double(node_capacity) / GB);
+            hosts.push_back(host);
+        });
+
+        auto create_node = [&] (size_t num_shards) {
+            auto host = topo.add_node(node_state::normal, num_shards, dc_rack);
+            uint64_t node_capacity = shard_capacity * num_shards;
+            topo.get_shared_load_stats().set_capacity(host, node_capacity);
+            total_capacity += node_capacity;
+            testlog.info("Added node {} with {} shards and {} GB disk capacity", host, num_shards, double(node_capacity) / GB);
+            hosts.push_back(host);
+        };
+
+        create_node(8);
+        create_node(12);
+
+        auto ks_name = add_keyspace(e, {{dc_rack.dc, 1}});
+
+        // Add 3 tables with sizes: 0.5 the current total storage, 0.25 the total storage and 0.125 the total storage
+        std::map<table_id, uint64_t> table_sizes;
+        uint64_t table_size = total_capacity / 2;
+        for (int c = 0; c < 3; c++) {
+            auto table_id = create_table_and_set_tablet_sizes(e, topo, ks_name, table_size, 512);
+            table_sizes[table_id] = table_size;
+            table_size /= 2;
+        }
+        // Add a table with 512 tablets and 1 byte per tablet
+        auto table_id = create_table_and_set_tablet_sizes(e, topo, ks_name, 512, 512, std::vector<uint64_t>(512, 1));
+        table_sizes[table_id] = 512;
+
+        rebalance_tablets(e, &topo.get_shared_load_stats());
+
+        auto& stm = e.shared_token_metadata().local();
+
+        auto check_balance = [&] () {
+            for (auto& [table, table_size] : table_sizes) {
+                load_sketch load(stm.get(), topo.get_shared_load_stats().get());
+                load.populate(std::nullopt, table).get();
+                load.dump(format("table: {}", table));
+                const double ideal_table_load = double(table_size) / total_capacity;
+                const double threshold_load = ideal_table_load * 1.2;
+                for (auto h : hosts) {
+                    auto min_max_load = load.get_shard_minmax(h);
+                    testlog.info("Table: {} ideal_load: {} host: {} load: {} min_shard_load: {} max_shard_load: {}",
+                                    table, ideal_table_load, h, load.get_load(h), min_max_load.min(), min_max_load.max());
+
+                    BOOST_REQUIRE_GT(threshold_load, min_max_load.max());
+                    BOOST_REQUIRE_GT(threshold_load, load.get_load(h));
+                }
+            }
+        };
+
+        check_balance();
+
+        create_node(4);
+
+        rebalance_tablets(e, &topo.get_shared_load_stats());
+
+        check_balance();
+    }, std::move(cfg)).get();
 }
 
 SEASTAR_THREAD_TEST_CASE(test_tablet_range_splitter) {

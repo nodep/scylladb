@@ -283,6 +283,7 @@ raft_server_for_group raft_group0::create_server_for_group0(raft::group_id gid, 
 future<group0_info>
 raft_group0::discover_group0(const std::vector<gms::inet_address>& seeds, cql3::query_processor& qp) {
     auto my_id = load_my_id();
+    group0_log.info("my ID: {}", my_id);
     discovery::peer_list peers;
     for (auto& ip: seeds) {
         if (ip != _gossiper.get_broadcast_address()) {

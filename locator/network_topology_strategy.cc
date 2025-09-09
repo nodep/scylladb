@@ -358,7 +358,7 @@ future<tablet_replica_set> network_topology_strategy::add_tablets_in_dc(schema_p
         std::map<sstring, std::unordered_set<locator::host_id>>& replicas_per_rack,
         const tablet_replica_set& cur_replicas,
         sstring dc, size_t dc_node_count, size_t dc_rf) const {
-    static thread_local std::default_random_engine rnd_engine{std::random_device{}()};
+    static thread_local std::default_random_engine rnd_engine{1 /*std::random_device{}()*/};
 
     auto replicas = cur_replicas;
     // all_dc_racks is ordered lexicographically on purpose
