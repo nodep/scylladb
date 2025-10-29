@@ -136,6 +136,7 @@ class load_sketch {
     token_metadata_ptr _tm;
     load_stats_ptr _load_stats;
     uint64_t _default_tablet_size = service::default_target_tablet_size;
+    uint64_t _minimal_tablet_size = service::default_target_tablet_size / 100;
 
 private:
     tablet_replica_set get_replicas_for_tablet_load(const tablet_info& ti, const tablet_transition_info* trinfo) const {
@@ -159,8 +160,8 @@ private:
         if (!_load_stats) {
             return _default_tablet_size;
         }
-        uint64_t tablet_size = _load_stats->get_tablet_size(host, rb_tid).value_or(_default_tablet_size);
-        return std::max(tablet_size, uint64_t(1));
+        uint64_t tablet_size = _load_stats->get_tablet_size(host, rb_tid).value_or(_minimal_tablet_size);
+        return std::max(tablet_size, _minimal_tablet_size);
     }
 
     future<> populate_table(table_id table, const tablet_map& tmap, std::optional<host_id> host, std::optional<sstring> only_dc) {

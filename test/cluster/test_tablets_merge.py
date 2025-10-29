@@ -516,7 +516,7 @@ async def test_migration_running_concurrently_to_merge_completion_handling(manag
     # to the larger node, and the move_tablet API will result in a no-op migration. This means we will
     # not enter take_storage_snapshot injection, the wait for "take_storage_snapshot: waiting" will
     # time out, and the test will fail.
-    cfg = { 'force_capacity_based_balancing': True }
+    cfg = { 'force_capacity_based_balancing': False }
     servers = [await manager.server_add(cmdline=cmdline, config=cfg)]
 
     await manager.api.disable_tablet_balancing(servers[0].ip_addr)

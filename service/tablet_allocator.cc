@@ -694,6 +694,8 @@ class load_balancer {
     // have the same size: _target_tablet_size
     bool _force_capacity_based_balancing = false;
 
+    uint64_t _minimal_tablet_size = default_target_tablet_size / 100;
+
 private:
     tablet_replica_set get_replicas_for_tablet_load(const tablet_info& ti, const tablet_transition_info* trinfo) const {
         // We reflect migrations in the load as if they already happened,
@@ -872,8 +874,8 @@ public:
 
     uint64_t get_tablet_size(host_id host, const range_based_tablet_id& rb_tid) const {
         if (_table_load_stats) {
-            uint64_t tablet_size = _table_load_stats->get_tablet_size(host, rb_tid).value_or(1);
-            return std::max(tablet_size, uint64_t(1));
+            uint64_t tablet_size = _table_load_stats->get_tablet_size(host, rb_tid).value_or(_minimal_tablet_size);
+            return std::max(tablet_size, _minimal_tablet_size);
         }
         return _target_tablet_size;
     }

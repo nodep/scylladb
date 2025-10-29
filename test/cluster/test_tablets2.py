@@ -549,7 +549,7 @@ async def test_tablet_cleanup_failure(manager: ManagerClient):
     # Without this, the second node might have a slightly lower transient effective disk
     # capacity, the size based load balancer will compute a higher load, and move the tablet
     # back to the first node.
-    config = { 'force_capacity_based_balancing': True }
+    config = { 'force_capacity_based_balancing': False }
 
     servers = [await manager.server_add(cmdline=cmdline, config=config)]
 
@@ -1367,7 +1367,7 @@ async def test_decommission_rack_basic(manager: ManagerClient):
 
     # Tablet size-based balancing will attempt to balance the DC based on tablet sizes, leading
     # to imbalance on tablet count per shard, which fails the test during verify_replicas_per_server()
-    force_capacity_lb_cfg = {'force_capacity_based_balancing': True}
+    force_capacity_lb_cfg = {'force_capacity_based_balancing': False}
 
     config = rf_rack_valid_cfg | force_capacity_lb_cfg
 
@@ -1413,7 +1413,7 @@ async def test_decommission_rack_after_adding_new_rack(manager: ManagerClient):
 
     # Tablet size-based balancing will attempt to balance the DC based on tablet sizes, leading
     # to imbalance on tablet count per shard, which fails the test during verify_replicas_per_server()
-    force_capacity_lb_cfg = {'force_capacity_based_balancing': True}
+    force_capacity_lb_cfg = {'force_capacity_based_balancing': False}
 
     config = rf_rack_valid_cfg | force_capacity_lb_cfg
 
@@ -1472,7 +1472,7 @@ async def test_decommission_not_enough_racks(manager: ManagerClient):
     # In rare cases, size based load balancing can lead to an imbalance in tablet count after
     # decommission (18 and 15 tablets per shard on a node). So, we force capacity based balancing
     # to keep the tablet count within what verify_replicas_per_server() expects
-    config = { "force_capacity_based_balancing": True }
+    config = { "force_capacity_based_balancing": False }
 
     all_servers = await create_cluster(manager, 1, num_racks, nodes_per_rack, config)
     async with create_and_populate_table(manager, rf=rf) as ctx:
