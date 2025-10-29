@@ -787,6 +787,8 @@ public:
         const locator::topology& topo = _tm->get_topology();
         migration_plan plan;
 
+        lblogger.info("dbglog level={}", lblogger.level());
+
         if (!utils::get_local_injector().enter("tablet_migration_bypass")) {
             // Prepare plans for each DC separately and combine them to be executed in parallel.
             for (auto&& dc : topo.get_datacenters()) {
@@ -3019,6 +3021,8 @@ public:
     future<migration_plan> make_plan(dc_name dc, std::optional<sstring> rack = std::nullopt) {
         migration_plan plan;
 
+        lblogger.info("dbglog make_plan for DC {} rack {}", dc, rack);
+
         _dc = dc;
         _rack = rack;
 
@@ -3044,6 +3048,7 @@ public:
             if (nodes.contains(host)) {
                 return;
             }
+            lblogger.info("dbglog ensuring node {}", host);
             auto* node = topo.find_node(host);
             if (!node) {
                 on_internal_error(lblogger, format("Node {} not found in topology", host));
@@ -3073,6 +3078,8 @@ public:
                 }
             }
         };
+
+        lblogger.info("dbglog building node map");
 
         _tm->for_each_token_owner([&] (const locator::node& node) {
             if (!node_filter(node)) {
@@ -3107,6 +3114,8 @@ public:
         }
 
         // Compute tablet load on nodes.
+
+        lblogger.info("dbglog computing node load");
 
         for (auto&& [table, tables] : _tm->tablets().all_table_groups()) {
             const auto& tmap = _tm->tablets().get_tablet_map(table);
@@ -3194,6 +3203,8 @@ public:
                 }
             }
         }
+
+        lblogger.info("dbglog checking destination node");
 
         // Check if we have destination nodes
         const bool has_dest_nodes = std::ranges::any_of(std::views::values(nodes), [&] (const auto& load) {
@@ -3332,6 +3343,8 @@ public:
 
         // Compute load imbalance.
 
+        lblogger.info("dbglog computing node imbalance");
+
         _total_capacity_shards = 0;
         _total_capacity_nodes = 0;
         _total_capacity_storage = 0;
@@ -3356,6 +3369,7 @@ public:
             }
         }
 
+        lblogger.info("dbglog entering node loop");
         for (auto&& [host, load] : nodes) {
             size_t read = 0;
             size_t write = 0;
@@ -3369,25 +3383,31 @@ public:
                          host, dc, load.rack(), load.avg_load, load.tablet_count, load.shard_count,
                          load.tablets_per_shard(), load.state(), load.dusage->capacity, read, write);
         }
+        lblogger.info("dbglog exiting node loop");
 
         if (!nodes_to_drain.empty() || (_tm->tablets().balancing_enabled() && (shuffle || !is_balanced(min_load, max_load)))) {
             host_id target = *min_load_node;
             lblogger.info("target node: {}, avg_load: {}, max: {}", target, min_load, max_load);
             plan.merge(co_await make_internode_plan(dc, nodes, nodes_to_drain, target));
         } else {
+            lblogger.info("dbglog not performed balance");
             _stats.for_dc(dc).stop_balance++;
         }
 
+        lblogger.info("dbglog making intranode plan");
         if (_tm->tablets().balancing_enabled()) {
             plan.merge(co_await make_intranode_plan(nodes, nodes_to_drain));
         }
 
+        lblogger.info("dbglog making merge colocation plan");
         if (_tm->tablets().balancing_enabled() && plan.empty()) {
             auto dc_merge_plan = co_await make_merge_colocation_plan(dc, nodes);
             auto level = dc_merge_plan.tablet_migration_count() > 0 ? seastar::log_level::info : seastar::log_level::debug;
             lblogger.log(level, "Prepared {} migrations for co-locating sibling tablets in DC {}", dc_merge_plan.tablet_migration_count(), dc);
             plan.merge(std::move(dc_merge_plan));
         }
+
+        lblogger.info("dbglog done make_plan() for DC={} and rack={}", dc, rack);
 
         co_await utils::clear_gently(nodes);
         co_return std::move(plan);

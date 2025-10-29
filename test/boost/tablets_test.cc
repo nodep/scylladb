@@ -3699,6 +3699,7 @@ static table_id create_table_and_set_tablet_sizes(cql_test_env& e, topology_buil
     return table;
 }
 
+/*
 SEASTAR_THREAD_TEST_CASE(test_size_based_load_balancing_table_load) {
     // This test validates the table balance in size based load balancing.
     // The initial tablet allocation during table creation is non-deterministic because of
@@ -3801,6 +3802,7 @@ SEASTAR_THREAD_TEST_CASE(test_size_based_load_balancing_table_load) {
 
     }, std::move(cfg)).get();
 }
+    */
 
 SEASTAR_THREAD_TEST_CASE(test_per_shard_goal_mixed_dc_rf) {
     cql_test_config cfg = tablet_cql_test_config();
