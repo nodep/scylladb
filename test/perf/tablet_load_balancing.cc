@@ -437,6 +437,7 @@ future<results> test_load_balancing_with_many_tables(params p, bool tablet_aware
             for (auto s : {s1, s2}) {
                 load_sketch load(stm.get(), load_stats_p);
                 load.populate(std::nullopt, s->id()).get();
+                load.dump(format("for table: {}", s->id()));
 
                 min_max_tracker<double> shard_overcommit_minmax;
                 min_max_tracker<double> node_overcommit_minmax;

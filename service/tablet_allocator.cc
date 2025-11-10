@@ -2163,7 +2163,7 @@ public:
             } else {
                 std::pop_heap(src_shards.begin(), src_shards.end(), node_load.shards_by_load_cmp());
                 src = src_shards.back();
-                sketch.has_complete_data(host, "get_least_loaded_shard()");
+                sketch.has_complete_data_test(host, "get_least_loaded_shard()");
                 dst = sketch.get_least_loaded_shard(host);
             }
 
@@ -3192,6 +3192,7 @@ public:
         _load_sketch = locator::load_sketch(_tm, _table_load_stats, _force_capacity_based_balancing ? _target_tablet_size : 0);
         _load_sketch->set_minimal_tablet_size(_minimal_tablet_size);
         co_await _load_sketch->populate_dc(dc);
+        _load_sketch->dump("after populate in: make_plan(dc)");
 
         for (auto& [host, n]: nodes) {
             if (!_load_sketch->has_complete_data(host)) {
@@ -3234,6 +3235,8 @@ public:
         // FIXME: To handle the above, we should rebalance the target node before migrating tablets from other nodes.
 
         // Compute per-shard load and candidate tablets.
+
+        lblogger.info("dbglog fetching tablet sizes");
 
         _tablet_count_per_table.clear();
         _disk_used_per_table.clear();
@@ -3749,4 +3752,21 @@ void load_sketch::has_complete_data_test(host_id node, sstring when) const {
 auto fmt::formatter<service::tablet_migration_info>::format(const service::tablet_migration_info& mig, fmt::format_context& ctx) const
         -> decltype(ctx.out()) {
     return fmt::format_to(ctx.out(), "{{tablet: {}, src: {}, dst: {}}}", mig.tablet, mig.src, mig.dst);
+}
+
+void locator::load_sketch::dump(sstring reason) {
+    service::lblogger.info("-- load_sketch {}", reason);
+    uint64_t total_used = 0;
+    uint64_t total_capacity = 0;
+    for (const auto& [host, n] : _nodes) {
+        service::lblogger.info(" node: {} tablets: {} du: {} complete_capacity: {}, complete_tablets: {}",
+            host, n._tablet_count, n._du, n._has_valid_disk_capacity, n._has_all_tablet_sizes);
+        for (const shard_load& sload: n._shards_by_load) {
+            service::lblogger.info("  shard: {} tablets: {} du: {}", sload.id, sload.tablet_count, sload.du);
+            total_used += sload.du.used;
+            total_capacity += sload.du.capacity;
+        }
+    }
+    double total_load = total_capacity == 0 ? 0 : double(total_used) / total_capacity;
+    service::lblogger.info("total_load: {} total used: {} total available: {}", total_load, bytes2gb(total_used), bytes2gb(total_capacity));
 }
