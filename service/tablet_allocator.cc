@@ -2163,6 +2163,7 @@ public:
             } else {
                 std::pop_heap(src_shards.begin(), src_shards.end(), node_load.shards_by_load_cmp());
                 src = src_shards.back();
+                sketch.has_complete_data(host, "get_least_loaded_shard()");
                 dst = sketch.get_least_loaded_shard(host);
             }
 
@@ -2224,7 +2225,9 @@ public:
             erase_candidates(nodes, tmap, tablets);
 
             update_node_load_on_migration(node_load, host, src, dst, tablets);
+            sketch.has_complete_data_test(host, "pick()");
             pick(sketch, host, dst, tablets);
+            sketch.has_complete_data_test(host, "unload()");
             unload(sketch, host, src, tablets);
         }
 
@@ -3727,6 +3730,21 @@ load_balancer_stats_manager& tablet_allocator::stats() {
 }
 
 }
+
+namespace locator {
+
+void load_sketch::has_complete_data_test(host_id node, sstring when) const {
+    if (!_nodes.contains(node)) {
+        service::lblogger.info("dbglog has_complete_data_test {} node not found", when);
+        return;
+    }
+    auto& n = _nodes.at(node);
+    service::lblogger.info("dbglog has_complete_data_test {} n._has_valid_disk_capacity == {}", when, n._has_valid_disk_capacity);
+    service::lblogger.info("dbglog has_complete_data_test {} n._has_all_tablet_sizes == {}", when, n._has_all_tablet_sizes);
+}
+
+}
+
 
 auto fmt::formatter<service::tablet_migration_info>::format(const service::tablet_migration_info& mig, fmt::format_context& ctx) const
         -> decltype(ctx.out()) {

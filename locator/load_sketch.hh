@@ -249,6 +249,8 @@ public:
         n._has_all_tablet_sizes = true;
     }
 
+    void has_complete_data_test(host_id node, sstring when) const;
+
     void set_minimal_tablet_size(uint64_t min_ts) {
         _minimal_tablet_size = min_ts;
     }
