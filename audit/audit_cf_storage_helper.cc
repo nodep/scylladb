@@ -107,9 +107,20 @@ future<> audit_cf_storage_helper::start(const db::config &cfg) {
         if (ks = _qp.db().try_find_keyspace(KEYSPACE_NAME); !ks) {
             // releasing, because table_helper::setup_keyspace creates a raft guard of its own
             service::release_guard(std::move(group0_guard));
+
+            std::optional<unsigned int> initial_tablets;
+            std::optional<db::tablet_options> per_table_tablet_options;
+            auto rf = std::to_string(RF_GOAL_PER_DC);
+            if (_qp.db().features().auto_replication_factor) {
+                initial_tablets.emplace(0);
+                auto& options = per_table_tablet_options.emplace();
+                options.min_per_shard_tablet_count = 1;
+                rf = "1"; // start with RF=1 if tablets are enabled, let topology coordinator automatically adjust it
+            }
             co_return co_await table_helper::setup_keyspace(_qp, _mm, KEYSPACE_NAME,
                                                             "org.apache.cassandra.locator.NetworkTopologyStrategy",
-                                                            "3", _dummy_query_state, {&_table});
+                                                            rf, _dummy_query_state, {&_table}, initial_tablets,
+                                                            per_table_tablet_options);
         } else if (ks->metadata()->strategy_name() == "org.apache.cassandra.locator.SimpleStrategy") {
             // We want to migrate the old (pre-Scylla 6.0) SimpleStrategy to a newer one.
             // The migrate_audit_table() function will do nothing if it races with another strategy change:
