@@ -9,11 +9,16 @@
 #pragma once
 
 #include "schema/schema_fwd.hh"
+#include "utils/chunked_vector.hh"
+#include "db/consistency_level_type.hh"
 #include "locator/host_id.hh"
+#include "dht/token.hh"
+#include "sstables/types.hh"
 
 #include <seastar/core/future.hh>
 #include <seastar/core/sstring.hh>
 
+#include <optional>
 #include <unordered_map>
 
 namespace cql3 {
@@ -30,7 +35,16 @@ namespace service {
     class migration_manager;
 }
 
+
 namespace db {
+
+struct snapshot_sstable_entry {
+    sstables::sstable_id sstable_id;
+    dht::token first_token;
+    dht::token last_token;
+    sstring toc_name;
+    sstring prefix;
+};
 
 class system_distributed_keyspace {
 public:
@@ -48,6 +62,10 @@ public:
      * We use it in the upgrade procedure to ensure that CDC generations appearing
      * in the old table also appear in the new table, if necessary. */
     static constexpr auto CDC_DESC_V1 = "cdc_streams_descriptions";
+
+    /* This table is used by the backup and restore code to store per-sstable metadata.
+     * The data the coordinator node puts in this table comes from the snapshot manifests. */
+    static constexpr auto SNAPSHOT_SSTABLES = "snapshot_sstables";
 
     /* Information required to modify/query some system_distributed tables, passed from the caller. */
     struct context {
@@ -86,6 +104,17 @@ public:
     // NOTE: there's a sibling `read_cdc_for_tablets_current_generation_timestamp` in `system_keyspace`, that does the same for tables backed up by tablets.
     // NOTE: currently used only by alternator
     future<db_clock::time_point> cdc_current_generation_timestamp(context);
+
+    /* Inserts a single SSTable entry for a given snapshot, keyspace, table, datacenter,
+     * and rack. The row is written with the specified TTL (in seconds). Uses consistency
+     * level `EACH_QUORUM` by default.*/
+    future<> insert_snapshot_sstable(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, sstables::sstable_id sstable_id, dht::token first_token, dht::token last_token, sstring toc_name, sstring prefix, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
+    
+    /* Retrieves all SSTable entries for a given snapshot, keyspace, table, datacenter, and rack.
+     * If `start_token` and `end_token` are provided, only entries whose `first_token` is in the range [`start_token`, `end_token`] will be returned.
+     * Returns a vector of `snapshot_sstable_entry` structs containing `sstable_id`, `first_token`, `last_token`,
+     * `toc_name`, and `prefix`. Uses consistency level `LOCAL_QUORUM` by default. */
+    future<utils::chunked_vector<snapshot_sstable_entry>> get_snapshot_sstables(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, db::consistency_level cl = db::consistency_level::LOCAL_QUORUM, std::optional<dht::token> start_token = std::nullopt, std::optional<dht::token> end_token = std::nullopt) const;
 
 private:
     future<> create_tables(std::vector<schema_ptr> tables);

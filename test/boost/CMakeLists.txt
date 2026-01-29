@@ -316,6 +316,8 @@ add_scylla_test(symmetric_key_test
   KIND SEASTAR
   LIBRARIES
     encryption)
+add_scylla_test(tablet_aware_restore_test
+  KIND SEASTAR)
 
 add_scylla_test(combined_tests
   KIND SEASTAR

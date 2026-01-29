@@ -37,6 +37,7 @@ class database;
 
 namespace db {
 class batchlog_manager;
+class system_distributed_keyspace;
 }
 
 namespace db::view {
