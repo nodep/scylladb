@@ -33,6 +33,10 @@
 #include "service/storage_service.hh"
 #include "utils/error_injection.hh"
 
+#include "sstables/object_storage_client.hh"
+#include "utils/rjson.hh"
+#include "db/system_distributed_keyspace.hh"
+
 #include <cfloat>
 #include <algorithm>
 
@@ -1019,4 +1023,85 @@ future<tasks::task_id> sstables_loader::download_new_sstables(sstring ks_name, s
 future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
                                                                                   std::vector<dht::token_range>&& tablets_ranges) {
     return tablet_sstable_streamer::get_sstables_for_tablets(sstables, std::move(tablets_ranges));
+}
+
+static future<size_t> process_manifest(input_stream<char>& is, const sstring& expected_snapshot_name,
+                                 const sstring& manifest_prefix, db::system_distributed_keyspace& sys_dist_ks,
+                                 db::consistency_level cl) {
+    // Read the entire JSON content
+    rjson::chunked_content content = co_await util::read_entire_stream(is);
+
+    rjson::value parsed = rjson::parse(std::move(content));
+
+    // Basic validation that tablet_count is a power of 2, as expected by our restore process
+    size_t tablet_count = parsed["table"]["tablet_count"].GetUint64();
+    if (!std::has_single_bit(tablet_count)) {
+        on_internal_error(llog, fmt::format("Invalid tablet_count {} in manifest {}, expected a power of 2", tablet_count, manifest_prefix));
+    }
+
+    // Extract the necessary fields from the manifest
+    // Expected JSON structure documented in docs/dev/object_storage.md
+    auto snapshot_name = rjson::to_sstring(parsed["snapshot"]["name"]);
+    if (snapshot_name != expected_snapshot_name) {
+        throw std::runtime_error(fmt::format("Manifest {} belongs to snapshot '{}', expected '{}'",
+            manifest_prefix, snapshot_name, expected_snapshot_name));
+    }
+    auto keyspace = rjson::to_sstring(parsed["table"]["keyspace_name"]);
+    auto table = rjson::to_sstring(parsed["table"]["table_name"]);
+    auto datacenter = rjson::to_sstring(parsed["node"]["datacenter"]);
+    auto rack = rjson::to_sstring(parsed["node"]["rack"]);
+
+    // Process each sstable entry in the manifest
+    // FIXME: cleanup of the snapshot-related rows is needed in case anything throws in here.
+    auto sstables = rjson::find(parsed, "sstables");
+    if (!sstables) {
+        co_return tablet_count;
+    }
+    if (!sstables->IsArray()) {
+        throw std::runtime_error("Malformed manifest, 'sstables' is not array");
+    }
+
+    for (auto& sstable_entry : sstables->GetArray()) {
+        auto id = rjson::to_sstable_id(sstable_entry["id"]);
+        auto first_token = rjson::to_token(sstable_entry["first_token"]);
+        auto last_token = rjson::to_token(sstable_entry["last_token"]);
+        auto toc_name = rjson::to_sstring(sstable_entry["toc_name"]);
+        auto prefix = sstring(std::filesystem::path(manifest_prefix).parent_path().string());
+        // Insert the snapshot sstable metadata into system_distributed.snapshot_sstables with a TTL of 3 days, that should be enough
+        // for any snapshot restore operation to complete, and after that the metadata will be automatically cleaned up from the table
+        co_await sys_dist_ks.insert_snapshot_sstable(snapshot_name, keyspace, table, datacenter, rack, id, first_token, last_token,
+                                                    toc_name, prefix, cl);
+    }
+
+    co_return tablet_count;
+}
+
+future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring endpoint, sstring bucket, sstring expected_snapshot_name, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl) {
+    if (manifest_prefixes.empty()) {
+        throw std::invalid_argument("manifest prefixes list must not be empty");
+    }
+
+    // Download manifests in parallel and populate system_distributed.snapshot_sstables
+    // with the content extracted from each manifest
+    auto client = sm.get_endpoint_client(endpoint);
+
+    // tablet_count to be returned by this function, we also validate that all manifests passed contain the same tablet count
+    std::optional<size_t> tablet_count;
+
+    co_await seastar::max_concurrent_for_each(manifest_prefixes, 16, [&] (const sstring& manifest_prefix) {
+        // Download the manifest JSON file
+        sstables::object_name name(bucket, manifest_prefix);
+        auto source = client->make_download_source(name);
+        return seastar::with_closeable(input_stream<char>(std::move(source)), [&] (input_stream<char>& is) {
+            return process_manifest(is, expected_snapshot_name, manifest_prefix, sys_dist_ks, cl).then([&](size_t count) {
+                if (!tablet_count) {
+                    tablet_count = count;
+                } else if (*tablet_count != count) {
+                    throw std::runtime_error(fmt::format("Inconsistent tablet_count values in manifest {}: expected {}, got {}", manifest_prefix, *tablet_count, count));
+                }
+            });
+        });
+    });
+
+    co_return *tablet_count;
 }
