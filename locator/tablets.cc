@@ -1440,6 +1440,22 @@ public:
     virtual dht::shard_replica_set shards_ready_for_reads(const schema& s, const token& token) const override {
         return _sharder.shards_ready_for_reads(token);
     }
+
+    virtual bool is_leaving(locator::host_id host, const dht::token& token) const override {
+        // Check if the token belongs to the tablet which is currently being migrated away from host
+        auto& tmap = get_tablet_map();
+        auto tid = tmap.get_tablet_id(token);
+        auto transition = tmap.get_tablet_transition_info(tid);
+        if (transition) {
+            auto& info = tmap.get_tablet_info(tid);
+            auto leaving_opt = locator::get_leaving_replica(info, *transition);
+            if (leaving_opt && leaving_opt->host == host) {
+                return true;
+            }
+        }
+
+        return false;
+    }
 };
 
 void tablet_aware_replication_strategy::validate_tablet_options(const abstract_replication_strategy& ars,
