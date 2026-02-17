@@ -7385,6 +7385,7 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
     } else {
         tls.effective_capacity = si.available + sum_tablet_sizes;
     }
+    rtlogger.info("effective_capacity={} available={} sum_tablet_sizes={}", tls.effective_capacity, si.available, sum_tablet_sizes);
 
     utils::get_local_injector().inject("clear_tablet_stats_in_load_stats", [&] {
         load_stats.tablet_stats.erase(this_host);
