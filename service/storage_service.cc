@@ -7322,11 +7322,9 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
 
     const locator::host_id this_host = _db.local().get_token_metadata().get_my_id();
 
-    uint64_t sum_tablet_sizes = 0;
-
     // Each node combines a per-table load map from all of its shards and returns it to the coordinator.
     // So if there are 1k nodes, there will be 1k RPCs in total.
-    auto load_stats = co_await _db.map_reduce0([&table_ids, &this_host, &sum_tablet_sizes] (replica::database& db) -> future<locator::load_stats> {
+    auto load_stats = co_await _db.map_reduce0([&table_ids, &this_host] (replica::database& db) -> future<locator::load_stats> {
         locator::load_stats load_stats{};
         auto& tables_metadata = db.get_tables_metadata();
 
@@ -7364,7 +7362,7 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
 
             locator::combined_load_stats combined_ls { table->table_load_stats(tablet_filter) };
             load_stats.tables.emplace(id, std::move(combined_ls.table_ls));
-            sum_tablet_sizes += load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
+            load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
 
             co_await coroutine::maybe_yield();
         }
@@ -7383,9 +7381,17 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
     if (config_capacity != 0) {
         tls.effective_capacity = config_capacity;
     } else {
+        uint64_t sum_tablet_sizes = 0;
+        for (auto& [host_id, tls] : load_stats.tablet_stats) {
+            for (auto& [table_id, tablet_sizes] : tls.tablet_sizes) {
+                for (auto& [rb_tid, size] : tablet_sizes) {
+                    sum_tablet_sizes += size;
+                }
+            }
+        }
         tls.effective_capacity = si.available + sum_tablet_sizes;
+        rtlogger.info("effective_capacity={} available={} sum_tablet_sizes={}", tls.effective_capacity, si.available, sum_tablet_sizes);
     }
-    rtlogger.info("effective_capacity={} available={} sum_tablet_sizes={}", tls.effective_capacity, si.available, sum_tablet_sizes);
 
     utils::get_local_injector().inject("clear_tablet_stats_in_load_stats", [&] {
         load_stats.tablet_stats.erase(this_host);
