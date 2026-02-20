@@ -527,11 +527,54 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
+    ss::tablet_aware_restore.set(r, [](std::unique_ptr<http::request> req) -> future<json_return_type> {
+        std::string keyspace = req->get_query_param("keyspace");
+        std::string table = req->get_query_param("table");
+        std::string snapshot = req->get_query_param("snapshot");
+
+        rjson::chunked_content content = co_await util::read_entire_stream(*req->content_stream);
+        rjson::value parsed = rjson::parse(std::move(content));
+        if (!parsed.IsArray()) {
+            throw httpd::bad_param_exception("backup locations (in body) must be a JSON array");
+        }
+
+        const auto& locations = parsed.GetArray();
+        if (locations.Size() != 1) {
+            throw httpd::bad_param_exception("backup locations array (in body) must contain exactly one entry");
+        }
+
+        const auto& location = locations[0];
+        if (!location.IsObject()) {
+            throw httpd::bad_param_exception("backup location (in body) must be a JSON object");
+        }
+
+        auto endpoint = rjson::to_string_view(location["endpoint"]);
+        auto bucket = rjson::to_string_view(location["bucket"]);
+        auto dc = rjson::to_string_view(location["datacenter"]);
+
+        if (!location.HasMember("manifests") || !location["manifests"].IsArray()) {
+            throw httpd::bad_param_exception("backup location entry must have 'manifests' array");
+        }
+
+        auto manifests = location["manifests"].GetArray() |
+            std::views::transform([] (const auto& m) { return sstring(rjson::to_string_view(m)); }) |
+            std::ranges::to<utils::chunked_vector<sstring>>();
+
+        if (manifests.empty()) {
+            throw httpd::bad_param_exception("backup location 'manifests' array must not be empty");
+        }
+
+        apilog.info("Tablet restore for {}:{} called. Parameters: snapshot={} datacenter={} endpoint={} bucket={} manifests_count={}",
+                    keyspace, table, snapshot, dc, endpoint, bucket, manifests.size());
+
+        co_return json_void();
+    });
 }
 
 void unset_sstables_loader(http_context& ctx, routes& r) {
     ss::load_new_ss_tables.unset(r);
     ss::start_restore.unset(r);
+    ss::tablet_aware_restore.unset(r);
 }
 
 void set_view_builder(http_context& ctx, routes& r, sharded<db::view::view_builder>& vb, sharded<gms::gossiper>& g) {
