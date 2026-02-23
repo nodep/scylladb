@@ -726,6 +726,11 @@ private:
         ++_sp.get_stats().received_hints_total;
         _sp.get_stats().received_hints_bytes_total += in.representation().size();
 
+        if (utils::get_local_injector().is_enabled("receive_hint_mutation_handler_log")) {
+            const auto table = in.column_family_id();
+            slogger.info("receive_hint_mutation_handler received hint for table {}", table);
+        }
+
         return receive_mutation_handler(_sp._hints_write_smp_service_group, cinfo, t, std::move(in),
             std::move(forward), std::move(reply_to), shard, response_id, std::move(trace_info),
             std::monostate(), fence, std::move(forward_id), std::move(reply_to_id));
