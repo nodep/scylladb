@@ -131,12 +131,14 @@ tablet_transition_info::tablet_transition_info(tablet_transition_stage stage,
                                                tablet_transition_kind transition,
                                                tablet_replica_set next,
                                                std::optional<tablet_replica> pending_replica,
-                                               service::session_id session_id)
+                                               service::session_id session_id,
+                                               std::optional<locator::restore_config> restore_cfg)
     : stage(stage)
     , transition(transition)
     , next(std::move(next))
     , pending_replica(std::move(pending_replica))
     , session_id(session_id)
+    , restore_cfg(std::move(restore_cfg))
     , writes(get_selector_for_writes(stage))
     , reads(get_selector_for_reads(stage))
 { }
