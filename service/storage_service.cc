@@ -5719,6 +5719,21 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
 }
 
 future<> storage_service::transit_tablet(table_id table, dht::token token, noncopyable_function<std::tuple<utils::chunked_vector<canonical_mutation>, sstring>(const locator::tablet_map&, api::timestamp_type)> prepare_mutations) {
+    auto success = co_await try_transit_tablet(table, token, std::move(prepare_mutations));
+    if (!success) {
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        auto tid = tmap.get_tablet_id(token);
+        throw std::runtime_error(fmt::format("Tablet {} is in transition", locator::global_tablet_id{table, tid}));
+    }
+
+    // Wait for transition to finish.
+    co_await _topology_state_machine.event.when([&] {
+        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
+        return !tmap.get_tablet_transition_info(tmap.get_tablet_id(token));
+    });
+}
+
+future<bool> storage_service::try_transit_tablet(table_id table, dht::token token, noncopyable_function<std::tuple<utils::chunked_vector<canonical_mutation>, sstring>(const locator::tablet_map&, api::timestamp_type)> prepare_mutations) {
     while (true) {
         auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
         bool topology_busy;
@@ -5738,7 +5753,7 @@ future<> storage_service::transit_tablet(table_id table, dht::token token, nonco
         auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
         auto tid = tmap.get_tablet_id(token);
         if (tmap.get_tablet_transition_info(tid)) {
-            throw std::runtime_error(fmt::format("Tablet {} is in transition", locator::global_tablet_id{table, tid}));
+            co_return false;
         }
 
         auto [ updates, reason ] = prepare_mutations(tmap, guard.write_timestamp());
@@ -5768,11 +5783,7 @@ future<> storage_service::transit_tablet(table_id table, dht::token token, nonco
         }
     }
 
-    // Wait for transition to finish.
-    co_await _topology_state_machine.event.when([&] {
-        auto& tmap = get_token_metadata().tablets().get_tablet_map(table);
-        return !tmap.get_tablet_transition_info(tmap.get_tablet_id(token));
-    });
+    co_return true;
 }
 
 future<> storage_service::set_tablet_balancing_enabled(bool enabled) {
