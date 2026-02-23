@@ -407,3 +407,61 @@ async def test_hint_to_pending(manager: ManagerClient):
             task.result()
 
         assert list(await cql.run_async(f"SELECT v FROM {table} WHERE pk = 0")) == [(0,)]
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_hint_to_leaving_will_send_hint_to_all_endpoints(manager: ManagerClient):
+    '''
+    This test checks if hint_sender sends a mutation to all replicas if the mutation
+    belongs to a tablet which is being migrated away from a host. This is needed to improve
+    consistency. https://scylladb.atlassian.net/browse/SCYLLADB-287
+    '''
+    cfg = { 'error_injections_at_startup': ['receive_hint_mutation_handler_log'] }
+    servers = await manager.servers_add(3, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+        {"dc": "dc1", "rack": "r2"},
+        {"dc": "dc1", "rack": "r2"},
+    ], cmdline = ["--logger-log-level", "hints_manager=trace"], config=cfg)
+    cql = await manager.get_cql_exclusive(servers[0])
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 2} AND tablets = {'initial': 1}") as ks:
+        table = f"{ks}.t"
+        await cql.run_async(f"CREATE TABLE {table} (pk int primary key, v int)")
+        host_ids = [await manager.get_host_id(server.server_id) for server in servers]
+
+        # The rest of the test assumes a tablet is on shard 0 of host 2, so we migrate it there
+        replicas = await get_tablet_replicas(manager, servers[0], ks, "t", 0)
+        replica = replicas[1] if replicas[0][0] == host_ids[0] else replicas[0]
+        if replica != (host_ids[2], 0):
+            await manager.api.move_tablet(servers[0].ip_addr, ks, "t", replica[0], replica[1], host_ids[2], 0, 0)
+
+        await manager.api.enable_injection(servers[1].ip_addr, "pause_after_streaming_tablet", False)
+
+        tablet_migration = asyncio.create_task(manager.api.move_tablet(servers[0].ip_addr, ks, "t", host_ids[2], 0, host_ids[1], 0, 0))
+
+        async def migration_reached_streaming():
+            stages = await cql.run_async(f"SELECT stage FROM system.tablets WHERE keyspace_name='{ks}' ALLOW FILTERING")
+            logger.info(f"Current stages: {[row.stage for row in stages]}")
+            return set(["streaming"]) == set([row.stage for row in stages]) or None
+        await wait_for(migration_reached_streaming, time.time() + 60)
+
+        await manager.server_stop_gracefully(servers[2].server_id)
+        await manager.others_not_see_server(servers[2].ip_addr)
+
+        await cql.run_async(SimpleStatement(f"INSERT INTO {table} (pk, v) VALUES (0, 0)", consistency_level=ConsistencyLevel.ANY))
+
+        s1_log = await manager.server_open_log(servers[1].server_id)
+        s2_log = await manager.server_open_log(servers[2].server_id)
+
+        await manager.server_start(servers[2].server_id)
+
+        # Make sure the hint was received by leaving and pending replicas
+        table_id = await manager.get_table_or_view_id(ks, 't')
+        for s in (s1_log, s2_log):
+            await s.wait_for(f"receive_hint_mutation_handler received hint for table {table_id}")
+
+        await manager.api.message_injection(servers[1].ip_addr, "pause_after_streaming_tablet")
+        await tablet_migration
+
+        assert list(await cql.run_async(f"SELECT v FROM {table} WHERE pk = 0")) == [(0,)]
