@@ -25,6 +25,8 @@ class database;
 }
 
 struct minimal_sst_info;
+struct restore_result {
+};
 
 namespace sstables { class storage_manager; }
 

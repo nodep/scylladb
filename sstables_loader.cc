@@ -34,6 +34,7 @@
 #include "utils/error_injection.hh"
 #include "sstables_loader_helpers.hh"
 #include "db/system_distributed_keyspace.hh"
+#include "idl/sstables_loader.dist.hh"
 
 #include "sstables/object_storage_client.hh"
 #include "utils/rjson.hh"
@@ -895,9 +896,20 @@ sstables_loader::sstables_loader(sharded<replica::database>& db,
     , _sched_group(std::move(sg))
 {
     tm.register_module("sstables_loader", _task_manager_module);
+    ser::sstables_loader_rpc_verbs::register_restore_tablet(&_messaging, [this] (raft::server_id dst_id, locator::global_tablet_id gid) -> future<restore_result> {
+        return _ss.local().handle_raft_rpc(dst_id, [&sl = container(), gid] (auto& ss) {
+            return ss.do_tablet_operation(gid, "Restore", [&sl, gid] (locator::tablet_metadata_guard& guard) -> future<service::tablet_operation_result> {
+                co_await sl.local().download_tablet_sstables(gid, guard);
+                co_return service::tablet_operation_empty_result{};
+            }).then([] (auto res) {
+                return make_ready_future<restore_result>();
+            });
+        });
+    });
 }
 
 future<> sstables_loader::stop() {
+    co_await ser::sstables_loader_rpc_verbs::unregister(&_messaging),
     co_await _task_manager_module->stop();
 }
 
