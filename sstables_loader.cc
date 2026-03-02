@@ -1002,3 +1002,51 @@ future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manag
 
     co_return *tablet_count;
 }
+
+class sstables_loader::tablet_restore_task_impl : public tasks::task_manager::task::impl {
+    sharded<sstables_loader>& _loader;
+    table_id _tid;
+    sstring _snap_name;
+    sstring _endpoint;
+    sstring _bucket;
+
+public:
+    tablet_restore_task_impl(tasks::task_manager::module_ptr module, sharded<sstables_loader>& loader, sstring ks,
+            table_id tid, sstring snap_name, sstring endpoint, sstring bucket) noexcept
+        : tasks::task_manager::task::impl(module, tasks::task_id::create_random_id(), 0, "node", ks, "", "", tasks::task_id::create_null_id())
+        , _loader(loader)
+        , _tid(std::move(tid))
+        , _snap_name(std::move(snap_name))
+        , _endpoint(std::move(endpoint))
+        , _bucket(std::move(bucket))
+    {
+        _status.progress_units = "batches";
+    }
+
+    virtual std::string type() const override {
+        return "restore_tablets";
+    }
+
+    virtual tasks::is_internal is_internal() const noexcept override {
+        return tasks::is_internal::no;
+    }
+
+    virtual tasks::is_user_task is_user_task() const noexcept override {
+        return tasks::is_user_task::yes;
+    }
+
+    tasks::is_abortable is_abortable() const noexcept override {
+        return tasks::is_abortable::no;
+    }
+
+protected:
+    virtual future<> run() override {
+        (void)_loader; (void)_tid; (void)_snap_name; (void)_endpoint; (void)_bucket;
+        co_return; // To be implemented
+    }
+};
+
+future<tasks::task_id> sstables_loader::restore_tablets(table_id tid, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, utils::chunked_vector<sstring> manifests) {
+    auto task = co_await _task_manager_module->make_and_start_task<tablet_restore_task_impl>({}, container(), keyspace, tid, std::move(snap_name), std::move(endpoint), std::move(bucket));
+    co_return task->id();
+}

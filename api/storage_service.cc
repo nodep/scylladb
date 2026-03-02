@@ -527,7 +527,7 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         co_return json::json_return_type(fmt::to_string(task_id));
     });
 
-    ss::tablet_aware_restore.set(r, [](std::unique_ptr<http::request> req) -> future<json_return_type> {
+    ss::tablet_aware_restore.set(r, [&ctx, &sst_loader](std::unique_ptr<http::request> req) -> future<json_return_type> {
         std::string keyspace = req->get_query_param("keyspace");
         std::string table = req->get_query_param("table");
         std::string snapshot = req->get_query_param("snapshot");
@@ -567,7 +567,9 @@ void set_sstables_loader(http_context& ctx, routes& r, sharded<sstables_loader>&
         apilog.info("Tablet restore for {}:{} called. Parameters: snapshot={} datacenter={} endpoint={} bucket={} manifests_count={}",
                     keyspace, table, snapshot, dc, endpoint, bucket, manifests.size());
 
-        co_return json_void();
+        auto table_id = validate_table(ctx.db.local(), keyspace, table);
+        auto task_id = co_await sst_loader.local().restore_tablets(table_id, keyspace, table, snapshot, sstring(endpoint), sstring(bucket), std::move(manifests));
+        co_return json::json_return_type(fmt::to_string(task_id));
     });
 }
 

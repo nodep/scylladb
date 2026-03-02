@@ -139,7 +139,10 @@ public:
             sstring prefix, std::vector<sstring> sstables,
             sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica);
 
+    future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, utils::chunked_vector<sstring> manifests);
+
     class download_task_impl;
+    class tablet_restore_task_impl;
 };
 
 template <>
