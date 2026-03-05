@@ -241,6 +241,13 @@ future<> view_building_coordinator::clean_finished_tasks() {
             builder.del_all_tasks();
         }
 
+        if (_db.features().view_building_tasks_min_task_id) {
+            // If min_alive_uuid == std::nullopt, set min_task_id to a fresh UUID,
+            // so future scans start past all the just-deleted rows (new tasks created
+            // later will have larger UUIDs).
+            builder.set_min_task_id(min_alive_uuid ? *min_alive_uuid : utils::UUID_gen::get_time_UUID());
+        }
+
         co_await commit_mutations(std::move(guard), {builder.build()}, "remove finished view building tasks");
         for (auto& [_, tasks_set]: _finished_tasks) {
             tasks_set.clear();
