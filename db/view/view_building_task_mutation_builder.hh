@@ -42,6 +42,8 @@ public:
     view_building_task_mutation_builder& del_tasks_before(utils::UUID id);
     // Deletes all tasks using a range tombstone covering the entire clustering range.
     view_building_task_mutation_builder& del_all_tasks();
+    // Sets the static column min_task_id to `id`.
+    view_building_task_mutation_builder& set_min_task_id(utils::UUID id);
 
     mutation build() {
         return std::move(_m);

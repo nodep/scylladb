@@ -71,6 +71,11 @@ view_building_task_mutation_builder& view_building_task_mutation_builder::del_al
     return *this;
 }
 
+view_building_task_mutation_builder& view_building_task_mutation_builder::set_min_task_id(utils::UUID id) {
+    _m.set_static_cell("min_task_id", data_value(id), _ts);
+    return *this;
+}
+
 }
 
 }
