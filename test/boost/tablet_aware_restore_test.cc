@@ -146,10 +146,10 @@ SEASTAR_TEST_CASE(test_populate_snapshot_sstables_from_manifests, *boost::unit_t
             auto bucket = storage_options.to_map()["bucket"];
             backup(env, ep, bucket).get();
 
-            BOOST_REQUIRE_THROW(populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), ep, bucket, "unexpected_snapshot", {"/backup/manifest.json"}, db::consistency_level::ONE).get(), std::runtime_error);;
+            BOOST_REQUIRE_THROW(populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "unexpected_snapshot", {"/backup/manifest.json"}, db::consistency_level::ONE).get(), std::runtime_error);;
 
             // populate system_distributed.snapshot_sstables with the content of the snapshot manifest
-            populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), ep, bucket, "snapshot", {"/backup/manifest.json"}, db::consistency_level::ONE).get();
+            populate_snapshot_sstables_from_manifests(env.get_sstorage_manager().local(), env.get_system_distributed_keyspace().local(), "ks", "cf", ep, bucket, "snapshot", {"/backup/manifest.json"}, db::consistency_level::ONE).get();
 
             check_snapshot_sstables(env).get();
     }, false, db_cfg_ptr, 10);
