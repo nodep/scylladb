@@ -52,6 +52,25 @@ view_building_task_mutation_builder& view_building_task_mutation_builder::del_ta
     return *this;
 }
 
+view_building_task_mutation_builder& view_building_task_mutation_builder::del_tasks_before(utils::UUID id) {
+    auto ck = get_ck(id);
+    range_tombstone rt(
+        position_in_partition::before_all_clustered_rows(),
+        position_in_partition_view(ck, bound_weight::before_all_prefixed),
+        tombstone{_ts, gc_clock::now()});
+    _m.partition().apply_row_tombstone(*_s, std::move(rt));
+    return *this;
+}
+
+view_building_task_mutation_builder& view_building_task_mutation_builder::del_all_tasks() {
+    range_tombstone rt(
+        position_in_partition::before_all_clustered_rows(),
+        position_in_partition::after_all_clustered_rows(),
+        tombstone{_ts, gc_clock::now()});
+    _m.partition().apply_row_tombstone(*_s, std::move(rt));
+    return *this;
+}
+
 }
 
 }
