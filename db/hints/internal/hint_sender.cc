@@ -258,14 +258,14 @@ future<> hint_sender::send_one_mutation(frozen_mutation_and_schema m) {
         const auto dst = end_point_key();
 
         const bool is_leaving = ermp->is_leaving(dst, token);
-        if (std::ranges::contains(natural_endpoints, dst) && !is_leaving) {
+        if (std::ranges::contains(natural_endpoints, dst) && (!is_leaving || !pending_endpoints.empty())) {
             manager_logger.trace("hint_sender[{}]:send_one_mutation: Sending directly", dst);
             // dst is not duplicated in pending_endpoints because it's in natural_endpoints
             return _proxy.send_hint_to_endpoint(std::move(m), std::move(ermp), dst, std::move(pending_endpoints));
         } else {
             if (manager_logger.is_enabled(log_level::trace)) {
                 if (is_leaving) {
-                    manager_logger.trace("hint_sender[{}]:send_one_mutation: Original target host is leaving, or tablet replica is migrated away. Mutating from scratch", dst);
+                    manager_logger.trace("hint_sender[{}]:send_one_mutation: Original target host or tablet replica is leaving. Mutating from scratch", dst);
                 } else {
                     manager_logger.trace("hint_sender[{}]:send_one_mutation: Endpoint set has changed and original target is no longer a replica. Mutating from scratch", dst);
                 }
@@ -378,6 +378,7 @@ void hint_sender::dismiss_replay_waiters() noexcept {
 
 future<> hint_sender::wait_until_hints_are_replayed_up_to(abort_source& as, db::replay_position up_to_rp) {
     manager_logger.debug("hint_sender[{}]:wait_until_hints_are_replayed_up_to: Entering with target {}", end_point_key(), up_to_rp);
+    manager_logger.debug("hint_sender[{}]:wait_until_hints_are_replayed_up_to: Currently upper bound is at {}", end_point_key(), _sent_upper_bound_rp);
     if (_foreign_segments_to_replay.empty() && up_to_rp < _sent_upper_bound_rp) {
         manager_logger.debug("hint_sender[{}]:wait_until_hints_are_replayed_up_to: Hints were already replayed above the point ({} < {})",
                 end_point_key(), up_to_rp, _sent_upper_bound_rp);
@@ -501,6 +502,7 @@ bool hint_sender::send_one_file(const sstring& fname) {
                     //   are created and we help enforce the "at most 10s worth of
                     //   hints in a segment".
                     co_await sleep(std::chrono::milliseconds(100));
+                    manager_logger.info("dbglog waiting for hints replay");
                     continue;
                 } else {
                     co_await send_one_hint(ctx_ptr, std::move(buf), rp, secs_since_file_mod, fname);

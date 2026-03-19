@@ -349,6 +349,9 @@ class ScyllaRESTAPIClient:
         """Get logger level"""
         return await self.client.get_text(f"/system/logger/{logger}", host=node_ip)
 
+    async def add_custom_log(self, node_ip: str, message: str) -> str:
+        return await self.client.post(f"/system/log?level=info&message={message}", host=node_ip)
+
     async def set_logger_level(self, node_ip: str, logger: str, level: str) -> None:
         """Set logger level"""
         assert level in ["debug", "info", "warning", "trace"]

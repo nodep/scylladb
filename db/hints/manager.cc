@@ -322,7 +322,9 @@ sync_point::shard_rps manager::calculate_current_sync_point(std::span<const loca
     // create a sync point for ALL other nodes.
     if (target_eps.empty()) {
         for (const auto& [host_id, ep_man] : _ep_managers) {
-            rps[host_id] = ep_man.last_written_replay_position();
+            auto rp = ep_man.last_written_replay_position();
+            manager_logger.info("dbglog creating rp {} for hints for host {}", rp, host_id);
+            rps[host_id] = rp;
         }
     }
 
@@ -384,8 +386,11 @@ future<> manager::wait_for_sync_point(abort_source& as, const sync_point::shard_
         } ();
 
         try {
+            manager_logger.info("dbglog waiting for hints to be replayed up to {}", rp);
             co_await ep_man.wait_until_hints_are_replayed_up_to(local_as, rp);
+            manager_logger.info("dbglog waiting for hints was successful for {}", rp);
         } catch (abort_requested_exception&) {
+            manager_logger.info("dbglog waiting for hints was ABORTED for {}", rp);
             if (!local_as.abort_requested()) {
                 local_as.request_abort();
             }
