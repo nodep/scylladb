@@ -120,6 +120,8 @@ schema_ptr snapshot_sstables() {
                 .with_column("toc_name", utf8_type)
                 // Prefix path in object storage where the SSTable was backed up
                 .with_column("prefix", utf8_type)
+                // Flag if the SSTable was downloaded already
+                .with_column("downloaded", boolean_type)
                 .with_hash_version()
                 .build();
     }();
@@ -432,6 +434,8 @@ system_distributed_keyspace::cdc_current_generation_timestamp(context ctx) {
 }
 
 future<> system_distributed_keyspace::insert_snapshot_sstable(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, sstables::sstable_id sstable_id, dht::token first_token, dht::token last_token, sstring toc_name, sstring prefix, db::consistency_level cl) {
+    // Not inserting the downloaded column so that re-populating on restore
+    // retry doesn't overwrite downloaded=true set by a previous attempt
     static const sstring query = format("INSERT INTO {}.{} (snapshot_name, \"keyspace\", \"table\", datacenter, rack, first_token, sstable_id, last_token, toc_name, prefix) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) USING TTL {}", NAME, SNAPSHOT_SSTABLES, SNAPSHOT_SSTABLES_TTL_SECONDS);
 
     return _qp.execute_internal(
@@ -447,11 +451,11 @@ future<utils::chunked_vector<snapshot_sstable_entry>>
 system_distributed_keyspace::get_snapshot_sstables(sstring snapshot_name, sstring ks, sstring table, sstring dc, sstring rack, db::consistency_level cl, std::optional<dht::token> start_token, std::optional<dht::token> end_token) const {
     utils::chunked_vector<snapshot_sstable_entry> sstables;
 
-    static const sstring base_query = format("SELECT toc_name, prefix, sstable_id, first_token, last_token FROM {}.{}"
+    static const sstring base_query = format("SELECT toc_name, prefix, sstable_id, first_token, last_token, downloaded FROM {}.{}"
         " WHERE snapshot_name = ? AND \"keyspace\" = ? AND \"table\" = ? AND datacenter = ? AND rack = ?", NAME, SNAPSHOT_SSTABLES);
 
     auto read_row = [&] (const cql3::untyped_result_set_row& row) {
-            sstables.emplace_back(sstables::sstable_id(row.get_as<utils::UUID>("sstable_id")), dht::token::from_int64(row.get_as<int64_t>("first_token")), dht::token::from_int64(row.get_as<int64_t>("last_token")), row.get_as<sstring>("toc_name"), row.get_as<sstring>("prefix"));
+            sstables.emplace_back(sstables::sstable_id(row.get_as<utils::UUID>("sstable_id")), dht::token::from_int64(row.get_as<int64_t>("first_token")), dht::token::from_int64(row.get_as<int64_t>("last_token")), row.get_as<sstring>("toc_name"), row.get_as<sstring>("prefix"), is_downloaded(row.get_or<bool>("downloaded", false)));
             return make_ready_future<stop_iteration>(stop_iteration::no);
     };
 
