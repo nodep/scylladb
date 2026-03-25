@@ -968,8 +968,12 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
     auto s = _db.local().find_schema(tid.table);
     auto tablet_range = tmap.get_token_range(tid.tablet);
     const auto& topo = guard.get_token_metadata()->get_topology();
+    auto keyspace_name = s->ks_name();
+    auto table_name = s->cf_name();
+    auto datacenter = topo.get_datacenter();
+    auto rack = topo.get_rack();
 
-    auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(restore_cfg.snapshot_name, s->ks_name(), s->cf_name(), topo.get_datacenter(), topo.get_rack(),
+    auto sst_infos = co_await _sys_dist_ks.get_snapshot_sstables(restore_cfg.snapshot_name, keyspace_name, table_name, datacenter, rack,
             db::consistency_level::LOCAL_QUORUM, tablet_range.start().transform([] (auto& v) { return v.value(); }), tablet_range.end().transform([] (auto& v) { return v.value(); }));
     llog.debug("{} SSTables found for tablet {}", sst_infos.size(), tid);
     if (sst_infos.empty()) {
@@ -1041,9 +1045,19 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
             return init;
         });
 
-    co_await container().invoke_on_all([tid, &downloaded_ssts] (auto& loader) -> future<> {
+    co_await container().invoke_on_all([tid, &downloaded_ssts, snap_name = restore_cfg.snapshot_name, keyspace_name, table_name, datacenter, rack] (auto& loader) -> future<> {
         auto shard_ssts = std::move(downloaded_ssts[this_shard_id()]);
-        co_await max_concurrent_for_each(shard_ssts, 16, [&loader, tid](const auto& min_info) -> future<> { co_await loader.attach_sstable(tid.table, min_info); });
+        co_await max_concurrent_for_each(shard_ssts, 16, [&loader, tid, snap_name, keyspace_name, table_name, datacenter, rack](const auto& min_info) -> future<> {
+            sstables::shared_sstable attached_sst = co_await loader.attach_sstable(tid.table, min_info);
+            co_await loader._sys_dist_ks.update_sstable_download_status(snap_name,
+                                                                         keyspace_name,
+                                                                         table_name,
+                                                                         datacenter,
+                                                                         rack,
+                                                                         *attached_sst->sstable_identifier(),
+                                                                         attached_sst->get_first_decorated_key().token(),
+                                                                         db::is_downloaded::yes);
+        });
     });
 }
 
