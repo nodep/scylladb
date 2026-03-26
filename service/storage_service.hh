@@ -230,9 +230,6 @@ private:
     shared_ptr<service::topo::task_manager_module> _global_topology_requests_module;
     shared_ptr<service::vnodes_to_tablets::task_manager_module> _vnodes_to_tablets_migration_module;
     gms::gossip_address_map& _address_map;
-    future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
-                                 sstring op_name,
-                                 std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
     future<service::tablet_operation_repair_result> repair_tablet(locator::global_tablet_id, service::session_id);
     future<> stream_tablet(locator::global_tablet_id);
     // Clones storage of leaving tablet into pending one. Done in the context of intra-node migration,
@@ -245,6 +242,10 @@ private:
     void register_tablet_split_candidate(table_id) noexcept;
     future<> run_tablet_split_monitor();
 public:
+    future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
+                                 sstring op_name,
+                                 std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
+
     storage_service(abort_source& as, sharded<replica::database>& db,
         gms::gossiper& gossiper,
         sharded<db::system_keyspace>&,
