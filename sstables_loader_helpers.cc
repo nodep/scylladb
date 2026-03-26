@@ -14,11 +14,14 @@
 #include "replica/database.hh"
 #include "sstables/shared_sstable.hh"
 #include "sstables/sstables.hh"
+#include "utils/error_injection.hh"
 
 future<minimal_sst_info> download_sstable(replica::database& db, replica::table& table, sstables::shared_sstable sstable, logging::logger& logger) {
     constexpr auto foptions = file_open_options{.extent_allocation_size_hint = 32_MiB, .sloppy_size = true};
     constexpr auto stream_options = file_output_stream_options{.buffer_size = 128_KiB, .write_behind = 10};
     auto components = sstable->all_components();
+
+    utils::get_local_injector().inject("fail_download_sstable", [] { throw std::runtime_error("Failing sstable download"); });
 
     // Move the TOC to the front to be processed first since `sstables::create_stream_sink` takes care
     // of creating behind the scene TemporaryTOC instead of usual one. This assures that in case of failure

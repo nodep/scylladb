@@ -777,6 +777,40 @@ async def test_restore_tablets(build_mode: str, manager: ManagerClient, object_s
 
 
 @pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_restore_tablets_download_failure(build_mode: str, manager: ManagerClient, object_storage):
+    '''Check that failure to download an sstable propagates back to API'''
+
+    topology = topo(rf = 1, nodes = 2, racks = 1, dcs = 1)
+    servers, host_ids = await create_cluster(topology, manager, logger, object_storage)
+
+    await manager.disable_tablet_balancing()
+    cql = manager.get_cql()
+
+    num_keys = 12
+    tablet_count=4
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': {tablet_count}}};")
+        insert_stmt = cql.prepare(f"INSERT INTO {ks}.test (pk, value) VALUES (?, ?)")
+        insert_stmt.consistency_level = ConsistencyLevel.ALL
+        await asyncio.gather(*(cql.run_async(insert_stmt, (str(i), i)) for i in range(num_keys)))
+        snap_name, sstables = await take_snapshot(ks, servers, manager, logger)
+        await asyncio.gather(*(do_backup(s, snap_name, f'{s.server_id}/{snap_name}', ks, 'test', object_storage, manager, logger) for s in servers))
+
+    await manager.api.enable_injection(servers[1].ip_addr, "fail_download_sstable", one_shot=True)
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': {topology.rf}}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.test ( pk text primary key, value int ) WITH tablets = {{'min_tablet_count': {tablet_count}, 'max_tablet_count': {tablet_count}}};")
+
+        logger.info(f'Restore cluster via {servers[0].ip_addr}')
+        manifests = [ f'{s.server_id}/{snap_name}/manifest.json' for s in servers ]
+        tid = await manager.api.restore_tablets(servers[0].ip_addr, ks, 'test', snap_name, servers[0].datacenter, object_storage.address, object_storage.bucket_name, manifests)
+        status = await manager.api.wait_task(servers[0].ip_addr, tid)
+        assert 'state' in status and status['state'] == 'failed'
+        assert 'error' in status and 'Failed to download' in status['error']
+
+
+@pytest.mark.asyncio
 async def test_restore_with_non_existing_sstable(manager: ManagerClient, object_storage):
     '''Check that restore task fails well when given a non-existing sstable'''
 
