@@ -986,6 +986,8 @@ future<> sstables_loader::download_tablet_sstables(locator::global_tablet_id tid
         throw std::logic_error("sstables_partially_contained");
     }
     llog.debug("{} SSTables filtered by range {} for tablet {}", fully.size(), tablet_range, tid);
+    co_await utils::get_local_injector().inject("pause_tablet_restore", utils::wait_for_message(60s));
+
     if (fully.empty()) {
         // It can happen that a tablet exists and contains no data. Just skip it
         co_return;
