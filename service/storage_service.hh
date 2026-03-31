@@ -241,10 +241,19 @@ private:
     future<> process_tablet_split_candidate(table_id) noexcept;
     void register_tablet_split_candidate(table_id) noexcept;
     future<> run_tablet_split_monitor();
+    void check_raft_rpc(raft::server_id dst);
 public:
     future<service::tablet_operation_result> do_tablet_operation(locator::global_tablet_id tablet,
                                  sstring op_name,
                                  std::function<future<service::tablet_operation_result>(locator::tablet_metadata_guard&)> op);
+
+    template <typename Func>
+    auto handle_raft_rpc(raft::server_id dst_id, Func&& handler) {
+        return container().invoke_on(0, [dst_id, handler = std::forward<Func>(handler)] (auto& ss) mutable {
+            ss.check_raft_rpc(dst_id);
+            return handler(ss);
+        });
+    };
 
     storage_service(abort_source& as, sharded<replica::database>& db,
         gms::gossiper& gossiper,

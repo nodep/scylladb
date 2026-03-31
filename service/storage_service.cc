@@ -6190,6 +6190,15 @@ node_state storage_service::get_node_state(locator::host_id id) {
     return p->second.state;
 }
 
+void storage_service::check_raft_rpc(raft::server_id dst_id) {
+    if (!_group0 || !_group0->joined_group0()) {
+        throw std::runtime_error("The node did not join group 0 yet");
+    }
+    if (_group0->load_my_id() != dst_id) {
+        throw raft_destination_id_not_correct(_group0->load_my_id(), dst_id);
+    }
+}
+
 void storage_service::init_messaging_service() {
     ser::node_ops_rpc_verbs::register_node_ops_cmd(&_messaging.local(), [this] (const rpc::client_info& cinfo, node_ops_cmd_request req) {
         auto coordinator = cinfo.retrieve_auxiliary<gms::inet_address>("baddr");
@@ -6201,17 +6210,6 @@ void storage_service::init_messaging_service() {
             return ss.node_ops_cmd_handler(coordinator, coordinator_host_id, std::move(req));
         });
     });
-    auto handle_raft_rpc = [this] (raft::server_id dst_id, auto handler) {
-        return container().invoke_on(0, [dst_id, handler = std::move(handler)] (auto& ss) mutable {
-            if (!ss._group0 || !ss._group0->joined_group0()) {
-                throw std::runtime_error("The node did not join group 0 yet");
-            }
-            if (ss._group0->load_my_id() != dst_id) {
-                throw raft_destination_id_not_correct(ss._group0->load_my_id(), dst_id);
-            }
-            return handler(ss);
-        });
-    };
     ser::streaming_rpc_verbs::register_tablet_stream_files(&_messaging.local(),
             [this] (const rpc::client_info& cinfo, streaming::stream_files_request req) -> future<streaming::stream_files_response> {
         streaming::stream_files_response resp;
@@ -6223,13 +6221,13 @@ void storage_service::init_messaging_service() {
         std::plus<size_t>());
         co_return resp;
     });
-    ser::storage_service_rpc_verbs::register_raft_topology_cmd(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd) {
+    ser::storage_service_rpc_verbs::register_raft_topology_cmd(&_messaging.local(), [this] (raft::server_id dst_id, raft::term_t term, uint64_t cmd_index, raft_topology_cmd cmd) {
         return handle_raft_rpc(dst_id, [cmd = std::move(cmd), term, cmd_index] (auto& ss) {
             check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "raft_topology_cmd");
             return ss.raft_topology_cmd_handler(term, cmd_index, cmd);
         });
     });
-    ser::storage_service_rpc_verbs::register_raft_pull_snapshot(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, raft_snapshot_pull_params params) {
+    ser::storage_service_rpc_verbs::register_raft_pull_snapshot(&_messaging.local(), [this] (raft::server_id dst_id, raft_snapshot_pull_params params) {
         return handle_raft_rpc(dst_id, [params = std::move(params)] (storage_service& ss) -> future<raft_snapshot> {
             check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "raft_pull_snapshot");
             utils::chunked_vector<canonical_mutation> mutations;
@@ -6324,28 +6322,28 @@ void storage_service::init_messaging_service() {
             };
         });
     });
-    ser::storage_service_rpc_verbs::register_tablet_stream_data(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, locator::global_tablet_id tablet) {
+    ser::storage_service_rpc_verbs::register_tablet_stream_data(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet) {
         return handle_raft_rpc(dst_id, [tablet] (auto& ss) {
             return ss.stream_tablet(tablet);
         });
     });
-    ser::storage_service_rpc_verbs::register_tablet_repair(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, locator::global_tablet_id tablet, rpc::optional<service::session_id> session_id) {
+    ser::storage_service_rpc_verbs::register_tablet_repair(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet, rpc::optional<service::session_id> session_id) {
         return handle_raft_rpc(dst_id, [tablet, session_id = session_id.value_or(service::session_id::create_null_id())] (auto& ss) -> future<service::tablet_operation_repair_result> {
             auto res = co_await ss.repair_tablet(tablet, session_id);
             co_return res;
         });
     });
-    ser::storage_service_rpc_verbs::register_tablet_cleanup(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, locator::global_tablet_id tablet) {
+    ser::storage_service_rpc_verbs::register_tablet_cleanup(&_messaging.local(), [this] (raft::server_id dst_id, locator::global_tablet_id tablet) {
         return handle_raft_rpc(dst_id, [tablet] (auto& ss) {
             return ss.cleanup_tablet(tablet);
         });
     });
-    ser::storage_service_rpc_verbs::register_table_load_stats(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id) {
+    ser::storage_service_rpc_verbs::register_table_load_stats(&_messaging.local(), [this] (raft::server_id dst_id) {
         return handle_raft_rpc(dst_id, [] (auto& ss) mutable {
             return ss.load_stats_for_tablet_based_tables();
         });
     });
-    ser::storage_service_rpc_verbs::register_table_load_stats_v1(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id) {
+    ser::storage_service_rpc_verbs::register_table_load_stats_v1(&_messaging.local(), [this] (raft::server_id dst_id) {
         return handle_raft_rpc(dst_id, [] (auto& ss) mutable {
             return ss.load_stats_for_tablet_based_tables().then([] (auto stats) {
                 return locator::load_stats_v1{ .tables = std::move(stats.tables) };
@@ -6366,7 +6364,7 @@ void storage_service::init_messaging_service() {
     ser::storage_service_rpc_verbs::register_sample_sstables(&_messaging.local(), [this] (table_id table, uint64_t chunk_size, uint64_t n_chunks) -> future<utils::chunked_vector<temporary_buffer<char>>> {
         return _db.local().sample_data_files(table, chunk_size, n_chunks);
     });
-    ser::join_node_rpc_verbs::register_join_node_request(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, service::join_node_request_params params) {
+    ser::join_node_rpc_verbs::register_join_node_request(&_messaging.local(), [this] (raft::server_id dst_id, service::join_node_request_params params) {
         return handle_raft_rpc(dst_id, [params = std::move(params)] (auto& ss) mutable {
             check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "join_node_request");
             return ss.join_node_request_handler(std::move(params));
@@ -6382,7 +6380,7 @@ void storage_service::init_messaging_service() {
             co_return co_await ss.join_node_response_handler(std::move(params));
         });
     });
-    ser::join_node_rpc_verbs::register_join_node_query(&_messaging.local(), [handle_raft_rpc] (raft::server_id dst_id, service::join_node_query_params) {
+    ser::join_node_rpc_verbs::register_join_node_query(&_messaging.local(), [this] (raft::server_id dst_id, service::join_node_query_params) {
         return handle_raft_rpc(dst_id, [] (auto& ss) -> future<join_node_query_result> {
             check_raft_rpc_scheduling_group(ss._db.local(), ss._feature_service, "join_node_query");
             auto result = join_node_query_result{
