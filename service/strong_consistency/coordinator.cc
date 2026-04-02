@@ -244,6 +244,11 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
     auto aoe = abort_on_expiry<timeout_clock>(timeout);
     [[maybe_unused]] const auto subs = chain_abort_sources(aoe.abort_source(), as);
 
+    utils::latency_counter lc;
+    lc.start();
+    auto mark_write_latency = defer([this, &lc] { _stats.write.mark(lc.stop().latency()); });
+    bool commit_status_unknown_ex = false;
+
     try {
         auto op_result = co_await create_operation_ctx(*schema, token, aoe.abort_source());
         if (const auto* redirect = get_if<need_redirect>(&op_result)) {
@@ -308,7 +313,11 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
                     logger.debug("mutate(): add_entry, got commit_status_unknown {}, table {}.{}, tablet {}, term {}",
                         ex, schema->ks_name(), schema->cf_name(), op.tablet_id, term);
 
+                    ++_stats.write_errors_status_unknown;
                     // FIXME: use a dedicated ERROR_CODE instead of SERVER_ERROR
+                    // FIXME: when a dedicated ERROR_CODE will be used,
+                    //        we can get rid of the boolean flag
+                    commit_status_unknown_ex = true;
                     throw exceptions::server_exception(
                         "The outcome of this statement is unknown. It may or may not have been applied. "
                         "Retrying the statement may be necessary.");
@@ -334,8 +343,12 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
                 || try_catch<seastar::timed_out_error>(ex) || try_catch<seastar::condition_variable_timed_out>(ex)) {
             logger.trace("mutate(): request timed out with error {}, table {}.{}, token {}",
                 ex, schema->ks_name(), schema->cf_name(), token);
+            ++_stats.write_errors_timeout;
             co_return coroutine::return_exception(write_timeout(schema->ks_name(), schema->cf_name()));
         } else {
+            if (!commit_status_unknown_ex) {
+                ++_stats.write_errors_other;
+            }
             logger.trace("mutate(): unknown exception {}, table {}.{}, token {}",
                 ex, schema->ks_name(), schema->cf_name(), token);
             // We know nothing about other errors. Let the CQL server convert them to SERVER_ERROR.
@@ -354,6 +367,10 @@ auto coordinator::query(schema_ptr schema,
 {
     auto aoe = abort_on_expiry<timeout_clock>(timeout);
     [[maybe_unused]] const auto subs = chain_abort_sources(aoe.abort_source(), as);
+
+    utils::latency_counter lc;
+    lc.start();
+    auto mark_read_latency = defer([this, &lc] { _stats.read.mark(lc.stop().latency()); });
 
     try {
         auto op_result = co_await create_operation_ctx(*schema, ranges[0].start()->value().token(), aoe.abort_source());
@@ -386,10 +403,12 @@ auto coordinator::query(schema_ptr schema,
                 || try_catch<timed_out_error>(ex)) {
             logger.trace("query(): request timed out with error {}, table {}.{}, read cmd {}",
                 ex, schema->ks_name(), schema->cf_name(), cmd);
+            ++_stats.read_errors_timeout;
             co_return coroutine::return_exception(read_timeout(schema->ks_name(), schema->cf_name()));
         } else {
             logger.trace("mutate(): unknown exception {}, table {}.{}, read cmd {}",
                 ex, schema->ks_name(), schema->cf_name(), cmd);
+            ++_stats.read_errors_other;
             // We know nothing about other errors. Let the CQL server convert them to SERVER_ERROR.
             throw;
         }
