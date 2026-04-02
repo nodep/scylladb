@@ -19,9 +19,9 @@
 #include "idl/strong_consistency/state_machine.dist.hh"
 #include "idl/strong_consistency/state_machine.dist.impl.hh"
 #include "gms/gossiper.hh"
+#include "utils/histogram_metrics_helper.hh"
 
 namespace service::strong_consistency {
-
 
 static logging::logger logger("sc_coordinator");
 
@@ -48,6 +48,68 @@ struct read_timeout : public exceptions::read_timeout_exception {
         )
     {}
 };
+
+void stats::register_stats() {
+    namespace sm = seastar::metrics;
+    sm::label reason_label("reason");
+
+    _metrics.add_group("strong_consistency_coordinator", {
+        sm::make_summary("write_latency_summary", sm::description("Strong consistency write latency summary"),
+            [this] { return to_metrics_summary(write.summary()); }).set_skip_when_empty(),
+
+        sm::make_histogram("write_latency", sm::description("Strong consistency write latency histogram"),
+            {}, [this] { return to_metrics_histogram(write.histogram()); })
+            .aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_timeout,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("timeout")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_status_unknown,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("status_unknown")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_other,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("other")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_node_bounces", write_node_bounces,
+            sm::description("number of strong consistency write requests bounced to another node"))
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_shard_bounces", write_shard_bounces,
+            sm::description("number of strong consistency write requests bounced to another shard"))
+            .set_skip_when_empty(),
+
+        sm::make_summary("read_latency_summary", sm::description("Strong consistency read latency summary"),
+            [this] { return to_metrics_summary(read.summary()); }).set_skip_when_empty(),
+
+        sm::make_histogram("read_latency", sm::description("Strong consistency read latency histogram"),
+            {}, [this] { return to_metrics_histogram(read.histogram()); })
+            .aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+
+        sm::make_counter("read_errors", read_errors_timeout,
+            sm::description("number of strong consistency read requests that failed"),
+            {reason_label("timeout")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_errors", read_errors_other,
+            sm::description("number of strong consistency read requests that failed"),
+            {reason_label("other")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_node_bounces", read_node_bounces,
+            sm::description("number of strong consistency read requests bounced to another node"))
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_shard_bounces", read_shard_bounces,
+            sm::description("number of strong consistency read requests bounced to another shard"))
+            .set_skip_when_empty(),
+    });
+}
 
 static const locator::tablet_replica* find_replica(const locator::tablet_info& tinfo, locator::host_id id) {
     const auto it = std::ranges::find_if(tinfo.replicas,
@@ -170,6 +232,7 @@ coordinator::coordinator(groups_manager& groups_manager, replica::database& db, 
     , _db(db)
     , _gossiper(gossiper)
 {
+    _stats.register_stats();
 }
 
 future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
