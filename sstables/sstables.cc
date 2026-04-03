@@ -157,11 +157,19 @@ scoped_no_abort_on_malformed_sstable_error::~scoped_no_abort_on_malformed_sstabl
         }
         return malformed_sstable_exception(message);
     };
+    if (abort_on_malformed_sstable_error()) {
+        sstlog.error("malformed sstable error (aborting): {}", make_exception().what());
+        std::abort();
+    }
     auto ex = std::make_exception_ptr(make_exception());
     on_internal_error(sstlog, std::move(ex));
 }
 
 [[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos) {
+    if (abort_on_malformed_sstable_error()) {
+        sstlog.error("malformed sstable error (aborting): BTI parse error for node at pos {}", pos);
+        std::abort();
+    }
     on_internal_error(sstlog, fmt::format("BTI parse error for node at pos {}", pos));
 }
 
