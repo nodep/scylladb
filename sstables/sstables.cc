@@ -7,7 +7,9 @@
  */
 
 #include "utils/log.hh"
+#include <atomic>
 #include <concepts>
+#include <cstdlib>
 #include <vector>
 #include <limits>
 #include <algorithm>
@@ -109,6 +111,32 @@ namespace sstables {
 thread_local utils::updateable_value<bool> global_cache_index_pages(true);
 
 logging::logger sstlog("sstable");
+
+static std::atomic<bool> _abort_on_malformed_sstable_error{false};
+
+bool set_abort_on_malformed_sstable_error(bool value) noexcept {
+    return _abort_on_malformed_sstable_error.exchange(value, std::memory_order_relaxed);
+}
+
+bool abort_on_malformed_sstable_error() noexcept {
+    return _abort_on_malformed_sstable_error.load(std::memory_order_relaxed);
+}
+
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg) {
+    if (_abort_on_malformed_sstable_error.load(std::memory_order_relaxed)) {
+        sstlog.error("malformed sstable error (aborting): {}", msg);
+        std::abort();
+    }
+    throw malformed_sstable_exception(std::move(msg));
+}
+
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg, component_name filename) {
+    throw_malformed_sstable_exception(format("{} in sstable {}", msg, filename));
+}
+
+[[noreturn]] void throw_bufsize_mismatch_exception(size_t size, size_t expected) {
+    throw_malformed_sstable_exception(format("Buffer improperly sized to hold requested data. Got: {:d}. Expected: {:d}", size, expected));
+}
 
 [[noreturn]] void on_parse_error(sstring message, std::optional<component_name> filename) {
     auto make_exception = [&] {

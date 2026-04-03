@@ -86,6 +86,7 @@
 #include "service/cache_hitrate_calculator.hh"
 #include "compaction/compaction_manager.hh"
 #include "sstables/sstables.hh"
+#include "sstables/exceptions.hh"
 #include "gms/feature_service.hh"
 #include "replica/distributed_loader.hh"
 #include "sstables_loader.hh"
@@ -1041,6 +1042,11 @@ To start the scylla server proper, simply invoke as: scylla server (or just scyl
                 set_abort_on_internal_error(val);
             });
             set_abort_on_internal_error(cfg->abort_on_internal_error());
+
+            auto abort_on_malformed_sstable_error_observer = cfg->abort_on_malformed_sstable_error.observe([] (bool val) {
+                sstables::set_abort_on_malformed_sstable_error(val);
+            });
+            sstables::set_abort_on_malformed_sstable_error(cfg->abort_on_malformed_sstable_error());
 
             checkpoint(stop_signal, "creating snitch");
             debug::the_snitch = &snitch;
