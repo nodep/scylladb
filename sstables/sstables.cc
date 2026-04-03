@@ -287,7 +287,7 @@ static typename Map::key_type reverse_map(const Value& v, const Map& map) {
 // and we need to do something about it.
 static void check_buf_size(temporary_buffer<char>& buf, size_t expected) {
     if (buf.size() < expected) {
-        throw bufsize_mismatch_exception(buf.size(), expected);
+        throw_bufsize_mismatch_exception(buf.size(), expected);
     }
 }
 

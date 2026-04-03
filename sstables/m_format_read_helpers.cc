@@ -17,7 +17,7 @@ namespace sstables {
 
 static void check_buf_size(temporary_buffer<char>& buf, size_t expected) {
     if (buf.size() < expected) {
-        throw bufsize_mismatch_exception(buf.size(), expected);
+        throw_bufsize_mismatch_exception(buf.size(), expected);
     }
 }
 
