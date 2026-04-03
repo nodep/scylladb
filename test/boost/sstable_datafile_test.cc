@@ -57,6 +57,7 @@
 #include "test/lib/exception_utils.hh"
 #include "test/lib/cql_assertions.hh"
 #include "test/lib/gcs_fixture.hh"
+#include "sstables/exceptions.hh"
 
 namespace fs = std::filesystem;
 
@@ -2215,6 +2216,7 @@ SEASTAR_TEST_CASE(test_broken_promoted_index_is_skipped) {
     // insert into ks.test (pk, ck, v) values (1, 3, 1);
     // delete from ks.test where pk = 1 and ck = 2;
     return test_env::do_with_async([] (test_env& env) {
+      sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
       for (const auto version : all_sstable_versions) {
         if (!has_summary_and_index(version)) {
             // This is an old test for some workaround for

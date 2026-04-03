@@ -138,6 +138,15 @@ bool abort_on_malformed_sstable_error() noexcept {
     throw_malformed_sstable_exception(format("Buffer improperly sized to hold requested data. Got: {:d}. Expected: {:d}", size, expected));
 }
 
+scoped_no_abort_on_malformed_sstable_error::scoped_no_abort_on_malformed_sstable_error() noexcept
+    : _prev(set_abort_on_malformed_sstable_error(false))
+{
+}
+
+scoped_no_abort_on_malformed_sstable_error::~scoped_no_abort_on_malformed_sstable_error() {
+    set_abort_on_malformed_sstable_error(_prev);
+}
+
 [[noreturn]] void on_parse_error(sstring message, std::optional<component_name> filename) {
     auto make_exception = [&] {
         if (message.empty()) {

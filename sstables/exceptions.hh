@@ -63,4 +63,15 @@ bool abort_on_malformed_sstable_error() noexcept;
 [[noreturn]] void throw_malformed_sstable_exception(sstring msg, component_name filename);
 [[noreturn]] void throw_bufsize_mismatch_exception(size_t size, size_t expected);
 
+// Disables aborting on malformed sstable errors for a scope.
+//
+// Intended for tests which intentionally corrupt sstables and expect
+// malformed_sstable_exception to be thrown rather than the process aborting.
+class scoped_no_abort_on_malformed_sstable_error {
+    bool _prev;
+public:
+    scoped_no_abort_on_malformed_sstable_error() noexcept;
+    ~scoped_no_abort_on_malformed_sstable_error();
+};
+
 }

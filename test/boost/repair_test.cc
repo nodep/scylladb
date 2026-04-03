@@ -27,6 +27,7 @@
 #include "schema/schema_registry.hh"
 #include "utils/chunked_vector.hh"
 #include "repair/incremental.hh"
+#include "sstables/exceptions.hh"
 
 BOOST_AUTO_TEST_SUITE(repair_test)
 
@@ -260,6 +261,7 @@ static future<> corrupt_data_component(sstables::shared_sstable sst) {
 
 static future<> run_repair_reader_corruption_test(random_mutation_generator::compress compress, const sstring& expected_error_msg) {
     return do_with_cql_env([=](cql_test_env& e) -> future<> {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         random_mutation_generator gen{random_mutation_generator::generate_counters::no, local_shard_only::no,
             random_mutation_generator::generate_uncompactable::no, std::nullopt, "ks", "cf", compress};
 
