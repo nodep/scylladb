@@ -176,7 +176,7 @@ public:
             } else if (clustering.size() == (expected_normal + 1)) {
                 return true;
             }
-            throw malformed_sstable_exception(format("Found {:d} clustering elements in column name. Was not expecting that!", clustering.size()));
+            throw_malformed_sstable_exception(format("Found {:d} clustering elements in column name. Was not expecting that!", clustering.size()));
         }
 
         static bool check_static(const schema& schema, bytes_view col) {
@@ -210,12 +210,12 @@ public:
             if (is_static) {
                 for (auto& e: clustering) {
                     if (e.size() != 0) {
-                        throw malformed_sstable_exception("Static row has clustering key information. I didn't expect that!");
+                        throw_malformed_sstable_exception("Static row has clustering key information. I didn't expect that!");
                     }
                 }
             }
             if (is_present && is_static != cdef->is_static()) {
-                throw malformed_sstable_exception(seastar::format("Mismatch between {} cell and {} column definition",
+                throw_malformed_sstable_exception(seastar::format("Mismatch between {} cell and {} column definition",
                                                                   is_static ? "static" : "non-static", cdef->is_static() ? "static" : "non-static"));
             }
         }
@@ -577,20 +577,20 @@ public:
                     [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
                     [&] (const user_type_impl& utype) -> const abstract_type& {
                         if (col.collection_extra_data.size() != sizeof(int16_t)) {
-                            throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                            throw_malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
                                         sizeof(int16_t), col.collection_extra_data.size()));
                         }
 
                         auto field_idx = deserialize_field_index(col.collection_extra_data);
                         if (field_idx >= utype.size()) {
-                            throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                            throw_malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
                                         utype.size(), field_idx));
                         }
 
                         return *utype.type(field_idx);
                     },
                     [] (const abstract_type& o) -> const abstract_type& {
-                        throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                        throw_malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
                     }
                 ));
                 auto ac = make_atomic_cell(value_type,
@@ -708,7 +708,7 @@ public:
             case composite::eoc::end:
                 return bound_kind::excl_start;
         }
-        throw malformed_sstable_exception(format("Unexpected start composite marker {:d}", uint16_t(uint8_t(found))));
+        throw_malformed_sstable_exception(format("Unexpected start composite marker {:d}", uint16_t(uint8_t(found))));
     }
 
     static bound_kind end_marker_to_bound_kind(bytes_view component) {
@@ -723,7 +723,7 @@ public:
             case composite::eoc::end:
                 return bound_kind::incl_end;
         }
-        throw malformed_sstable_exception(format("Unexpected end composite marker {:d}", uint16_t(uint8_t(found))));
+        throw_malformed_sstable_exception(format("Unexpected end composite marker {:d}", uint16_t(uint8_t(found))));
     }
 
     // Consume one range tombstone.
@@ -1050,7 +1050,7 @@ private:
                 } else {
                     // FIXME: see ColumnSerializer.java:deserializeColumnBody
                     if ((mask & column_mask::counter_update) != column_mask::none) {
-                        throw malformed_sstable_exception("FIXME COUNTER_UPDATE_MASK");
+                        throw_malformed_sstable_exception("FIXME COUNTER_UPDATE_MASK");
                     }
                     _ttl = _expiration = 0;
                     _deleted = (mask & column_mask::deletion) != column_mask::none;
@@ -1062,7 +1062,7 @@ private:
                 mp_row_consumer_k_l::proceed ret;
                 if (_deleted) {
                     if (_val_fragmented.size_bytes() != 4) {
-                        throw malformed_sstable_exception("deleted cell expects local_deletion_time value");
+                        throw_malformed_sstable_exception("deleted cell expects local_deletion_time value");
                     }
                     _val = temporary_buffer<char>(4);
                     auto v = fragmented_temporary_buffer::view(_val_fragmented);
@@ -1110,7 +1110,7 @@ public:
             return;
         }
         if (_state != state::ROW_START || data_consumer::primitive_consumer::active()) {
-            throw malformed_sstable_exception("end of input, but not end of row");
+            throw_malformed_sstable_exception("end of input, but not end of row");
         }
     }
 
@@ -1249,7 +1249,7 @@ private:
         }
 
         if (!_consumer.is_mutation_end()) {
-            throw malformed_sstable_exception(format("consumer not at partition boundary, position: {}",
+            throw_malformed_sstable_exception(format("consumer not at partition boundary, position: {}",
                                                      position_in_partition_view::printer(*_schema, _consumer.position())), _sst->get_filename());
         }
 
@@ -1442,7 +1442,7 @@ public:
             try {
                 f.get();
             } catch(sstables::malformed_sstable_exception& e) {
-                throw sstables::malformed_sstable_exception(format("Failed to read partition from SSTable {} due to {}", _sst->get_filename(), e.what()));
+                throw_malformed_sstable_exception(format("Failed to read partition from SSTable {} due to {}", _sst->get_filename(), e.what()));
             }
         });
     }

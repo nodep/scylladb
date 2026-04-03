@@ -705,20 +705,20 @@ future<> parse(const schema& schema, sstable_version_types v, random_access_read
                 break;
             case metadata_type::Serialization:
                 if (v < sstable_version_types::mc) {
-                    throw malformed_sstable_exception(
+                    throw_malformed_sstable_exception(
                         "Statistics is malformed: SSTable is in 2.x format but contains serialization header.");
                 } else {
                     co_await parse<serialization_header>(schema, v, in, s.contents[type]);
                 }
                 break;
             default:
-                throw malformed_sstable_exception(fmt::format("Invalid metadata type at Statistics file: {} ", int(type)));
+                throw_malformed_sstable_exception(fmt::format("Invalid metadata type at Statistics file: {} ", int(type)));
             }
         }
     } catch (const malformed_sstable_exception&) {
         throw;
     } catch (...) {
-        throw malformed_sstable_exception(fmt::format("Statistics file is malformed: {}", std::current_exception()));
+        throw_malformed_sstable_exception(fmt::format("Statistics file is malformed: {}", std::current_exception()));
     }
 }
 
@@ -854,7 +854,7 @@ future<> parse(const schema& s, sstable_version_types v, random_access_reader& i
 
     co_await parse(s, v, in, c.name, c.options, chunk_len, data_len);
     if (chunk_len == 0) {
-        throw malformed_sstable_exception("CompressionInfo is malformed: zero chunk_len");
+        throw_malformed_sstable_exception("CompressionInfo is malformed: zero chunk_len");
     }
     c.set_uncompressed_chunk_length(chunk_len);
     c.set_uncompressed_file_length(data_len);
@@ -936,12 +936,12 @@ future<> sstable::read_toc(sstable_open_config cfg) noexcept {
                 }
             }
             if (!_recognized_components.size()) {
-                throw malformed_sstable_exception("Empty TOC", toc_filename());
+                throw_malformed_sstable_exception("Empty TOC", toc_filename());
             }
         });
     } catch (std::system_error& e) {
         if (e.code() == std::error_code(ENOENT, std::system_category())) {
-            throw malformed_sstable_exception(fmt::format("{}: file not found", toc_filename()));
+            throw_malformed_sstable_exception(fmt::format("{}: file not found", toc_filename()));
         }
         throw;
     }
@@ -1094,11 +1094,11 @@ future<> sstable::do_read_simple(component_type type,
         _metadata_size_on_disk += size;
     }  catch (std::system_error& e) {
         if (e.code() == std::error_code(ENOENT, std::system_category())) {
-            throw malformed_sstable_exception(fmt::format("{}: file not found", component_name));
+            throw_malformed_sstable_exception(fmt::format("{}: file not found", component_name));
         }
         throw;
     } catch (malformed_sstable_exception& e) {
-        throw malformed_sstable_exception(e.what(), component_name);
+        throw_malformed_sstable_exception(e.what(), component_name);
     }
 }
 
@@ -1289,7 +1289,7 @@ void sstable::validate_component_digest(component_type type, uint32_t computed_d
         if (_ignore_component_digest_mismatch) {
             sstlog.warn("{}", msg);
         } else {
-            throw malformed_sstable_exception(msg);
+            throw_malformed_sstable_exception(msg);
         }
     }
 }
@@ -1302,7 +1302,7 @@ future<> sstable::validate_index_digest() const {
         }
         auto computed_digest = co_await compute_component_file_digest(f, size);
         if (*expected_digest != computed_digest) {
-            throw malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                 fmt::format("{} digest mismatch in {}: expected {}, computed {}",
                             type, get_filename(), *expected_digest, computed_digest));
         }
@@ -1966,7 +1966,7 @@ void sstable::build_delayed_filter(uint64_t num_partitions) {
         }
     }
     if (processed_hashes != num_partitions) {
-        throw malformed_sstable_exception(fmt::format("Temporary hashes file {} was supposed to contain {} hashes, but it contains only {} hashes",
+        throw_malformed_sstable_exception(fmt::format("Temporary hashes file {} was supposed to contain {} hashes, but it contains only {} hashes",
             filename(component_type::TemporaryHashes), num_partitions, processed_hashes));
     }
 
@@ -2168,7 +2168,7 @@ void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min
             !!(expected_partition_count % min_index_interval);
     // FIXME: handle case where max_expected_entries is greater than max value stored by uint32_t.
     if (max_expected_entries > std::numeric_limits<uint32_t>::max()) {
-        throw malformed_sstable_exception("Current sampling level (" + to_sstring(downsampling::BASE_SAMPLING_LEVEL) + ") not enough to generate summary.");
+        throw_malformed_sstable_exception("Current sampling level (" + to_sstring(downsampling::BASE_SAMPLING_LEVEL) + ") not enough to generate summary.");
     }
 
     s.header.memory_size = 0;
@@ -3376,10 +3376,10 @@ void sstable::set_first_and_last_keys() {
         first = decorate_key("first", _partitions_db_footer->first_key.get_bytes());
         last = decorate_key("last", _partitions_db_footer->last_key.get_bytes());
     } else {
-        throw malformed_sstable_exception(format("{}: neither Summary.db nor Partitions.db component is present, can't determine first and last partition key", get_filename()));
+        throw_malformed_sstable_exception(format("{}: neither Summary.db nor Partitions.db component is present, can't determine first and last partition key", get_filename()));
     }
     if (first.value().tri_compare(*_schema, last.value()) > 0) {
-        throw malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first.value(), last.value()));
+        throw_malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first.value(), last.value()));
     }
     _first = std::move(first.value());
     _last = std::move(last.value());
@@ -4350,7 +4350,7 @@ public:
 std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr schema, sstables_manager& sstm, const data_dictionary::storage_options& s_opts, sstable_state state, std::string_view component_filename, sstable_stream_sink_cfg cfg) {
     auto desc_result = parse_path(component_filename, schema->ks_name(), schema->cf_name());
     if (!desc_result) {
-        throw malformed_sstable_exception(desc_result.error());
+        throw_malformed_sstable_exception(desc_result.error());
     }
     auto desc = std::move(*desc_result);
     auto sst = sstm.make_sstable(schema, s_opts, desc.generation, state, desc.version, desc.format);
@@ -4421,7 +4421,7 @@ namespace trie {
 future<bti_partitions_db_footer> read_bti_partitions_db_footer(const schema& s, sstable_version_types v, const seastar::file& f, uint64_t file_size) {
     file_random_access_reader reader(f, file_size, default_sstable_buffer_size);
     if (file_size < 24) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db file is too small: file_size={}", file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db file is too small: file_size={}", file_size));
     }
     co_await reader.seek(file_size - 24);
     uint64_t keys_position;
@@ -4431,10 +4431,10 @@ future<bti_partitions_db_footer> read_bti_partitions_db_footer(const schema& s, 
     co_await parse(s, v, reader, partition_count);
     co_await parse(s, v, reader, trie_root);
     if (trie_root >= file_size) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: trie_root={}, file_size={}", trie_root, file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db malformed: trie_root={}, file_size={}", trie_root, file_size));
     }
     if (keys_position >= file_size) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: keys_position={}, file_size={}", keys_position, file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db malformed: keys_position={}, file_size={}", keys_position, file_size));
     }
     co_await reader.seek(keys_position);
     disk_string<uint16_t> first_key;

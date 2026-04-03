@@ -345,7 +345,7 @@ const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sst
         data_dictionary::storage_options options;
         auto ed_result = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
         if (!ed_result) {
-            throw sstables::malformed_sstable_exception(ed_result.error());
+            sstables::throw_malformed_sstable_exception(ed_result.error());
         }
         auto ed = std::move(*ed_result);
 

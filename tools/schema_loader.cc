@@ -617,7 +617,7 @@ schema_ptr do_load_schema_from_sstable(const db::config& dbcfg, std::filesystem:
 
     auto ed_result = sstables::parse_path(sstable_path, keyspace, table);
     if (!ed_result) {
-        throw sstables::malformed_sstable_exception(ed_result.error());
+        sstables::throw_malformed_sstable_exception(ed_result.error());
     }
     const auto ed = std::move(*ed_result);
     const auto dir_path = sstable_path.parent_path();

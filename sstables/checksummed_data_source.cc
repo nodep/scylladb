@@ -115,7 +115,7 @@ public:
         if (buf.size() != chunk_size) {
             auto actual_end = _underlying_pos + buf.size();
             if (chunk_index + 1 < _checksum.checksums.size()) {
-                throw malformed_sstable_exception(seastar::format("Checksummed reader hit premature end-of-file at file offset {}: expected {} chunks of size {} but data file has {}",
+                throw_malformed_sstable_exception(seastar::format("Checksummed reader hit premature end-of-file at file offset {}: expected {} chunks of size {} but data file has {}",
                         actual_end, _checksum.checksums.size(), chunk_size, chunk_index + 1));
             } else if (actual_end < _file_len) {
                 // Truncation on last chunk. Update _end_pos so that future
@@ -124,7 +124,7 @@ public:
             }
         }
         if (chunk_index >= _checksum.checksums.size()) {
-            throw malformed_sstable_exception(seastar::format("Chunk count mismatch between CRC and Data.db: expected {} but data file has more", _checksum.checksums.size()));
+            throw_malformed_sstable_exception(seastar::format("Chunk count mismatch between CRC and Data.db: expected {} but data file has more", _checksum.checksums.size()));
         }
         auto expected_checksum = _checksum.checksums[chunk_index];
         auto actual_checksum = ChecksumType::checksum(buf.get(), buf.size());
@@ -231,7 +231,7 @@ input_stream<char> make_checksummed_file_m_format_input_stream(
 }
 
 void throwing_integrity_error_handler(sstring msg) {
-        throw sstables::malformed_sstable_exception(msg);
+        throw_malformed_sstable_exception(msg);
 };
 
 }

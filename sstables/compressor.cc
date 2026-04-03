@@ -363,7 +363,7 @@ static std::optional<std::vector<std::byte>> dict_from_options(const sstables::c
                 auto i = std::stoi(k_str.substr(DICTIONARY_OPTION.size()));
                 parts.emplace(i, v.value);
             } catch (const std::exception& e) {
-                throw sstables::malformed_sstable_exception(fmt::format("Corrupted dictionary option: {}", k_str));
+                sstables::throw_malformed_sstable_exception(fmt::format("Corrupted dictionary option: {}", k_str));
             }
         }
         auto v_str = sstring(v.value.begin(), v.value.end());
@@ -372,7 +372,7 @@ static std::optional<std::vector<std::byte>> dict_from_options(const sstables::c
     int i = 0;
     for (const auto& [k, v] : parts) {
         if (k != i) {
-            throw sstables::malformed_sstable_exception(fmt::format("Missing dictionary part: expected {}, got {}", i, k));
+            sstables::throw_malformed_sstable_exception(fmt::format("Missing dictionary part: expected {}, got {}", i, k));
         }
         ++i;
         auto s = std::as_bytes(std::span(v));
