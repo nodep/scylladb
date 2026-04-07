@@ -331,7 +331,7 @@ void check_sstable_schema(sstables::test_env& env, std::filesystem::path sst_pat
 
     check_schema_columns(*schema, *mutations.front().schema(), has_scylla_metadata);
 
-    const auto ed = sstables::parse_path(sst_path, "ks", "tbl");
+    const auto ed = sstables::parse_path(sst_path, "ks", "tbl").value();
     const auto dir_path = sst_path.parent_path();
     auto sst = env.make_sstable(schema, dir_path.c_str(), ed.generation, ed.version, ed.format);
 

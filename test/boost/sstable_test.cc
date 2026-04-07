@@ -869,7 +869,7 @@ BOOST_AUTO_TEST_CASE(test_parse_path_good) {
         }
     };
     for (auto& [path, expected_ks, expected_cf, expected_desc] : sstables) {
-        auto [desc, ks, cf] = parse_path(path);
+        auto [desc, ks, cf] = parse_path(path).value();
         BOOST_CHECK_EQUAL(ks, expected_ks);
         BOOST_CHECK_EQUAL(cf, expected_cf);
         BOOST_CHECK_EQUAL(expected_desc.generation, desc.generation);
@@ -902,7 +902,7 @@ BOOST_AUTO_TEST_CASE(test_parse_path_bad) {
         "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2-grand-Data.db",
     };
     for (auto path : paths) {
-        BOOST_CHECK_THROW(parse_path(path), std::exception);
+        BOOST_CHECK(!parse_path(path).has_value());
     }
 }
 
@@ -927,7 +927,7 @@ static future<> test_component_digest_persistence(component_type component, ssta
         BOOST_REQUIRE(has_component);
 
         auto toc_path = fmt::to_string(sst_original->toc_filename());
-        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
         auto dir_path = std::filesystem::path(toc_path).parent_path().string();
 
         std::optional<uint32_t> original_digest;
@@ -1052,7 +1052,7 @@ static future<> test_component_digest_validation(component_type component, sstab
         BOOST_REQUIRE(digest.has_value());
 
         auto toc_path = fmt::to_string(sst->toc_filename());
-        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
         auto dir_path = std::filesystem::path(toc_path).parent_path().string();
 
         corrupt_sstable(sst, component);

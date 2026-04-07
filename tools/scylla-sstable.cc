@@ -156,13 +156,13 @@ sstable_path_info extract_from_sstable_path(const bpo::variables_map& app_config
 
     auto sst_path = std::filesystem::path(app_config["sstables"].as<std::vector<sstring>>().front());
     sstring keyspace, table;
-    try {
-        auto [_, ks, tbl] = sstables::parse_path(sst_path);
-        keyspace = std::move(ks);
-        table = std::move(tbl);
-    } catch (const sstables::malformed_sstable_exception&) {
+    auto result = sstables::parse_path(sst_path);
+    if (!result) {
         throw std::invalid_argument(fmt::format("cannot extract information from sstable path, sstable has invalid path: {}", sst_path));
     }
+    auto [_, ks, tbl] = std::move(*result);
+    keyspace = std::move(ks);
+    table = std::move(tbl);
     const auto sst_dir_path = std::filesystem::path(sst_path).remove_filename();
     std::filesystem::path data_dir_path;
     // Detect whether sstable is in root table directory, or in a sub-directory
@@ -343,7 +343,11 @@ const std::vector<sstables::shared_sstable> load_sstables(schema_ptr schema, sst
 
 
         data_dictionary::storage_options options;
-        auto ed = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
+        auto ed_result = sstables::parse_path(sst_path, schema->ks_name(), schema->cf_name());
+        if (!ed_result) {
+            throw sstables::malformed_sstable_exception(ed_result.error());
+        }
+        auto ed = std::move(*ed_result);
 
         using osp = db::object_storage_endpoint_param;
         static const auto os_types = { osp::s3_type, osp::gs_type };

@@ -30,6 +30,7 @@
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/util/memory-data-sink.hh>
+#include <expected>
 #include <iterator>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -2893,7 +2894,7 @@ sstable::make_full_scan_reader(
     return kl::make_full_scan_reader(shared_from_this(), std::move(schema), std::move(permit), std::move(trace_state), monitor, integrity);
 }
 
-static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(const std::filesystem::path& sst_path, sstring* const provided_ks, sstring* const provided_cf) {
+static std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> make_entry_descriptor(const std::filesystem::path& sst_path, sstring* const provided_ks, sstring* const provided_cf) {
     // examples of fname look like
     //   la-42-big-Data.db
     //   ka-42-big-Data.db
@@ -2935,10 +2936,14 @@ static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(cons
                 ks = dirmatch[1].str();
                 cf = dirmatch[2].str();
             } else {
-                throw malformed_sstable_exception(seastar::format("invalid path for file {}: {}. Path doesn't match known pattern.", fname, sstdir));
+                return std::unexpected{seastar::format("invalid path for file {}: {}. Path doesn't match known pattern.", fname, sstdir)};
             }
         }
-        version = version_from_string(match[1].str());
+        try {
+            version = version_from_string(match[1].str());
+        } catch (const std::exception& e) {
+            return std::unexpected{seastar::format("failed to parse version for sstable filename {}: {}", fname, e)};
+        }
         generation = match[2].str();
         format = sstring(match[3].str());
         component = sstring(match[4].str());
@@ -2952,18 +2957,25 @@ static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(cons
         generation = match[3].str();
         component = sstring(match[4].str());
     } else {
-        throw malformed_sstable_exception(seastar::format("invalid version for file {}. Name doesn't match any known version.", fname));
+        return std::unexpected{seastar::format("invalid version for file {}. Name doesn't match any known version.", fname)};
     }
-    return std::make_tuple(entry_descriptor(generation_type::from_string(generation), version, format_from_string(format), sstable::component_from_sstring(version, component)), ks, cf);
+    try {
+        return std::make_tuple(entry_descriptor(generation_type::from_string(generation), version, format_from_string(format), sstable::component_from_sstring(version, component)), ks, cf);
+    } catch (const std::exception& e) {
+        return std::unexpected{seastar::format("failed to parse sstable filename {}: {}", fname, e.what())};
+    }
 }
 
-std::tuple<entry_descriptor, sstring, sstring> parse_path(const std::filesystem::path& sst_path) {
+std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> parse_path(const std::filesystem::path& sst_path) {
     return make_entry_descriptor(sst_path, nullptr, nullptr);
 }
 
-entry_descriptor parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf) {
+std::expected<entry_descriptor, sstring> parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf) {
     auto full = make_entry_descriptor(sst_path, &ks, &cf);
-    return std::get<0>(full);
+    if (!full) {
+        return std::unexpected{full.error()};
+    }
+    return std::get<0>(*full);
 }
 
 sstable_version_types version_from_string(std::string_view s) {
@@ -4291,7 +4303,11 @@ public:
 };
 
 std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr schema, sstables_manager& sstm, const data_dictionary::storage_options& s_opts, sstable_state state, std::string_view component_filename, sstable_stream_sink_cfg cfg) {
-    auto desc = parse_path(component_filename, schema->ks_name(), schema->cf_name());
+    auto desc_result = parse_path(component_filename, schema->ks_name(), schema->cf_name());
+    if (!desc_result) {
+        throw malformed_sstable_exception(desc_result.error());
+    }
+    auto desc = std::move(*desc_result);
     auto sst = sstm.make_sstable(schema, s_opts, desc.generation, state, desc.version, desc.format);
 
     auto type = desc.component;
