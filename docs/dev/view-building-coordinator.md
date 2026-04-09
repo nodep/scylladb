@@ -106,6 +106,7 @@ The most important table is `system.view_building_tasks`, which stores all unfin
 CREATE TABLE system.view_building_tasks (
     key text,
     id timeuuid,
+    min_task_id timeuuid STATIC, -- lower bound for task scans; see "Tombstone avoidance" below
     type text,
     aborted boolean,
     base_id uuid,
@@ -116,6 +117,26 @@ CREATE TABLE system.view_building_tasks (
     PRIMARY KEY (key, id)
 )
 ```
+
+### Tombstone avoidance
+
+`system.view_building_tasks` is a single partition. When `finished_task_gc_fiber()` removes
+finished tasks in batches, the deleted rows remain as tombstones in SSTables until compaction,
+causing `tombstone_warn_threshold` warnings on subsequent reloads in large clusters.
+
+Two mechanisms address this:
+
+**Range tombstone on GC.** Instead of one row tombstone per deleted task, the coordinator emits
+a single range tombstone `[before_all, min_alive_uuid)` where `min_alive_uuid` is the smallest
+timeuuid among surviving tasks. Tasks above the boundary (rare) still get individual row tombstones.
+When all tasks are deleted, a single full-partition range tombstone is used.
+
+**Bounded scan on reload.** Physical rows remain until compaction and are still counted as dead cells.
+After each GC batch, `min_task_id = min_alive_uuid` is written atomically as a static cell (same Raft
+batch as the range tombstone). On reload, `min_task_id` is read using a **static-only partition slice**
+(empty `_row_ranges` + `always_return_static_content`) — this makes the SSTable reader stop immediately
+after the static row, before any clustering tombstones, so zero dead cells are counted. The value is
+then used as `AND id >= min_task_id` to skip all tombstoned rows in the main scan.
 
 The view building coordinator stores currently processing base table in `system.scylla_local` 
 under `view_building_processing_base` key. 
