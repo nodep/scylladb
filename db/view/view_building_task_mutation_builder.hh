@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include "db/view/view_building_state.hh"
 #include "mutation/mutation.hh"
 #include "db/system_keyspace.hh"
 #include "mutation/timestamp.hh"
@@ -19,17 +20,19 @@ namespace view {
 // Factory for mutations to `system.view_building_tasks` table.
 class view_building_task_mutation_builder {
     api::timestamp_type _ts;
+    task_uuid_generator _uuid_gen;
     schema_ptr _s;
     mutation _m;
 
 public:
-    view_building_task_mutation_builder(api::timestamp_type ts)
+    view_building_task_mutation_builder(api::timestamp_type ts, task_uuid_generator uuid_gen)
             : _ts(ts)
+            , _uuid_gen(std::move(uuid_gen))
             , _s(db::system_keyspace::view_building_tasks())
             , _m(_s, partition_key::from_single_value(*_s, data_value("view_building").serialize_nonnull()))
     { }
 
-    static utils::UUID new_id();
+    utils::UUID new_id();
 
     view_building_task_mutation_builder& set_type(utils::UUID id, db::view::view_building_task::task_type type);
     view_building_task_mutation_builder& set_aborted(utils::UUID id, bool aborted);

@@ -14,7 +14,7 @@ namespace db {
 namespace view {
 
 utils::UUID view_building_task_mutation_builder::new_id() {
-    return utils::UUID_gen::get_time_UUID();
+    return _uuid_gen();
 }
 
 clustering_key view_building_task_mutation_builder::get_ck(utils::UUID id) {

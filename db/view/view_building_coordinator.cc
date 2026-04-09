@@ -180,7 +180,7 @@ future<> view_building_coordinator::clean_finished_tasks() {
         co_return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
 
     // Collect tasks eligible for deletion: must still be in state and not aborted.
     std::vector<utils::UUID> tasks_to_delete;
@@ -587,7 +587,7 @@ void view_building_coordinator::generate_tablet_migration_updates(utils::chunked
     }
 
     auto last_token = tmap.get_last_token(gid.tablet);
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
 
     auto create_task_copy_on_pending_replica = [&] (const view_building_task& task) {
         auto new_id = builder.new_id();
@@ -655,7 +655,7 @@ void view_building_coordinator::generate_tablet_resize_updates(utils::chunked_ve
         return;
     }
     bool is_split = old_tmap.tablet_count() < new_tmap.tablet_count();
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
 
     auto create_task_copy = [&] (const view_building_task& task, dht::token last_token) -> utils::UUID {
         auto new_id = builder.new_id();
@@ -725,7 +725,7 @@ void view_building_coordinator::abort_tasks(utils::chunked_vector<canonical_muta
     }
     vbc_logger.debug("Generating abort mutations for tasks for table {}", table_id);
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto abort_task_map = [&] (const task_map& task_map) {
         for (auto& [id, _]: task_map) {
             vbc_logger.debug("Aborting task {}", id);
@@ -754,7 +754,7 @@ void abort_view_building_tasks(const view_building_state_machine& vb_sm,
     }
     vbc_logger.debug("Generating abort mutations for tasks for table {} on replica {} and last token {}", table_id, replica, last_token);
 
-    view_building_task_mutation_builder builder(write_timestamp);
+    view_building_task_mutation_builder builder(write_timestamp, vb_sm.building_state.make_task_uuid_generator(write_timestamp));
     auto abort_task_map = [&] (const task_map& task_map) {
         for (auto& [id, task]: task_map) {
             if (task.last_token == last_token) {
@@ -796,7 +796,7 @@ void view_building_coordinator::rollback_aborted_tasks(utils::chunked_vector<can
         return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto& base_tasks = _vb_sm.building_state.tasks_state.at(table_id);
     for (auto& [_, replica_tasks]: base_tasks) {
         for (auto& [_, building_task_map]: replica_tasks.view_tasks) {
@@ -813,7 +813,7 @@ void view_building_coordinator::rollback_aborted_tasks(utils::chunked_vector<can
         return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto& replica_tasks = _vb_sm.building_state.tasks_state.at(table_id).at(replica);
     for (auto& [_, building_task_map]: replica_tasks.view_tasks) {
         rollback_task_map(builder, building_task_map);
