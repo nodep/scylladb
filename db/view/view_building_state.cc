@@ -8,6 +8,7 @@
  */
 
 #include "db/view/view_building_state.hh"
+#include "utils/UUID_gen.hh"
 
 namespace db {
 
@@ -126,6 +127,24 @@ std::map<dht::token, std::vector<view_building_task>> view_building_state::colle
         tasks[task.last_token].push_back(task);
     }
     return tasks;
+}
+
+task_uuid_generator::task_uuid_generator(api::timestamp_type base_ts)
+        : _next_ts(base_ts) {}
+
+utils::UUID task_uuid_generator::operator()() {
+    return utils::UUID_gen::get_random_time_UUID_from_micros(
+            std::chrono::microseconds{_next_ts++});
+}
+
+task_uuid_generator view_building_state::make_task_uuid_generator(api::timestamp_type ts) const {
+    if (min_alive_uuid) {
+        auto lower_bound = utils::UUID_gen::micros_timestamp(*min_alive_uuid);
+        if (ts <= lower_bound) {
+            ts = lower_bound + 1;
+        }
+    }
+    return task_uuid_generator{ts};
 }
 
 }
