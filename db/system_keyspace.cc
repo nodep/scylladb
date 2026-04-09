@@ -2750,7 +2750,7 @@ future<mutation> system_keyspace::make_remove_view_build_status_on_host_mutation
 
 static constexpr auto VIEW_BUILDING_KEY = "view_building";
 
-future<db::view::building_tasks> system_keyspace::get_view_building_tasks() {
+future<std::pair<db::view::building_tasks, std::optional<utils::UUID>>> system_keyspace::get_view_building_tasks() {
     using namespace db::view;
 
     // When the VIEW_BUILDING_TASKS_MIN_TASK_ID feature is active, read the static
@@ -2815,7 +2815,7 @@ future<db::view::building_tasks> system_keyspace::get_view_building_tasks() {
                 NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
         co_await _qp.query_internal(full_query, std::move(process_row));
     }
-    co_return tasks;
+    co_return std::pair{std::move(tasks), std::move(min_task_id)};
 }
 
 future<mutation> system_keyspace::make_view_building_task_mutation(api::timestamp_type ts, const db::view::view_building_task& task) {

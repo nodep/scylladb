@@ -22,9 +22,10 @@ view_building_task::view_building_task(utils::UUID id, task_type type, bool abor
         , replica(replica)
         , last_token(last_token) {}
 
-view_building_state::view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table)
+view_building_state::view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table, std::optional<utils::UUID> min_alive_uuid)
         : tasks_state(std::move(tasks_state))
-        , currently_processed_base_table(std::move(processed_base_table)) {}
+        , currently_processed_base_table(std::move(processed_base_table))
+        , min_alive_uuid(std::move(min_alive_uuid)) {}
 
 views_state::views_state(std::map<table_id, std::vector<table_id>> views_per_base, view_build_status_map status_map)
         : views_per_base(std::move(views_per_base))

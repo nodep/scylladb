@@ -73,8 +73,9 @@ using building_tasks = std::map<table_id, base_table_tasks>;
 struct view_building_state {
     building_tasks tasks_state;
     std::optional<table_id> currently_processed_base_table;
+    std::optional<utils::UUID> min_alive_uuid;
 
-    view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table);
+    view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table, std::optional<utils::UUID> min_alive_uuid);
     view_building_state() = default;
     
     std::optional<std::reference_wrapper<const view_building_task>> get_task(table_id base_id, locator::tablet_replica replica, utils::UUID id) const;
