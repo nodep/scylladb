@@ -1016,3 +1016,36 @@ async def test_all_good_on_node_restart(manager: ManagerClient):
     log = await manager.server_open_log(servers[0].server_id)
     warnings = await log.grep(expr="view_building_state_observer failed with")
     assert len(warnings) == 0, f"Found view building state observer warnings: {warnings}"
+
+# Reproduces SCYLLADB-657
+#
+# Test that view building does not trigger tombstone_warn_threshold warnings.
+# Uses a high tablet count (2048) to create many tasks, which produces many
+# tombstones when tasks are cleaned up. Verifies no warnings appear in logs.
+@pytest.mark.asyncio
+async def test_tombstone_warn_threshold(manager: ManagerClient):
+    node_count = 1
+    servers = await manager.servers_add(node_count, cmdline=cmdline_loggers, property_file=[
+        {"dc": "dc1", "rack": "r1"},
+    ])
+    cql, _ = await manager.get_ready_cql(servers)
+    await manager.disable_tablet_balancing()
+
+    async with new_test_keyspace(manager, f"WITH replication = {{'class': 'NetworkTopologyStrategy', 'replication_factor': 1}} AND tablets = {{'enabled': true, 'initial': 2048}}") as ks:
+        await cql.run_async(f"CREATE TABLE {ks}.tab (key int, c int, v text, PRIMARY KEY (key, c))")
+        await populate_base_table(cql, ks, "tab")
+
+        await pause_view_build_coordinator(manager)
+
+        logs = await asyncio.gather(*(manager.server_open_log(s.server_id) for s in servers))
+        marks = await asyncio.gather(*(l.mark() for l in logs))
+
+        await cql.run_async(f"CREATE MATERIALIZED VIEW {ks}.mv_cf_view1 AS SELECT * FROM {ks}.tab "
+                        "WHERE c IS NOT NULL and key IS NOT NULL AND v IS NOT NULL PRIMARY KEY (c, key, v) ")
+        await unpause_view_build_coordinator(manager)
+        await wait_for_view(cql, 'mv_cf_view1', node_count)
+        await check_view_contents(cql, ks, "tab", "mv_cf_view1")
+
+        matches = await asyncio.gather(*(l.grep("system.view_building_tasks.*tombstone_warn_threshold", from_mark=m) for (l, m) in zip(logs, marks)))
+        for server_matches in matches:
+            assert len(server_matches) == 0
