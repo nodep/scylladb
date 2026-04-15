@@ -200,6 +200,9 @@ public:
     future<> put_object(sstring object_name, ::memory_data_sink_buffers bufs, seastar::abort_source* = nullptr);
     future<> copy_object(sstring source_object, sstring target_object, std::optional<size_t> part_size = {}, std::optional<tag> tag = {}, seastar::abort_source* = nullptr);
     future<> delete_object(sstring object_name, seastar::abort_source* = nullptr);
+    future<> create_bucket(sstring bucket_name, seastar::abort_source* = nullptr);
+    future<> delete_bucket(sstring bucket_name, seastar::abort_source* = nullptr);
+    future<> delete_bucket_with_objects(sstring bucket_name, seastar::abort_source* = nullptr);
 
     file make_readable_file(sstring object_name, seastar::abort_source* = nullptr);
     data_sink make_upload_sink(sstring object_name, seastar::abort_source* = nullptr);
