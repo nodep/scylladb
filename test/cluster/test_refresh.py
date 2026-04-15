@@ -19,7 +19,7 @@ from collections import defaultdict
 from cassandra.cluster import ConsistencyLevel
 from test.pylib.minio_server import MinioServer
 from test.pylib.manager_client import ManagerClient
-from test.cluster.object_store.conftest import format_tuples
+from test.pylib.object_storage import format_tuples
 from test.cluster.object_store.test_backup import topo, take_snapshot, do_test_streaming_scopes
 from test.cluster.util import new_test_keyspace
 from test.pylib.rest_client import read_barrier
