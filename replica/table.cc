@@ -3256,6 +3256,8 @@ table::table(schema_ptr schema, config config, lw_shared_ptr<const storage_optio
                          keyspace_label(_schema->ks_name()),
                          column_family_label(_schema->cf_name())
                         )
+    , _tablet_activity_read_ewma(_config.tablet_activity_ewma_window, utils::meter_timer::tick_interval())
+    , _tablet_activity_write_ewma(_config.tablet_activity_ewma_window, utils::meter_timer::tick_interval())
     , _compaction_manager(compaction_manager)
     , _compaction_strategy(make_compaction_strategy(_schema->compaction_strategy(), _schema->compaction_strategy_options()))
     , _sg_manager(make_storage_group_manager())

@@ -1608,6 +1608,22 @@ db::config::config(std::shared_ptr<db::extensions> exts)
          "Maximum number of tablets which may be leaving a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
     , tablet_streaming_write_concurrency_per_shard(this, "tablet_streaming_write_concurrency_per_shard", liveness::LiveUpdate, value_status::Used, 2,
          "Maximum number of tablets which may be pending on a shard at the same time. Effecting only on topology coordinator. Set to the same value on all nodes.")
+    , tablets_activity_weighted_allocation_enabled(this, "tablets_activity_weighted_allocation_enabled", liveness::LiveUpdate, value_status::Used, true,
+         "When enabled, the tablet allocator considers per-table read/write activity when distributing the tablet budget among tables once the cluster " \
+         "reaches the tablets_per_shard_goal. Active tables are allowed to overshoot the uniform goal (up to the hard limit) at the expense of idle tables.")
+    , tablets_per_shard_hard_limit_multiplier(this, "tablets_per_shard_hard_limit_multiplier", liveness::LiveUpdate, value_status::Used, 4,
+         "Multiplier applied to tablets_per_shard_goal to compute the hard per-shard tablet limit used by activity-weighted allocation. " \
+         "The activity-weighted allocator will never allocate more than tablets_per_shard_goal * this value tablets per shard.")
+    , tablets_active_table_rate_threshold(this, "tablets_active_table_rate_threshold", liveness::LiveUpdate, value_status::Used, 1.0,
+         "Combined read+write rate (ops/sec, as an EWMA) at or above which a table is classified as active for activity-weighted tablet allocation. " \
+         "Together with tablets_idle_table_rate_threshold this provides hysteresis to avoid classification flapping.")
+    , tablets_idle_table_rate_threshold(this, "tablets_idle_table_rate_threshold", liveness::LiveUpdate, value_status::Used, 0.1,
+         "Combined read+write rate (ops/sec, as an EWMA) at or below which a table is classified as idle for activity-weighted tablet allocation. " \
+         "Tables between the idle and active thresholds retain their previous classification (hysteresis).")
+    , tablets_activity_ewma_window_seconds(this, "tablets_activity_ewma_window_seconds", liveness::LiveUpdate, value_status::Used, 900,
+         "Window duration in seconds for the EWMA (Exponentially Weighted Moving Average) used to measure per-table read/write activity rates " \
+         "for activity-weighted tablet allocation. A larger window smooths out short bursts; a smaller window makes the allocator more responsive " \
+         "to traffic changes. Default is 900 seconds (15 minutes).")
     , service_levels_interval(this, "service_levels_interval_ms", liveness::LiveUpdate, value_status::Used, 10000, "Controls how often service levels module polls configuration table")
 
     , audit(this, "audit", value_status::Used, "table",

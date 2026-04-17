@@ -481,6 +481,7 @@ public:
         unsigned x_log2_compaction_groups{0};
         utils::updateable_value<bool> enable_compacting_data_for_streaming_and_repair;
         utils::updateable_value<bool> enable_tombstone_gc_for_streaming_and_repair;
+        std::chrono::seconds tablet_activity_ewma_window{900};
     };
 
     using snapshot_details = db::snapshot_ctl::table_snapshot_details;
@@ -504,10 +505,11 @@ private:
     // their semantics (window length, update cadence, visibility) are owned
     // by the allocator rather than the metrics subsystem.
     //
-    // Window: 15 minutes. Tick: 10 seconds (via _tablet_activity_timer). The
-    // rate is reported in operations per second.
-    utils::moving_average _tablet_activity_read_ewma{std::chrono::minutes(15), utils::meter_timer::tick_interval()};
-    utils::moving_average _tablet_activity_write_ewma{std::chrono::minutes(15), utils::meter_timer::tick_interval()};
+    // Window: configurable via tablets_activity_ewma_window_seconds (default
+    // 15 minutes). Tick: 10 seconds (via _tablet_activity_timer). The rate is
+    // reported in operations per second.
+    utils::moving_average _tablet_activity_read_ewma;
+    utils::moving_average _tablet_activity_write_ewma;
     utils::meter_timer _tablet_activity_timer{[this] {
         _tablet_activity_read_ewma.update();
         _tablet_activity_write_ewma.update();

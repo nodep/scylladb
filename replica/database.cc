@@ -1595,6 +1595,7 @@ keyspace::make_column_family_config(const schema& s, const database& db) const {
     cfg.data_listeners = &db.data_listeners();
     cfg.enable_compacting_data_for_streaming_and_repair = db_config.enable_compacting_data_for_streaming_and_repair;
     cfg.enable_tombstone_gc_for_streaming_and_repair = db_config.enable_tombstone_gc_for_streaming_and_repair;
+    cfg.tablet_activity_ewma_window = std::chrono::seconds(db_config.tablets_activity_ewma_window_seconds());
 
     return cfg;
 }

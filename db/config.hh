@@ -575,6 +575,11 @@ public:
     named_value<uint64_t> target_tablet_size_in_bytes;
     named_value<unsigned> tablet_streaming_read_concurrency_per_shard;
     named_value<unsigned> tablet_streaming_write_concurrency_per_shard;
+    named_value<bool> tablets_activity_weighted_allocation_enabled;
+    named_value<unsigned> tablets_per_shard_hard_limit_multiplier;
+    named_value<double> tablets_active_table_rate_threshold;
+    named_value<double> tablets_idle_table_rate_threshold;
+    named_value<unsigned> tablets_activity_ewma_window_seconds;
 
     named_value<uint32_t> service_levels_interval;
 
