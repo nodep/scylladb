@@ -4407,6 +4407,7 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
 
     std::unordered_map<table_id, size_t> total_replicas;
     bool table_load_stats_invalid = false;
+    bool table_activity_incomplete = false;
 
     for (auto& [dc, nodes] : tm->get_datacenter_token_owners_nodes()) {
         locator::load_stats dc_stats;
@@ -4453,6 +4454,30 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
             }
 
             _load_stats_per_node[dst] = node_stats;
+
+            // Detect rolling upgrade: older nodes (pre-2026.3) don't populate
+            // load_stats::table_activity. The sender-side invariant in
+            // load_stats_for_tablet_based_tables() is to emplace a table_activity
+            // entry (possibly with zero rates) for every table the node reports in
+            // load_stats::tables. If we see a node whose tables are non-empty but
+            // whose table_activity does not cover them, we treat activity data as
+            // unavailable cluster-wide and drop it so the tablet allocator falls
+            // back to uniform scaling until the upgrade finishes.
+            if (!node_stats.tables.empty()) {
+                bool activity_complete = true;
+                for (auto& [tid, _] : node_stats.tables) {
+                    if (!node_stats.table_activity.contains(tid)) {
+                        activity_complete = false;
+                        break;
+                    }
+                }
+                if (!activity_complete) {
+                    rtlogger.debug("raft topology: Node {} did not report per-table activity; "
+                                   "disabling activity-weighted tablet allocation for this refresh.", dst);
+                    table_activity_incomplete = true;
+                }
+            }
+
             dc_stats += node_stats;
         });
 
@@ -4500,6 +4525,14 @@ future<> topology_coordinator::refresh_tablet_load_stats() {
 
     if (table_load_stats_invalid) {
         stats.tables.clear();
+    }
+
+    // If any node did not report per-table activity (rolling upgrade), drop the
+    // aggregated activity data so the tablet allocator falls back to uniform
+    // scaling. Once all nodes are upgraded, activity data will be complete on
+    // the next refresh and activity-weighted allocation will take effect.
+    if (table_activity_incomplete) {
+        stats.table_activity.clear();
     }
 
     rtlogger.debug("raft topology: Refreshed table load stats for all DC(s).");
