@@ -187,6 +187,7 @@ public:
     gms::feature view_building_tasks_min_task_id { *this, "VIEW_BUILDING_TASKS_MIN_TASK_ID"sv };
     gms::feature quiesce_topology_enhanced { *this, "QUIESCE_TOPOLOGY_ENHANCED"sv };
     gms::feature tablet_pow2_convergence { *this, "TABLET_POW2_CONVERGENCE"sv };
+    gms::feature auto_replication_factor { *this, "AUTO_REPLICATION_FACTOR"sv };
 public:
 
     const std::unordered_map<sstring, std::reference_wrapper<feature>>& registered_features() const;
