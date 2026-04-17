@@ -5665,6 +5665,15 @@ future<locator::load_stats> storage_service::load_stats_for_tablet_based_tables(
             load_stats.tables.emplace(id, std::move(combined_ls.table_ls));
             tablet_sizes_per_shard[this_shard_id()].size += load_stats.tablet_stats[this_host].add_tablet_sizes(combined_ls.tablet_ls);
 
+            // Contribute this shard's share of the table's activity rate.
+            // Emplaced unconditionally (even when the rate is 0) so the
+            // coordinator can distinguish "node reports activity data" from
+            // "node is older and does not report it at all", which matters
+            // during rolling upgrade.
+            auto& act = load_stats.table_activity[id];
+            act.read_rate += table->tablet_activity_read_rate();
+            act.write_rate += table->tablet_activity_write_rate();
+
             co_await coroutine::maybe_yield();
         }
 
