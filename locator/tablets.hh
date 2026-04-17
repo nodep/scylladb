@@ -520,6 +520,21 @@ struct tablet_load_stats {
     uint64_t add_tablet_sizes(const tablet_load_stats& tls);
 };
 
+// Per-table activity rates, reported by each node and aggregated cluster-wide.
+// Used by the tablet allocator to bias tablet-count scaling toward active tables.
+struct table_activity_stats {
+    // Exponentially-weighted moving averages of read and write operations per
+    // second, measured on the reporting node across all shards owning tablets
+    // of this table. The aggregated cluster-wide value is the sum over nodes.
+    double read_rate = 0.0;
+    double write_rate = 0.0;
+
+    table_activity_stats& operator+=(const table_activity_stats& s) noexcept;
+    friend table_activity_stats operator+(table_activity_stats a, const table_activity_stats& b) {
+        return a += b;
+    }
+};
+
 // Used as a return value for functions returning both table and tablet stats
 struct combined_load_stats {
     locator::table_load_stats table_ls;
@@ -539,6 +554,12 @@ struct load_stats {
 
     // Size-based load balancing data
     tablet_load_stats_map tablet_stats;
+
+    // Per-table activity rates (reads/writes per second), aggregated across
+    // the cluster. Empty on nodes that do not report activity (e.g. during
+    // rolling upgrade); consumers must treat emptiness as "data unavailable"
+    // rather than "all tables idle".
+    std::unordered_map<table_id, table_activity_stats> table_activity;
 
     static load_stats from_v1(load_stats_v1&&);
 

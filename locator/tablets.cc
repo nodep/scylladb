@@ -1019,6 +1019,12 @@ table_load_stats& table_load_stats::operator+=(const table_load_stats& s) noexce
     return *this;
 }
 
+table_activity_stats& table_activity_stats::operator+=(const table_activity_stats& s) noexcept {
+    read_rate += s.read_rate;
+    write_rate += s.write_rate;
+    return *this;
+}
+
 uint64_t tablet_load_stats::add_tablet_sizes(const tablet_load_stats& tls) {
     uint64_t table_sizes_sum = 0;
     for (auto& [table, sizes] : tls.tablet_sizes) {
@@ -1047,6 +1053,9 @@ load_stats& load_stats::operator+=(const load_stats& s) {
     for (auto& [host, tablet_ls] : s.tablet_stats) {
         tablet_stats[host].effective_capacity = tablet_ls.effective_capacity;
         tablet_stats[host].add_tablet_sizes(tablet_ls);
+    }
+    for (auto& [id, act] : s.table_activity) {
+        table_activity[id] += act;
     }
     return *this;
 }
