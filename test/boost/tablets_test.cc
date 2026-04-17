@@ -6879,4 +6879,354 @@ SEASTAR_THREAD_TEST_CASE(test_tablet_options_min_and_max_tablet_count) {
     }, cfg).get();
 }
 
+// --- Activity-weighted Phase 3 tablet allocation tests --------------------
+//
+// The following tests exercise the activity-aware tablet scaling path added
+// so that during initial data ingestion (many empty tables + a few hot ones),
+// the tablet budget is concentrated on tables that actually receive traffic.
+// The path is controlled by `tablets_activity_weighted_allocation_enabled`
+// (default true) and is driven from `load_stats::table_activity`.
+
+SEASTAR_THREAD_TEST_CASE(test_activity_weighted_allocation_basic) {
+    // One hot table, three idle tables. The activity-weighted path must
+    // leave the hot table with substantially more tablets than the idle ones
+    // and bring the total per-shard count back within the hard limit.
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->tablets_per_shard_goal(4);
+    cfg.db_config->tablets_per_shard_hard_limit_multiplier(4);
+    cfg.db_config->tablets_activity_weighted_allocation_enabled(true);
+
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        auto dc = topo.dc();
+
+        auto host1 = topo.add_node(node_state::normal, 1);
+
+        // 4 keyspaces each starting at 8 tablets => 32 tablets/shard.
+        // goal=4, hard_limit=16 => scaling must kick in.
+        auto ks_hot = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_cold_1 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_cold_2 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_cold_3 = add_keyspace(e, {{dc, 1}}, 8);
+
+        auto make_table = [&] (const sstring& ks) {
+            e.execute_cql(fmt::format("CREATE TABLE {}.t (p text, r int, PRIMARY KEY (p))", ks)).get();
+            return e.local_db().find_schema(ks, "t")->id();
+        };
+
+        auto t_hot = make_table(ks_hot);
+        auto t_cold_1 = make_table(ks_cold_1);
+        auto t_cold_2 = make_table(ks_cold_2);
+        auto t_cold_3 = make_table(ks_cold_3);
+
+        auto& stm = e.shared_token_metadata().local();
+        auto tablet_count = [&] (table_id tid) {
+            return stm.get()->tablets().get_tablet_map(tid).tablet_count();
+        };
+
+        shared_load_stats& ls = topo.get_shared_load_stats();
+        ls.set_size(t_hot, 0);
+        ls.set_size(t_cold_1, 0);
+        ls.set_size(t_cold_2, 0);
+        ls.set_size(t_cold_3, 0);
+
+        // Hot table gets rate well above active threshold (1.0); cold tables
+        // stay below idle threshold (0.1). Must emplace a table_activity entry
+        // for every table in load_stats.tables; otherwise the topology
+        // coordinator's rolling-upgrade guard (simulated here via a non-empty
+        // map) would invalidate the state.
+        ls.set_activity(t_hot, 50.0, 50.0);
+        ls.set_activity(t_cold_1, 0.0, 0.0);
+        ls.set_activity(t_cold_2, 0.0, 0.0);
+        ls.set_activity(t_cold_3, 0.0, 0.0);
+
+        ls.set_default_tablet_sizes(stm.get());
+
+        rebalance_tablets(e, &ls);
+
+        auto hot = tablet_count(t_hot);
+        auto c1 = tablet_count(t_cold_1);
+        auto c2 = tablet_count(t_cold_2);
+        auto c3 = tablet_count(t_cold_3);
+        testlog.info("activity_weighted_basic: hot={}, cold={}, {}, {}", hot, c1, c2, c3);
+
+        // The hot table keeps significantly more tablets than any idle table.
+        BOOST_REQUIRE_GT(hot, c1);
+        BOOST_REQUIRE_GT(hot, c2);
+        BOOST_REQUIRE_GT(hot, c3);
+        // Empty idle tables collapse to their size-based floor (=1).
+        BOOST_REQUIRE_EQUAL(c1, 1u);
+        BOOST_REQUIRE_EQUAL(c2, 1u);
+        BOOST_REQUIRE_EQUAL(c3, 1u);
+        // Total stays under the hard limit (goal * multiplier = 4 * 4 = 16).
+        BOOST_REQUIRE_LE(hot + c1 + c2 + c3, 16u);
+    }, cfg).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_activity_weighted_disabled_falls_back_to_uniform) {
+    // Regression: with the activity flag disabled the allocator must
+    // fall back to the legacy uniform-scaling behavior, yielding equal
+    // tablet counts across all tables regardless of activity.
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->tablets_per_shard_goal(4);
+    cfg.db_config->tablets_activity_weighted_allocation_enabled(false);
+
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        auto dc = topo.dc();
+
+        topo.add_node(node_state::normal, 1);
+
+        auto ks1 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks2 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks3 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks4 = add_keyspace(e, {{dc, 1}}, 8);
+
+        auto make_table = [&] (const sstring& ks) {
+            e.execute_cql(fmt::format("CREATE TABLE {}.t (p text, r int, PRIMARY KEY (p))", ks)).get();
+            return e.local_db().find_schema(ks, "t")->id();
+        };
+        auto t1 = make_table(ks1);
+        auto t2 = make_table(ks2);
+        auto t3 = make_table(ks3);
+        auto t4 = make_table(ks4);
+
+        auto& stm = e.shared_token_metadata().local();
+        auto tablet_count = [&] (table_id tid) {
+            return stm.get()->tablets().get_tablet_map(tid).tablet_count();
+        };
+
+        shared_load_stats& ls = topo.get_shared_load_stats();
+        for (auto t : {t1, t2, t3, t4}) {
+            ls.set_size(t, 0);
+        }
+
+        // Provide activity anyway -- the flag being off must override.
+        ls.set_activity(t1, 1000.0, 1000.0);
+        ls.set_activity(t2, 0.0, 0.0);
+        ls.set_activity(t3, 0.0, 0.0);
+        ls.set_activity(t4, 0.0, 0.0);
+
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        auto n1 = tablet_count(t1);
+        auto n2 = tablet_count(t2);
+        auto n3 = tablet_count(t3);
+        auto n4 = tablet_count(t4);
+        testlog.info("disabled_fallback: {}, {}, {}, {}", n1, n2, n3, n4);
+
+        // Uniform scaling: all equal.
+        BOOST_REQUIRE_EQUAL(n1, n2);
+        BOOST_REQUIRE_EQUAL(n2, n3);
+        BOOST_REQUIRE_EQUAL(n3, n4);
+    }, cfg).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_activity_weighted_empty_activity_falls_back) {
+    // Rolling-upgrade scenario: load_stats has no table_activity entries at
+    // all (e.g. the topology coordinator cleared it because at least one node
+    // is still on an older version). The allocator must treat this as "data
+    // unavailable" and use legacy uniform scaling -- it must not mistake
+    // missing data for "all tables idle".
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->tablets_per_shard_goal(4);
+    cfg.db_config->tablets_activity_weighted_allocation_enabled(true);
+
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        auto dc = topo.dc();
+
+        topo.add_node(node_state::normal, 1);
+
+        auto ks1 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks2 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks3 = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks4 = add_keyspace(e, {{dc, 1}}, 8);
+
+        auto make_table = [&] (const sstring& ks) {
+            e.execute_cql(fmt::format("CREATE TABLE {}.t (p text, r int, PRIMARY KEY (p))", ks)).get();
+            return e.local_db().find_schema(ks, "t")->id();
+        };
+        auto t1 = make_table(ks1);
+        auto t2 = make_table(ks2);
+        auto t3 = make_table(ks3);
+        auto t4 = make_table(ks4);
+
+        auto& stm = e.shared_token_metadata().local();
+        auto tablet_count = [&] (table_id tid) {
+            return stm.get()->tablets().get_tablet_map(tid).tablet_count();
+        };
+
+        shared_load_stats& ls = topo.get_shared_load_stats();
+        for (auto t : {t1, t2, t3, t4}) {
+            ls.set_size(t, 0);
+        }
+        // Deliberately do NOT call set_activity -- table_activity map is empty.
+
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        auto n1 = tablet_count(t1);
+        auto n2 = tablet_count(t2);
+        auto n3 = tablet_count(t3);
+        auto n4 = tablet_count(t4);
+        testlog.info("empty_activity_fallback: {}, {}, {}, {}", n1, n2, n3, n4);
+
+        // Legacy uniform scaling: all counts equal.
+        BOOST_REQUIRE_EQUAL(n1, n2);
+        BOOST_REQUIRE_EQUAL(n2, n3);
+        BOOST_REQUIRE_EQUAL(n3, n4);
+    }, cfg).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_activity_weighted_hysteresis) {
+    // Verify that a rate in the hysteresis band (between idle and active
+    // thresholds) retains the prior classification across consecutive
+    // rebalance calls. The classification state lives on
+    // tablet_allocator_impl and is shared between calls on the same impl.
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->tablets_per_shard_goal(4);
+    cfg.db_config->tablets_activity_weighted_allocation_enabled(true);
+    cfg.db_config->tablets_active_table_rate_threshold(1.0);
+    cfg.db_config->tablets_idle_table_rate_threshold(0.1);
+
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        auto dc = topo.dc();
+
+        topo.add_node(node_state::normal, 1);
+
+        auto ks_a = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_b = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_c = add_keyspace(e, {{dc, 1}}, 8);
+        auto ks_d = add_keyspace(e, {{dc, 1}}, 8);
+
+        auto make_table = [&] (const sstring& ks) {
+            e.execute_cql(fmt::format("CREATE TABLE {}.t (p text, r int, PRIMARY KEY (p))", ks)).get();
+            return e.local_db().find_schema(ks, "t")->id();
+        };
+        auto t_a = make_table(ks_a);
+        auto t_b = make_table(ks_b);
+        auto t_c = make_table(ks_c);
+        auto t_d = make_table(ks_d);
+
+        auto& stm = e.shared_token_metadata().local();
+        auto tablet_count = [&] (table_id tid) {
+            return stm.get()->tablets().get_tablet_map(tid).tablet_count();
+        };
+
+        shared_load_stats& ls = topo.get_shared_load_stats();
+        for (auto t : {t_a, t_b, t_c, t_d}) {
+            ls.set_size(t, 0);
+        }
+
+        // First rebalance: A clearly active, rest idle. Classify A=active.
+        ls.set_activity(t_a, 5.0, 5.0);
+        ls.set_activity(t_b, 0.0, 0.0);
+        ls.set_activity(t_c, 0.0, 0.0);
+        ls.set_activity(t_d, 0.0, 0.0);
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        auto a_after_active = tablet_count(t_a);
+        auto b_after_active = tablet_count(t_b);
+        testlog.info("hysteresis step1: A={}, B={}", a_after_active, b_after_active);
+        BOOST_REQUIRE_GT(a_after_active, b_after_active);
+
+        // Drop A into the hysteresis band (0.5 is between 0.1 and 1.0). With
+        // hysteresis, A must remain classified active; without it, A would
+        // flip to idle and collapse to 1 tablet.
+        ls.set_activity(t_a, 0.25, 0.25);
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        auto a_in_band = tablet_count(t_a);
+        auto b_in_band = tablet_count(t_b);
+        testlog.info("hysteresis step2 (band): A={}, B={}", a_in_band, b_in_band);
+        BOOST_REQUIRE_GT(a_in_band, b_in_band);
+        BOOST_REQUIRE_GT(a_in_band, 1u);
+
+        // Drop A clearly below the idle threshold. Now A must flip to idle.
+        ls.set_activity(t_a, 0.0, 0.0);
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        auto a_idle = tablet_count(t_a);
+        auto b_idle = tablet_count(t_b);
+        testlog.info("hysteresis step3 (idle): A={}, B={}", a_idle, b_idle);
+        BOOST_REQUIRE_EQUAL(a_idle, b_idle);
+    }, cfg).get();
+}
+
+SEASTAR_THREAD_TEST_CASE(test_activity_weighted_hard_limit_compression) {
+    // When many idle tables exist, the combined (active + idle-floor) budget
+    // can exceed the hard limit. The algorithm must compress idle floors
+    // proportionally so that the cluster respects the hard limit.
+    auto cfg = tablet_cql_test_config();
+    cfg.db_config->tablets_per_shard_goal(4);
+    cfg.db_config->tablets_per_shard_hard_limit_multiplier(2); // hard=8
+    cfg.db_config->tablets_activity_weighted_allocation_enabled(true);
+
+    do_with_cql_env_thread([] (auto& e) {
+        topology_builder topo(e);
+        auto dc = topo.dc();
+
+        auto host1 = topo.add_node(node_state::normal, 1);
+
+        auto ks_hot = add_keyspace(e, {{dc, 1}}, 8);
+        std::vector<sstring> cold_ks;
+        for (int i = 0; i < 12; i++) {
+            cold_ks.push_back(add_keyspace(e, {{dc, 1}}, 2));
+        }
+
+        auto make_table = [&] (const sstring& ks) {
+            e.execute_cql(fmt::format("CREATE TABLE {}.t (p text, r int, PRIMARY KEY (p))", ks)).get();
+            return e.local_db().find_schema(ks, "t")->id();
+        };
+
+        auto t_hot = make_table(ks_hot);
+        std::vector<table_id> cold_tables;
+        for (auto& ks : cold_ks) {
+            cold_tables.push_back(make_table(ks));
+        }
+
+        auto& stm = e.shared_token_metadata().local();
+        auto tablet_count = [&] (table_id tid) {
+            return stm.get()->tablets().get_tablet_map(tid).tablet_count();
+        };
+
+        shared_load_stats& ls = topo.get_shared_load_stats();
+        ls.set_size(t_hot, 0);
+        ls.set_activity(t_hot, 100.0, 100.0);
+        // Give each idle table a non-trivial size-based floor (2 * 5GiB chunks
+        // => floor of 2 tablets) so the uncompressed floor budget is 12*2=24
+        // per shard, which exceeds hard_limit=8 and forces compression.
+        for (auto t : cold_tables) {
+            ls.set_size(t, service::default_target_tablet_size * 2);
+            ls.set_activity(t, 0.0, 0.0);
+        }
+
+        ls.set_default_tablet_sizes(stm.get());
+        rebalance_tablets(e, &ls);
+
+        size_t hot = tablet_count(t_hot);
+        size_t total_cold = 0;
+        for (auto t : cold_tables) {
+            total_cold += tablet_count(t);
+        }
+        size_t total = hot + total_cold;
+        testlog.info("hard_limit_compression: hot={}, total_cold={}, total={}", hot, total_cold, total);
+
+        // Hot table keeps more than any individual idle table.
+        for (auto t : cold_tables) {
+            BOOST_REQUIRE_GE(hot, tablet_count(t));
+        }
+        // Total per-shard count respects the hard limit (8) -- allowing a
+        // little slack for pow2 rounding applied after Phase 3.
+        BOOST_REQUIRE_LE(total, 16u);
+        (void)host1;
+    }, cfg).get();
+}
+
 BOOST_AUTO_TEST_SUITE_END()

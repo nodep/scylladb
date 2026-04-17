@@ -34,6 +34,14 @@ struct shared_load_stats {
         stats.tables[table].size_in_bytes = size_in_bytes;
     }
 
+    // Sets per-table activity (read+write EWMA rates, ops/sec) for tests of the
+    // activity-weighted tablet allocation path. Ensures load_stats::table_activity
+    // is non-empty, which is the signal the allocator uses to enable the
+    // activity-aware Phase 3 scaling branch.
+    void set_activity(table_id table, double read_rate, double write_rate) {
+        stats.table_activity[table] = locator::table_activity_stats{read_rate, write_rate};
+    }
+
     void set_split_ready_seq_number(table_id table, size_t seq_number) {
         stats.tables[table].split_ready_seq_number = seq_number;
     }
