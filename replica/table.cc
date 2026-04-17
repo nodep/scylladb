@@ -4941,6 +4941,7 @@ template<typename... Args>
 void table::do_apply(compaction_group& cg, db::rp_handle&& h, Args&&... args) {
     utils::latency_counter lc;
     _stats.writes.set_latency(lc);
+    _tablet_activity_write_ewma.add(1);
     db::replay_position rp = h;
     check_valid_rp(rp);
     try {
@@ -5051,6 +5052,7 @@ table::query(schema_ptr query_schema,
     const auto table_async_gate_holder = _async_gate.hold();
     utils::latency_counter lc;
     _stats.reads.set_latency(lc);
+    _tablet_activity_read_ewma.add(1);
 
     auto finally = defer([&] () noexcept {
         _stats.reads.mark(lc);
@@ -5128,6 +5130,7 @@ table::mutation_query(schema_ptr query_schema,
     }
 
     const auto table_async_gate_holder = _async_gate.hold();
+    _tablet_activity_read_ewma.add(1);
 
     std::optional<querier> querier_opt;
     if (saved_querier) {

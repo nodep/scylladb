@@ -46,6 +46,7 @@
 #include "query/query-result.hh"
 #include "compaction/compaction_strategy.hh"
 #include "utils/estimated_histogram.hh"
+#include "utils/histogram.hh"
 #include <seastar/core/metrics_registration.hh>
 #include "db/view/view_stats.hh"
 #include "db/view/view_update_backlog.hh"
@@ -496,6 +497,21 @@ private:
     mutable table_stats _stats;
     mutable db::view::stats _view_stats;
     mutable row_locker::stats _row_locker_stats;
+
+    // EWMAs of per-shard read and write operations per second for this table,
+    // consumed by the tablet allocator to bias tablet-count scaling toward
+    // active tables. Kept separate from `_stats.reads`/`_stats.writes` so
+    // their semantics (window length, update cadence, visibility) are owned
+    // by the allocator rather than the metrics subsystem.
+    //
+    // Window: 15 minutes. Tick: 10 seconds (via _tablet_activity_timer). The
+    // rate is reported in operations per second.
+    utils::moving_average _tablet_activity_read_ewma{std::chrono::minutes(15), utils::meter_timer::tick_interval()};
+    utils::moving_average _tablet_activity_write_ewma{std::chrono::minutes(15), utils::meter_timer::tick_interval()};
+    utils::meter_timer _tablet_activity_timer{[this] {
+        _tablet_activity_read_ewma.update();
+        _tablet_activity_write_ewma.update();
+    }};
 
     uint64_t _failed_counter_applies_to_memtable = 0;
 
@@ -1186,6 +1202,9 @@ public:
     table_stats& get_stats() const {
         return _stats;
     }
+
+    double tablet_activity_read_rate() const { return _tablet_activity_read_ewma.rate(); }
+    double tablet_activity_write_rate() const { return _tablet_activity_write_ewma.rate(); }
 
     locator::combined_load_stats table_load_stats() const;
 
