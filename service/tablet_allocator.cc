@@ -965,6 +965,11 @@ class load_balancer {
     std::unordered_set<host_id> _skiplist;
     bool _use_table_aware_balancing = true;
     double _initial_scale = 1;
+    // Persistent per-table active/idle classification (hysteresis state) owned by
+    // tablet_allocator_impl, passed in when activity-weighted Phase 3 scaling is
+    // enabled. nullptr means the activity-weighted path is disabled for this
+    // invocation and legacy uniform scaling is used.
+    std::unordered_map<table_id, bool>* _activity_classification = nullptr;
 
     // This is the maximum load delta between the most and least loaded nodes,
     // below which the balancer considers the DC balanced
@@ -1135,6 +1140,14 @@ public:
 
     void set_initial_scale(double initial_scale) {
         _initial_scale = initial_scale;
+    }
+
+    // Enables activity-weighted Phase 3 scaling. The classification map is owned
+    // by tablet_allocator_impl so that hysteresis state (active/idle per table)
+    // survives across successive make_plan() invocations. Passing nullptr (the
+    // default) keeps the legacy uniform scaling behavior.
+    void set_activity_classification(std::unordered_map<table_id, bool>* classification) {
+        _activity_classification = classification;
     }
 
     const locator::table_load_stats* load_stats_for_table(table_id id) const {
@@ -2460,8 +2473,48 @@ public:
         struct scale_info {
             double factor;
             endpoint_dc_rack source;
+            // When set, this is an absolute tablet count target (a floor imposed
+            // on an inactive table), not a scale factor. The post-rack-reconciliation
+            // apply loop treats it as the tablet count directly.
+            std::optional<size_t> absolute_count = std::nullopt;
         };
         std::unordered_map<table_id, scale_info> table_scaling;
+
+        // Activity-weighted Phase 3 state. Non-null iff the activity path is enabled
+        // for this invocation and load_stats carries a non-empty table_activity map
+        // (after the rolling-upgrade filter applied by the topology coordinator).
+        // Classification (active/idle) is cluster-wide, not per-rack, so we compute
+        // it once up-front using cluster-aggregated rates and hysteresis state held
+        // across invocations on tablet_allocator_impl.
+        const bool activity_weighted_enabled =
+                _db.get_config().tablets_activity_weighted_allocation_enabled()
+                && _activity_classification != nullptr
+                && _table_load_stats
+                && !_table_load_stats->table_activity.empty();
+
+        auto classify_table = [&] (table_id tid) -> bool {
+            // Returns true if the table is classified active. Uses dual thresholds
+            // with hysteresis: rise to active only at or above the high threshold,
+            // fall to idle only at or below the low threshold; rates in between
+            // retain the previous classification.
+            const double high = _db.get_config().tablets_active_table_rate_threshold();
+            const double low = _db.get_config().tablets_idle_table_rate_threshold();
+            double rate = 0.0;
+            if (auto it = _table_load_stats->table_activity.find(tid);
+                it != _table_load_stats->table_activity.end()) {
+                rate = it->second.read_rate + it->second.write_rate;
+            }
+            auto [it, inserted] = _activity_classification->try_emplace(tid, rate >= high);
+            bool prev = it->second;
+            bool next = prev;
+            if (rate >= high) {
+                next = true;
+            } else if (rate <= low) {
+                next = false;
+            }
+            it->second = next;
+            return next;
+        };
 
         for (auto&& [rack, shard_count] : shards_per_rack) {
             double cur_avg_tablets_per_shard = 0;
@@ -2504,7 +2557,45 @@ public:
             lblogger.debug("new_avg_tablets_per_shard[dc={},rack={}]: {:.3f}{}", rack.dc, rack.rack, new_avg_tablets_per_shard,
                 overloaded ? " (overloaded!)" : "");
 
-            if (overloaded) {
+            if (!overloaded) {
+                continue;
+            }
+
+            // Helper reused by both paths to pick the most restrictive per-table
+            // adjustment when multiple racks demand shrinking.
+            auto record_factor = [&] (table_id table, scale_info candidate) {
+                auto [i, inserted] = table_scaling.try_emplace(table, candidate);
+                if (inserted) {
+                    return;
+                }
+                // Floor (absolute) takes precedence over factor only if it results
+                // in a smaller tablet count; since we don't yet know the
+                // post-reconciliation target tablet count here we simply keep the
+                // most restrictive factor, and for floors the smallest absolute
+                // count wins.
+                auto& existing = i->second;
+                if (candidate.absolute_count && existing.absolute_count) {
+                    if (*candidate.absolute_count < *existing.absolute_count) {
+                        existing = std::move(candidate);
+                    }
+                } else if (candidate.absolute_count && !existing.absolute_count) {
+                    // Prefer factor (relative) if its resulting count would be
+                    // smaller than the floor. Without the table_plan context
+                    // here, we conservatively keep the existing factor; the floor
+                    // was computed on another rack and will be applied on that
+                    // rack's path anyway.
+                } else if (!candidate.absolute_count && existing.absolute_count) {
+                    // Same conservative reasoning as above: keep existing floor.
+                } else {
+                    if (candidate.factor < existing.factor) {
+                        existing = std::move(candidate);
+                    }
+                }
+            };
+
+            if (!activity_weighted_enabled) {
+                // Legacy uniform scaling: all tables with replicas in this rack
+                // shrink by the same factor so that the rack meets the goal.
                 auto scale = scale_info{_tablets_per_shard_goal / new_avg_tablets_per_shard, rack};
 
                 for (auto&& [table, table_plan]: plan.tables) {
@@ -2514,25 +2605,130 @@ public:
                     // If table has no replicas in this rack, scaling it won't help and is harmful to its distribution
                     // in other DCs or racks.
                     if (rf && (rf->is_numeric() || std::ranges::contains(rf->get_rack_list(), rack.rack))) {
-                        auto [i, inserted] = table_scaling.try_emplace(table, scale);
-                        if (!inserted) {
-                            if (scale.factor < i->second.factor) {
-                                i->second = std::move(scale);
-                            }
-                        }
+                        record_factor(table, scale);
                     }
+                }
+                continue;
+            }
+
+            // Activity-weighted path: partition tables into active (keep Phase 2
+            // target, scale only if active subtotal alone still exceeds soft_goal)
+            // and inactive (compress to a size-based floor, then further compress
+            // proportionally if the soft_goal + floors sum exceeds hard_limit).
+            auto get_avg_tablets_per_shard_for_table = [&] (table_id table, size_t tablet_count) -> double {
+                auto* rs = rs_by_table[table];
+                auto rf = rs->get_replication_factor_data(rack.dc);
+                if (!rf) {
+                    return 0;
+                }
+                if (rf->is_numeric()) {
+                    auto racks_in_dc = racks_per_dc.at(rack.dc).size();
+                    return double(tablet_count) * rf->count() / shard_count / racks_in_dc;
+                }
+                if (std::ranges::contains(rf->get_rack_list(), rack.rack)) {
+                    return double(tablet_count) / shard_count;
+                }
+                return 0;
+            };
+
+            struct table_info_entry {
+                bool active;
+                size_t floor; // only meaningful when !active
+                double per_shard_at_floor; // only meaningful when !active
+                double per_shard_at_target; // only meaningful when active
+            };
+            std::unordered_map<table_id, table_info_entry> table_info;
+            double active_per_shard = 0.0;
+            double floor_per_shard = 0.0;
+
+            for (auto&& [table, table_plan] : plan.tables) {
+                auto* rs = rs_by_table[table];
+                auto rf = rs->get_replication_factor_data(rack.dc);
+                if (!rf || (!rf->is_numeric() && !std::ranges::contains(rf->get_rack_list(), rack.rack))) {
+                    continue; // no replicas in this rack
+                }
+                auto per_shard_at_target = get_avg_tablets_per_shard_for_table(table, table_plan.target_tablet_count);
+                if (per_shard_at_target == 0) {
+                    continue;
+                }
+
+                bool is_active = classify_table(table);
+                if (is_active) {
+                    active_per_shard += per_shard_at_target;
+                    table_info[table] = table_info_entry{true, 0, 0.0, per_shard_at_target};
+                    continue;
+                }
+
+                // Inactive: floor is size-based, capped by the Phase 2 target so
+                // we never inflate a table here. Empty tables floor at 1 tablet.
+                size_t size_floor = 1;
+                if (auto tls = load_stats_for_table(table); tls && tls->size_in_bytes > 0 && _target_tablet_size > 0) {
+                    size_floor = std::max<size_t>(1,
+                            div_ceil(tls->size_in_bytes, _target_tablet_size));
+                }
+                size_t floor = std::min(size_floor, table_plan.target_tablet_count);
+                auto per_shard_at_floor = get_avg_tablets_per_shard_for_table(table, floor);
+                floor_per_shard += per_shard_at_floor;
+                table_info[table] = table_info_entry{false, floor, per_shard_at_floor, 0.0};
+            }
+
+            const double soft_goal = double(_tablets_per_shard_goal);
+            const double hard_limit = soft_goal * _db.get_config().tablets_per_shard_hard_limit_multiplier();
+
+            double active_scale = 1.0;
+            if (active_per_shard > soft_goal) {
+                active_scale = soft_goal / active_per_shard;
+            }
+            double effective_active_per_shard = active_per_shard * active_scale;
+
+            double floor_scale = 1.0;
+            if (effective_active_per_shard + floor_per_shard > hard_limit) {
+                // By construction effective_active_per_shard <= soft_goal < hard_limit,
+                // so the numerator is strictly positive.
+                floor_scale = (hard_limit - effective_active_per_shard) / floor_per_shard;
+                if (floor_scale < 0.0) {
+                    floor_scale = 0.0;
+                }
+            }
+
+            lblogger.debug("activity-weighted[dc={},rack={}]: active_per_shard={:.3f}, floor_per_shard={:.3f}, "
+                           "active_scale={:.3f}, floor_scale={:.3f}, soft_goal={:.1f}, hard_limit={:.1f}",
+                           rack.dc, rack.rack, active_per_shard, floor_per_shard,
+                           active_scale, floor_scale, soft_goal, hard_limit);
+
+            for (auto&& [table, info] : table_info) {
+                if (info.active) {
+                    if (active_scale < 1.0) {
+                        record_factor(table, scale_info{active_scale, rack});
+                    }
+                } else {
+                    size_t target_floor = std::max<size_t>(1, size_t(std::floor(info.floor * floor_scale)));
+                    record_factor(table, scale_info{0.0 /* unused */, rack, target_floor});
                 }
             }
         }
 
         for (auto&& [table, scale] : table_scaling) {
             auto& table_plan = plan.tables[table];
-            auto new_count = std::max<size_t>(1, table_plan.target_tablet_count * scale.factor);
-            lblogger.debug("Scaling down table {} by a factor of {:.3f} due to {}.{}: {} => {}", table, scale.factor,
-                           scale.source.dc, scale.source.rack, table_plan.target_tablet_count, new_count);
-            table_plan.target_tablet_count = new_count;
-            table_plan.target_tablet_count_reason = format("{} scaled by {:.3f} due to {}.{}", table_plan.target_tablet_count_reason,
-                                                           scale.factor, scale.source.dc, scale.source.rack);
+            size_t new_count;
+            if (scale.absolute_count) {
+                new_count = std::max<size_t>(1, *scale.absolute_count);
+                // Never inflate in Phase 3: the floor is a cap-from-above only.
+                new_count = std::min(new_count, table_plan.target_tablet_count);
+                lblogger.debug("Flooring table {} to {} tablets due to {}.{} (activity-weighted): {} => {}",
+                               table, new_count, scale.source.dc, scale.source.rack,
+                               table_plan.target_tablet_count, new_count);
+                table_plan.target_tablet_count = new_count;
+                table_plan.target_tablet_count_reason = format("{} floored to {} due to {}.{} (inactive)",
+                               table_plan.target_tablet_count_reason, new_count, scale.source.dc, scale.source.rack);
+            } else {
+                new_count = std::max<size_t>(1, table_plan.target_tablet_count * scale.factor);
+                lblogger.debug("Scaling down table {} by a factor of {:.3f} due to {}.{}: {} => {}", table, scale.factor,
+                               scale.source.dc, scale.source.rack, table_plan.target_tablet_count, new_count);
+                table_plan.target_tablet_count = new_count;
+                table_plan.target_tablet_count_reason = format("{} scaled by {:.3f} due to {}.{}", table_plan.target_tablet_count_reason,
+                                                               scale.factor, scale.source.dc, scale.source.rack);
+            }
         }
 
         // Generate:
@@ -4463,6 +4659,10 @@ class tablet_allocator_impl : public tablet_allocator::impl
     bool _stopped = false;
     bool _use_tablet_aware_balancing = true;
     locator::load_stats_ptr _load_stats;
+    // Persistent per-table active/idle classification for activity-weighted
+    // tablet allocation. The map outlives individual load_balancer instances so
+    // hysteresis state carries across make_plan() invocations.
+    std::unordered_map<table_id, bool> _table_activity_classification;
 private:
     load_balancer make_load_balancer(token_metadata_ptr tm,
             service::topology* topology,
@@ -4475,6 +4675,7 @@ private:
             std::move(skiplist));
         lb.set_use_table_aware_balancing(_use_tablet_aware_balancing);
         lb.set_initial_scale(_db.get_config().tablets_initial_scale_factor());
+        lb.set_activity_classification(&_table_activity_classification);
         return lb;
     }
 public:
