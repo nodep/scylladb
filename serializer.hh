@@ -245,6 +245,40 @@ template<> struct serializer<uint32_t> : public integral_serializer<uint32_t> {}
 template<> struct serializer<int64_t> : public integral_serializer<int64_t> {};
 template<> struct serializer<uint64_t> : public integral_serializer<uint64_t> {};
 
+template<typename T, typename Input>
+requires std::is_floating_point_v<T>
+inline T deserialize_floating_point(Input& input) {
+    T data;
+    input.read(reinterpret_cast<char*>(&data), sizeof(T));
+    return data;
+}
+
+template<typename T, typename Output>
+requires std::is_floating_point_v<T>
+inline void serialize_floating_point(Output& output, T data) {
+    output.write(reinterpret_cast<const char*>(&data), sizeof(T));
+}
+
+template<typename T>
+struct floating_point_serializer {
+    template<typename Input>
+    static T read(Input& v) {
+        return deserialize_floating_point<T>(v);
+    }
+    template<typename Output>
+    static void write(Output& out, T v) {
+        serialize_floating_point(out, v);
+    }
+    template<typename Input>
+    static void skip(Input& v) {
+        read(v);
+    }
+};
+
+template<> struct serializer<float> : public floating_point_serializer<float> {};
+template<> struct serializer<double> : public floating_point_serializer<double> {};
+template<> struct serializer<long double> : public floating_point_serializer<long double> {};
+
 template<typename Output>
 void safe_serialize_as_uint32(Output& output, uint64_t data);
 
