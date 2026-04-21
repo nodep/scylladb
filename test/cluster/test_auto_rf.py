@@ -14,7 +14,8 @@ from test.pylib.rest_client import HTTPError
 from test.pylib.tablets import get_all_tablet_replicas
 from test.pylib.manager_client import ManagerClient
 from test.pylib.internal_types import ServerInfo, HostID
-from test.cluster.util import parse_replication_options, wait_for_cql_and_get_hosts
+from test.cluster.tasks.task_manager_client import TaskManagerClient
+from test.cluster.util import create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts
 
 
 logger = logging.getLogger(__name__)
@@ -252,3 +253,320 @@ async def test_auto_rf_audit_ks_late_creation(manager: ManagerClient):
 
     logger.info("Verify the audit schema is created with correct RF")
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2'], 'dc2': ['r1', 'r2']}, timeout=30)
+
+
+# ---------------------------------------------------------------------------
+# Gating tests.
+#
+# These tests exercise the rule implemented in
+# service::topology_coordinator::get_racks_for_auto_rf_change(): a rack (or
+# DC) is only considered eligible for auto-RF expansion if some *non-auto-RF*
+# tablets-enabled keyspace already places replicas there (either via an
+# explicit rack list or via a numeric RF, which makes all racks in the DC
+# eligible).
+#
+# These tests use an explicit user-created tablets keyspace as the
+# "eligibility driver" and verify that audit/system_traces follow it.
+# ---------------------------------------------------------------------------
+
+
+async def get_pending_rf_changes(cql, ks: str) -> int:
+    """Return the number of pending keyspace_rf_change requests for `ks`."""
+    rows = await cql.run_async(
+        f"SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
+        f"AND new_keyspace_rf_change_ks_name='{ks}' AND done=False ALLOW FILTERING")
+    return len(rows)
+
+
+async def _list_rf_change_tasks(manager: ManagerClient, server: ServerInfo, ks: str):
+    """Return all keyspace_rf_change tasks known to the task manager for `ks`.
+
+    This includes pending/running tasks and recently-completed tasks still
+    within the user-task TTL window.
+    """
+    task_mgr = TaskManagerClient(manager.api)
+    tasks = await task_mgr.list_tasks(server.ip_addr, "global_topology_requests", keyspace=ks)
+    return [t for t in tasks if t.type == "keyspace_rf_change"]
+
+
+async def wait_for_auto_rf_to_settle(manager: ManagerClient, server: ServerInfo, cql, ks: str,
+                                     timeout: float = 120.0) -> int:
+    """
+    Wait until the topology coordinator has finished acting on `ks`:
+      * there are no pending keyspace_rf_change requests (done=False) for `ks`
+        in system.topology_requests, AND
+      * no keyspace_rf_change task for `ks` is currently running in the
+        task manager.
+
+    Returns the number of keyspace_rf_change tasks that completed during the
+    settle window (useful for negative tests that want to assert no task ran).
+    """
+    task_mgr = TaskManagerClient(manager.api)
+    start = time.time()
+
+    # First: grab the baseline count of tasks currently known.
+    initial = {t.task_id for t in await _list_rf_change_tasks(manager, server, ks)}
+
+    while True:
+        pending = await get_pending_rf_changes(cql, ks)
+        tasks = await _list_rf_change_tasks(manager, server, ks)
+        running = [t for t in tasks if t.state in ("created", "running", "suspended")]
+        if pending == 0 and not running:
+            final = {t.task_id for t in tasks}
+            new_tasks = final - initial
+            return len(new_tasks)
+        if time.time() - start > timeout:
+            raise AssertionError(
+                f"auto-RF for {ks} did not settle within {timeout}s: "
+                f"pending={pending}, running_tasks={[t.task_id for t in running]}")
+        await asyncio.sleep(0.5)
+
+
+async def wait_for_rf_change_task(manager: ManagerClient, server: ServerInfo, cql, ks: str,
+                                  timeout: float = 120.0) -> None:
+    """
+    Wait until a keyspace_rf_change task for `ks` is scheduled AND completes
+    successfully. Use this in positive tests that expect auto-RF to act.
+    """
+    task_mgr = TaskManagerClient(manager.api)
+    deadline = time.time() + timeout
+
+    # Wait for the task to appear (either running or done).
+    task_id = None
+    while task_id is None:
+        for t in await _list_rf_change_tasks(manager, server, ks):
+            # Ignore tasks that existed before we were called and are already
+            # finished (they belong to a previous step). A freshly scheduled
+            # task will either be pending in system.topology_requests or
+            # present in a non-"done" state for at least a brief moment, so
+            # require that we actually observe pending work or a running task.
+            if t.state in ("created", "running", "suspended"):
+                task_id = t.task_id
+                break
+        if task_id is None and await get_pending_rf_changes(cql, ks) > 0:
+            # Pending in sys_ks but task manager hasn't exposed it yet.
+            await asyncio.sleep(0.2)
+            continue
+        if task_id is not None:
+            break
+        if time.time() >= deadline:
+            raise AssertionError(f"no keyspace_rf_change task appeared for {ks} within {timeout}s")
+        await asyncio.sleep(0.2)
+
+    logger.info(f"Waiting for rf_change task {task_id} on {ks} to complete")
+    status = await task_mgr.wait_for_task(server.ip_addr, task_id)
+    assert status.state == "done", (
+        f"keyspace_rf_change task {task_id} for {ks} ended in state "
+        f"{status.state}: {status.error}")
+    # And make sure nothing else is still pending (defense in depth).
+    await wait_for_auto_rf_to_settle(manager, server, cql, ks)
+
+
+@pytest.mark.asyncio
+async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ManagerClient):
+    """
+    Verify that auto-RF on the audit keyspace only expands to racks that are
+    already present in the rack list of some other (non-auto-RF) tablets
+    keyspace.
+
+    Scenario:
+      1. Start cluster with dc1/r1, audit enabled. Create a user tablets
+         keyspace restricted to dc1:['r1']. Wait for any initial auto-RF
+         activity to settle.
+      2. Add a node in dc1/r2. Assert that auto-RF does NOT schedule any
+         keyspace_rf_change task for audit, and audit's replication is
+         unchanged.
+      3. ALTER the user keyspace to include r2. Wait for the auto-RF task to
+         be scheduled and completed, and assert audit now includes r2.
+    """
+    ks = AUDIT_KS
+    tables = AUDIT_TABLES
+    cfg_audit = {"audit": "table"}
+
+    logger.info("Start cluster with 1 node in dc1/r1, audit enabled")
+    servers = []
+    host_to_dc_rack = {}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
+    cql = manager.get_cql()
+    server0 = servers[0]
+
+    logger.info("Create a user tablets keyspace pinned to dc1:['r1']")
+    user_ks = await create_new_test_keyspace(
+        cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['r1']}")
+
+    logger.info("Wait for any initial auto-RF activity on audit to settle")
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info("Add a node in dc1/r2 -- auto-RF must NOT schedule any task for audit")
+    before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
+    # Wait for the coordinator to settle after the node-add; this also waits
+    # for any (erroneously) scheduled rf_change task to finish.
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    # Give the coordinator a few additional iterations to ensure it truly
+    # decided not to schedule a change.
+    await asyncio.sleep(5)
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    new_tasks = after_tasks - before_tasks
+    assert not new_tasks, (
+        f"auto-RF unexpectedly scheduled {len(new_tasks)} keyspace_rf_change task(s) "
+        f"for {ks} after adding r2 (task ids: {new_tasks})")
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info(f"ALTER {user_ks} to include r2 -- auto-RF must now add r2 to audit")
+    await cql.run_async(
+        f"ALTER KEYSPACE {user_ks} WITH replication = "
+        f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2']}}")
+    await wait_for_rf_change_task(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=0)
+
+    await cql.run_async(f"DROP KEYSPACE {user_ks}")
+
+
+@pytest.mark.asyncio
+async def test_auto_rf_expansion_gated_by_user_dc(manager: ManagerClient):
+    """
+    Same gating rule, but at the DC dimension: auto-RF must not add a new DC
+    to audit's replication options until some non-auto-RF tablets keyspace
+    has data in that DC.
+    """
+    ks = AUDIT_KS
+    tables = AUDIT_TABLES
+    cfg_audit = {"audit": "table"}
+
+    logger.info("Start cluster with 1 node in dc1/r1, audit enabled")
+    servers = []
+    host_to_dc_rack = {}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
+    cql = manager.get_cql()
+    server0 = servers[0]
+
+    logger.info("Create a user tablets keyspace restricted to dc1:['r1']")
+    user_ks = await create_new_test_keyspace(
+        cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['r1']}")
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info("Add a node in a brand-new dc2/r1 -- auto-RF must NOT schedule any task for audit")
+    before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc2", "rack": "r1"}, cfg_audit)
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await asyncio.sleep(5)
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    new_tasks = after_tasks - before_tasks
+    assert not new_tasks, (
+        f"auto-RF unexpectedly scheduled {len(new_tasks)} keyspace_rf_change task(s) "
+        f"for {ks} after adding a node in dc2 (task ids: {new_tasks})")
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info(f"ALTER {user_ks} to include dc2 -- auto-RF must now add dc2 to audit")
+    await cql.run_async(
+        f"ALTER KEYSPACE {user_ks} WITH replication = "
+        f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1'], 'dc2': ['r1']}}")
+    await wait_for_rf_change_task(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables,
+                        {'dc1': ['r1'], 'dc2': ['r1']}, timeout=0)
+
+    await cql.run_async(f"DROP KEYSPACE {user_ks}")
+
+
+@pytest.mark.asyncio
+async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: ManagerClient):
+    """
+    If a non-auto-RF tablets keyspace uses a numeric RF (e.g. dc1: 1), then
+    all racks in that DC are considered eligible for auto-RF expansion,
+    because numeric-RF replicas may live on any rack.
+
+    Verify that adding a new rack in such a setup *does* cause auto-RF to
+    expand audit to the new rack (contrasting with the rack-list test above).
+    """
+    ks = AUDIT_KS
+    tables = AUDIT_TABLES
+    cfg_audit = {"audit": "table"}
+
+    logger.info("Start cluster with 1 node in dc1/r1, audit enabled")
+    servers = []
+    host_to_dc_rack = {}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
+    cql = manager.get_cql()
+    server0 = servers[0]
+
+    logger.info("Create a user tablets keyspace with numeric RF (dc1: 1)")
+    user_ks = await create_new_test_keyspace(
+        cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1}")
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info("Add a node in dc1/r2 -- all racks are eligible, so audit must expand to r2")
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
+    await wait_for_rf_change_task(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=0)
+
+    await cql.run_async(f"DROP KEYSPACE {user_ks}")
+
+
+@pytest.mark.asyncio
+async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: ManagerClient):
+    """
+    Regression test for the chicken-and-egg case: when there is no
+    non-auto-RF tablets keyspace in the cluster at all, auto-RF has nothing
+    to anchor expansion on, so audit/system_traces must stay at their
+    initial numeric RF=1 even as additional racks and DCs are added.
+
+    This test codifies the current (intentional) behavior; if we ever
+    decide to fall back to "all racks eligible" when no such keyspace
+    exists, this test should be updated accordingly.
+    """
+    ks = AUDIT_KS
+    cfg_audit = {"audit": "table"}
+
+    logger.info("Start cluster with multiple racks across two DCs, audit enabled, no user tablet keyspace")
+    servers = []
+    host_to_dc_rack = {}
+    await add_servers_and_update_map(
+        manager, servers, host_to_dc_rack, 4,
+        [{"dc": "dc1", "rack": "r1"},
+         {"dc": "dc1", "rack": "r2"},
+         {"dc": "dc2", "rack": "r1"},
+         {"dc": "dc2", "rack": "r2"}],
+        cfg_audit)
+    cql = manager.get_cql()
+    server0 = servers[0]
+
+    logger.info("Wait for audit keyspace to appear")
+    async def wait_audit_exists():
+        deadline = time.time() + 60
+        while time.time() < deadline:
+            rows = await cql.run_async(
+                f"SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+            if len(rows) == 1:
+                return
+            await asyncio.sleep(1)
+        raise AssertionError(f"audit keyspace did not appear within 60s")
+    await wait_audit_exists()
+
+    logger.info("Wait for the coordinator to settle, then assert no RF change task ran for audit")
+    before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    # Wait until nothing is pending/running; this returns immediately if the
+    # coordinator correctly decided not to schedule anything.
+    new_completed = await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    # Give the coordinator additional iterations and recheck.
+    await asyncio.sleep(10)
+    new_completed += await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    new_tasks = after_tasks - before_tasks
+    assert not new_tasks, (
+        f"Without any non-auto-RF tablet keyspace, auto-RF should not schedule "
+        f"any task for {ks}, but observed {len(new_tasks)} new task(s): {new_tasks}")
+
+    rows = await cql.run_async(
+        f"SELECT replication, replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+    assert len(rows) == 1
+    replication = parse_replication_options(rows[0].replication_v2 or rows[0].replication)
+    replication.pop('class', None)
+    assert replication == {'dc1': '1'}, (
+        f"Auto-RF unexpectedly modified {ks} replication: got {replication}. "
+        f"Without any non-auto-RF tablet keyspace, no rack should be eligible.")
