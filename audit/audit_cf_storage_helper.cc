@@ -111,7 +111,8 @@ future<> audit_cf_storage_helper::start(const db::config &cfg) {
             std::optional<unsigned int> initial_tablets;
             std::optional<db::tablet_options> per_table_tablet_options;
             auto rf = std::to_string(RF_GOAL_PER_DC);
-            if (_qp.db().features().auto_replication_factor) {
+            auto use_vnodes = utils::get_local_injector().enter("auto_rf_keyspaces_use_vnodes");
+            if (_qp.db().features().auto_replication_factor && !use_vnodes) {
                 initial_tablets.emplace(0);
                 auto& options = per_table_tablet_options.emplace();
                 options.min_per_shard_tablet_count = 1;
