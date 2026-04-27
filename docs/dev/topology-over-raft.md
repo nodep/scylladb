@@ -274,6 +274,8 @@ globally driven by the topology change coordinator and serialized per-tablet. Tr
 
 - repair - tablet replicas are repaired
 
+- restore - tablet replicas download SSTables from object storage during cluster-wide backup restore
+
 Each tablet has its own state machine for keeping state of transition stored in group0 which is part of the tablet state. It involves
 these properties of a tablet:
 
@@ -389,6 +391,9 @@ stateDiagram-v2
 ```
 
 The repair tablet transition kind is different. It transits only to the repair and end_repair stage because no token ownership is changed.
+
+The restore tablet transition kind is also simple. It uses a single `restore` stage and does not change token
+ownership. See the [Tablet-aware restore](#tablet-aware-restore) section below for details.
 
 The behavioral difference between "migration" and "intranode_migration" transitions is in the way "streaming" stage
 is performed. In case of intra-node migration, streaming is done by fast duplication of data by creating hard links to
@@ -984,3 +989,18 @@ Losing a committed entry can be observed by external systems. For example, the l
 schema version in the cluster can go back in time from the driver's perspective. This
 is outside the scope of the recovery procedure, though, and it shouldn't cause
 problems in practice.
+
+# Tablet restore transition
+
+The `restore` tablet transition kind is used by the tablet-aware restore to download SSTables
+from object storage. The transition contains `restore_config` with snapshot name, endpoint and
+bucket.
+
+Like `repair`, the `restore` transition does not change token ownership — replicas remain intact.
+The topology coordinator processes a tablet in this stage by calling the `RESTORE_TABLET` RPC on
+all tablet replicas. Each replica then downloads and attaches the SSTables that are contained in
+the tablet's token range. If the operation succeeds or fails, the transition is cleared and the
+failure to download SSTables is propagated back to user by the API handler itself.
+
+Restore transitions are serialized per-tablet like any other transition (invariant [INV-TABL-2]),
+so they do not run concurrently with migrations or repairs on the same tablet.
