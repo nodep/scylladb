@@ -50,10 +50,27 @@ async def test_raft_recovery_user_data(manager: ManagerClient, remove_dead_nodes
     rf_rack_cfg = {'rf_rack_valid_keyspaces': False}
     # Workaround for flakiness from https://github.com/scylladb/scylladb/issues/23565.
     hints_cfg = {'hinted_handoff_enabled': False}
+    # Disable auto-RF for system tablet keyspaces (system_traces, audit). After commits
+    # d2cc78f1a8 and d274616c6e those keyspaces use NetworkTopologyStrategy + auto-RF,
+    # so the topology coordinator grows their RF in every DC to a goal of 3. Later in
+    # the test we kill all nodes in dc2 and remove them from topology; if those system
+    # keyspaces still have a non-zero RF in dc2, removenode rejects the operation
+    # ("zero replica after the removal" / RF-rack-invalid validation).
+    #
+    # We don't fix this by ALTERing the system keyspaces' RF down to 0 in dc2 because
+    # auto-RF runs concurrently with the test: at the moment we'd want to issue the
+    # ALTER, the current RF is unknown (e.g. it might be 2 in the middle of being
+    # ramped up to 3) and racing with the coordinator's own RF change makes our ALTER
+    # fail (only RF changes of 1 per ALTER are allowed for tablet keyspaces, and only
+    # one in-flight RF change at a time). The `auto_rf_keyspaces_use_vnodes` injection
+    # makes auto-RF-managed system keyspaces use vnodes instead of tablets, so they
+    # don't take part in tablet topology validation and dc2 removal proceeds without
+    # further intervention.
+    auto_rf_cfg = {'error_injections_at_startup': ['auto_rf_keyspaces_use_vnodes']}
     cfg = {
         'endpoint_snitch': 'GossipingPropertyFileSnitch',
         'tablets_mode_for_new_keyspaces': 'enabled',
-    } | rf_rack_cfg | hints_cfg
+    } | rf_rack_cfg | hints_cfg | auto_rf_cfg
 
     property_file_dc1 = {'dc': 'dc1', 'rack': 'rack1'}
     property_file_dc2 = {'dc': 'dc2', 'rack': 'rack2'}
