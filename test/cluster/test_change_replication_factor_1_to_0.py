@@ -101,6 +101,9 @@ async def test_change_replication_factor_1_to_0_and_decommission(request: pytest
         # dc1 = 0 -> remove me from said dc
         await cql.run_async(f"alter keyspace {ks} with replication = {{'class': 'NetworkTopologyStrategy', 'dc0': 1, 'dc1': 0}}")
 
+        for sys_ks in ("system_traces", "audit"):
+            await cql.run_async(f"alter keyspace {sys_ks} with replication = {{'class': 'NetworkTopologyStrategy', 'dc0': 1, 'dc1': 0}}")
+
         logger.info(f"Decommissioning node {srvs[1]}")
 
         # decommission dc1
