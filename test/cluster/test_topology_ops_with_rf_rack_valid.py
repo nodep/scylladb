@@ -73,7 +73,7 @@ async def test_remove_node_violating_rf_rack(manager: ManagerClient, enforce: bo
     When enforce=True: Second node removal should be rejected with an error
     When enforce=False: Second node removal should succeed but with a warning log
     """
-    cfg = {'rf_rack_valid_keyspaces': enforce, 'error_injections_at_startup': [{'name': 'suppress_features', 'value': 'RACK_LIST_RF'}]}
+    cfg = {'rf_rack_valid_keyspaces': enforce, 'error_injections_at_startup': [{'name': 'suppress_features', 'value': 'RACK_LIST_RF'}, 'auto_rf_keyspaces_use_vnodes']}
     cmdline = ['--logger-log-level', 'tablets=debug', '--logger-log-level', 'raft_topology=debug']
 
     async def remove_node(server_id: str, expected_error: str = None):
