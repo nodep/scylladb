@@ -12,13 +12,14 @@ from cassandra.protocol import InvalidRequest, WriteTimeout
 from cassandra import Unauthorized
 
 from test.cluster.lwt.lwt_common import wait_for_tablet_count
-from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver, FeatureConfig
+from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver, \
+    FeatureConfig, get_topology_coordinator
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
-from test.pylib.util import wait_for_cql_and_get_hosts
+from test.pylib.util import wait_for_cql_and_get_hosts, wait_for, get_available_host
 from test.pylib.internal_types import ServerInfo
 from test.pylib.tablets import get_all_tablet_replicas
 from test.pylib.scylla_cluster import ReplaceConfig
-from test.pylib.rest_client import inject_error_one_shot
+from test.pylib.rest_client import inject_error_one_shot, read_barrier
 
 import pytest
 import asyncio
@@ -407,7 +408,8 @@ async def test_lwt_state_is_preserved_on_tablet_rebuild(manager: ScyllaClusterMa
         logs = []
         for s in servers:
             logs.append(await manager.server_open_log(s.server_id))
-        assert sum([len(await log.grep('Initiating repair phase of tablet rebuild')) for log in logs]) == 1
+        table_id = await manager.get_table_or_view_id(ks, 'test')
+        assert sum([len(await log.grep(f'Initiating repair phase of tablet rebuild.*{table_id}')) for log in logs]) == 1
 
         # Step 5. Do the SERIAL (paxos) read of c from {n3, n4}.
         await set_injection([servers[1]], 'paxos_error_before_save_promise')
@@ -496,7 +498,11 @@ async def test_lwt_timeout_while_creating_paxos_state_table(manager: ScyllaClust
                              manager.server_stop_gracefully(servers[2].server_id))
 
         logger.info(f"Running an LWT with timeout {timeout}")
-        with pytest.raises(Exception, match="raft operation \\[read_barrier\\] timed out, there is no raft quorum"):
+        # Which stage of the group0 operation trips the timeout depends on what else the
+        # node has in flight: the read barrier when the operation runs alone, the group0
+        # operation mutex when it has to queue behind one that cannot commit. Both report
+        # the same reason, which is what this test is about.
+        with pytest.raises(Exception, match=r"raft operation \[[^\]]*\] timed out, there is no raft quorum"):
             await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (1, 1) IF NOT EXISTS")
 
         logger.info("Start the second and third nodes")
@@ -652,6 +658,42 @@ async def test_lwt_coordinator_shard(manager: ScyllaClusterManager, storage_conf
         assert "shard 1" in matches[0][0]
 
 
+async def wait_for_auto_rf_settled(manager, deadline: float) -> None:
+    """Wait until auto-RF has completed all pending replication changes.
+
+    Auto-RF may schedule keyspace_rf_change operations after a user tablet
+    keyspace is created (or altered) in a cluster with multiple racks. These
+    operations advance the topology fence_version and preempt tablet
+    balancing. Tests sensitive to topology stability should call this after
+    creating their test keyspace/table to ensure auto-RF has finished its work.
+
+    Waits until:
+    - needs_auto_rf_change is not set in system.topology
+    - No keyspace_rf_change transition is in progress
+      (transition_state is null or unrelated to RF change)
+    """
+    cql = manager.get_cql()
+    servers = await manager.running_servers()
+
+    async def settled():
+        host = await get_available_host(cql, deadline)
+        await read_barrier(manager.api, servers[0].ip_addr)
+        rows = await cql.run_async(
+            "SELECT needs_auto_rf_change, transition_state "
+            "FROM system.topology WHERE key = 'topology'",
+            host=host)
+        if not rows:
+            return None
+        row = rows[0]
+        if row.needs_auto_rf_change:
+            return None
+        if row.transition_state in ('write_both_read_old', 'write_both_read_new'):
+            return None
+        return True
+
+    await wait_for(settled, deadline, period=0.5, label="auto_rf_settled")
+
+
 @pytest.mark.skip_mode(mode='debug', reason='dev is enought: the test checks non-critical functionality')
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_error_message_for_timeout_due_to_write_uncertainty(manager: ScyllaClusterManager,
@@ -680,12 +722,21 @@ async def test_error_message_for_timeout_due_to_write_uncertainty(manager: Scyll
     servers = await manager.servers_add(3, config=cfg, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
+    # Disable tablet balancing until #29767 is merged. This is needed because the balancer issues
+    # migrations to balance the tablets of the system tables and the user table.
+    # After #29767 is merged, quiesce_topology() will wait until the tablets are balanced.
+    await manager.disable_tablet_balancing()
+
     logger.info("Create a keyspace")
     keyspace_opts = storage_config.get_keyspace_opts(
         "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}")
     async with new_test_keyspace(manager, keyspace_opts) as ks:
         logger.info("Create a table")
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        # Wait for auto-rf to replicate the system tablets to all the racks
+        await wait_for_auto_rf_settled(manager, time.time() + 120)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
 
         # accept on the first node returns an error
         logger.info("Inject paxos_error_before_save_proposal")
@@ -741,12 +792,52 @@ async def test_no_uncertainty_for_reads(manager: ScyllaClusterManager, storage_c
     servers = await manager.servers_add(3, config=cfg, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
+    # After commits d2cc78f1a8 (system_traces) and d274616c6e (audit) those system
+    # keyspaces use tablets + auto-RF. Auto-RF kicks in once tablets actually exist
+    # in the racks (i.e. once the test creates its tablet keyspace+table below) and
+    # then issues a sequence of single-step ALTERs to grow per-DC RF toward the
+    # goal (3 for audit, 2 for system_traces). Each ALTER triggers tablet
+    # placement on the newly added rack by the load balancer, and the load
+    # balancer also wakes up periodically (~1s) and produces additional waves of
+    # fence-version bumps for some time after auto-RF has stopped scheduling.
+    #
+    # The SERIAL read below is fenced by the topology version: any replica
+    # response that arrives after the coordinator has moved to a newer fence is
+    # rejected with "stale topology exception, caller version N, callee fence
+    # version M". The LWT counts that as a replica failure and -- combined with
+    # the second replica we deliberately fail via paxos_error_before_save_proposal
+    # -- the read crosses the failure threshold and the test fails with
+    # ReadFailure for reasons unrelated to LWT correctness.
+    #
+    # We deliberately do NOT use the auto_rf_keyspaces_use_vnodes injection here,
+    # because we want the test to exercise the production setup (tablets + auto-RF
+    # for system_traces/audit). Instead, before triggering auto-RF we disable
+    # background tablet balancing, so the post-auto-RF load-balancer ticks that
+    # would otherwise keep bumping fences during the LWT do not happen. Auto-RF
+    # itself still runs, schedules its ALTERs, and the resulting tablet placement
+    # is performed as part of those topology operations (disable_tablet_balancing
+    # only stops *background* rebalancing, not migrations driven by topology
+    # operations). After we observe that auto-RF has actually started scheduling
+    # ("Scheduling auto RF change for keyspace"), we wait for the topology to
+    # quiesce so the fence version is stable for the duration of the LWT.
+    coord_host = await get_topology_coordinator(manager)
+    coord_srv = await manager.find_server_by_host_id(servers, coord_host)
+    coord_log = await manager.server_open_log(coord_srv.server_id)
+    await manager.disable_tablet_balancing()
+
     logger.info("Create a keyspace")
     keyspace_opts = storage_config.get_keyspace_opts(
         "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}")
     async with new_test_keyspace(manager, keyspace_opts) as ks:
         logger.info("Create a table")
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        # Wait for auto-rf to replicate the system tablets to all the racks
+        await wait_for_auto_rf_settled(manager, time.time() + 120)
+        await manager.api.quiesce_topology(servers[0].ip_addr)
+
+        await coord_log.wait_for("Scheduling auto RF change for keyspace")
+        await manager.api.quiesce_topology(coord_srv.ip_addr)
 
         # accept on the first node returns an error
         logger.info("Inject paxos_error_before_save_proposal")
