@@ -12,7 +12,8 @@ from cassandra.protocol import InvalidRequest, WriteTimeout
 from cassandra import Unauthorized
 
 from test.cluster.lwt.lwt_common import wait_for_tablet_count
-from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver
+from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver, \
+    get_topology_coordinator, find_server_by_host_id
 from test.pylib.manager_client import ManagerClient
 from test.pylib.util import wait_for_cql_and_get_hosts
 from test.pylib.internal_types import ServerInfo
@@ -720,10 +721,46 @@ async def test_no_uncertainty_for_reads(manager: ManagerClient):
     servers = await manager.servers_add(3, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
+    # After commits d2cc78f1a8 (system_traces) and d274616c6e (audit) those system
+    # keyspaces use tablets + auto-RF. Auto-RF kicks in once tablets actually exist
+    # in the racks (i.e. once the test creates its tablet keyspace+table below) and
+    # then issues a sequence of single-step ALTERs to grow per-DC RF toward the
+    # goal (3 for audit, 2 for system_traces). Each ALTER triggers tablet
+    # placement on the newly added rack by the load balancer, and the load
+    # balancer also wakes up periodically (~1s) and produces additional waves of
+    # fence-version bumps for some time after auto-RF has stopped scheduling.
+    #
+    # The SERIAL read below is fenced by the topology version: any replica
+    # response that arrives after the coordinator has moved to a newer fence is
+    # rejected with "stale topology exception, caller version N, callee fence
+    # version M". The LWT counts that as a replica failure and -- combined with
+    # the second replica we deliberately fail via paxos_error_before_save_proposal
+    # -- the read crosses the failure threshold and the test fails with
+    # ReadFailure for reasons unrelated to LWT correctness.
+    #
+    # We deliberately do NOT use the auto_rf_keyspaces_use_vnodes injection here,
+    # because we want the test to exercise the production setup (tablets + auto-RF
+    # for system_traces/audit). Instead, before triggering auto-RF we disable
+    # background tablet balancing, so the post-auto-RF load-balancer ticks that
+    # would otherwise keep bumping fences during the LWT do not happen. Auto-RF
+    # itself still runs, schedules its ALTERs, and the resulting tablet placement
+    # is performed as part of those topology operations (disable_tablet_balancing
+    # only stops *background* rebalancing, not migrations driven by topology
+    # operations). After we observe that auto-RF has actually started scheduling
+    # ("Scheduling auto RF change for keyspace"), we wait for the topology to
+    # quiesce so the fence version is stable for the duration of the LWT.
+    coord_host = await get_topology_coordinator(manager)
+    coord_srv = await find_server_by_host_id(manager, servers, coord_host)
+    coord_log = await manager.server_open_log(coord_srv.server_id)
+    await manager.disable_tablet_balancing()
+
     logger.info("Create a keyspace")
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}") as ks:
         logger.info("Create a table")
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
+
+        await coord_log.wait_for("Scheduling auto RF change for keyspace")
+        await manager.api.quiesce_topology(coord_srv.ip_addr)
 
         # accept on the first node returns an error
         logger.info("Inject paxos_error_before_save_proposal")
