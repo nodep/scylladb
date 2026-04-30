@@ -726,6 +726,18 @@ database::setup_metrics() {
             sm::description("Number of large partitions exceeding compaction_large_partition_warning_threshold_mb. "
                 "Large partitions have performance impact and should be avoided, check the documentation for details.")),
 
+        sm::make_counter("large_rows_exceeding_threshold", [this] { return _large_data_handler->stats().rows_bigger_than_threshold; },
+            sm::description("Number of large rows exceeding compaction_large_row_warning_threshold_mb. "
+                "Large rows have performance impact and should be avoided, check the documentation for details.")),
+
+        sm::make_counter("large_cell_exceeding_threshold", [this] { return _large_data_handler->stats().cells_bigger_than_threshold; },
+            sm::description("Number of large cells exceeding compaction_large_cell_warning_threshold_mb. "
+                "Large cells have performance impact and should be avoided, check the documentation for details.")),
+
+        sm::make_counter("large_collection_exceeding_threshold", [this] { return _large_data_handler->stats().collections_bigger_than_threshold; },
+            sm::description("Number of large collections exceeding compaction_collection_elements_count_warning_threshold. "
+                "Large collections have performance impact and should be avoided, check the documentation for details.")),
+
         sm::make_total_operations("total_view_updates_pushed_local", _cf_stats.total_view_updates_pushed_local,
                 sm::description("Total number of view updates generated for tables and applied locally."))(basic_level),
 
