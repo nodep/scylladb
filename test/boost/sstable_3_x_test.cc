@@ -5939,3 +5939,106 @@ SEASTAR_TEST_CASE(test_alter_compression_during_write) {
         assertions.produces_end_of_stream();
     });
 }
+
+SEASTAR_THREAD_TEST_CASE(test_large_data_stats_large_rows) {
+    simple_schema s;
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto pk = s.make_pkey();
+    mutation m(s.schema(), pk);
+    auto ck1 = s.make_ckey("ck1");
+    s.add_row(m, ck1, "foo");
+    auto ck2 = s.make_ckey("ck2");
+    s.add_row(m, ck2, "a_long_value_exceeding_threshold");
+    auto ck3 = s.make_ckey("ck3");
+    s.add_row(m, ck3, "another_long_value_exceeding_threshold");
+
+    auto sc = s.schema();
+    auto mt = make_memtable(sc, {m}).get();
+
+    for (auto version : writable_sstable_versions) {
+        large_data_test_handler handler(std::numeric_limits<uint64_t>::max(), 21,
+            std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max());
+
+        BOOST_REQUIRE_EQUAL(handler.stats().rows_bigger_than_threshold, 0);
+
+        sstables::test_env::do_with_async([&] (auto& env) {
+            auto sst = env.make_sstable(sc, version);
+            sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()),
+                1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        }, { &handler }).get();
+
+        BOOST_REQUIRE_GE(handler.stats().rows_bigger_than_threshold, 2);
+        BOOST_REQUIRE_EQUAL(handler.stats().partitions_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().cells_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().collections_bigger_than_threshold, 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_data_stats_large_cells) {
+    simple_schema s;
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto pk = s.make_pkey();
+    mutation m(s.schema(), pk);
+    auto ck1 = s.make_ckey("ck1");
+    s.add_row(m, ck1, "foo");
+    auto ck2 = s.make_ckey("ck2");
+    s.add_row(m, ck2, "foo bar baz");
+
+    auto sc = s.schema();
+    auto mt = make_memtable(sc, {m}).get();
+
+    for (auto version : writable_sstable_versions) {
+        large_data_test_handler handler(std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max(), 5,
+            std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max());
+
+        BOOST_REQUIRE_EQUAL(handler.stats().cells_bigger_than_threshold, 0);
+
+        sstables::test_env::do_with_async([&] (auto& env) {
+            auto sst = env.make_sstable(sc, version);
+            sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()),
+                1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        }, { &handler }).get();
+
+        BOOST_REQUIRE_GT(handler.stats().cells_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().partitions_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().rows_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().collections_bigger_than_threshold, 0);
+    }
+}
+
+SEASTAR_THREAD_TEST_CASE(test_large_data_stats_large_collections) {
+    simple_schema s(simple_schema::with_static::no, simple_schema::with_collection::yes);
+    tests::reader_concurrency_semaphore_wrapper semaphore;
+    auto pk = s.make_pkey();
+    mutation m(s.schema(), pk);
+
+    std::map<bytes, bytes> kv_map;
+    for (int i = 0; i < 15; i++) {
+        kv_map[to_bytes(format("key{}", i))] = to_bytes(format("val{}", i));
+    }
+    s.add_row_with_collection(m, s.make_ckey("ck1"), kv_map);
+
+    auto sc = s.schema();
+    auto mt = make_memtable(sc, {m}).get();
+
+    for (auto version : writable_sstable_versions) {
+        large_data_test_handler handler(std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max(), std::numeric_limits<uint64_t>::max(),
+            std::numeric_limits<uint64_t>::max(), 10);
+
+        BOOST_REQUIRE_EQUAL(handler.stats().collections_bigger_than_threshold, 0);
+
+        sstables::test_env::do_with_async([&] (auto& env) {
+            auto sst = env.make_sstable(sc, version);
+            sst->write_components(mt->make_mutation_reader(sc, semaphore.make_permit()),
+                1, sc, env.manager().configure_writer("test"), encoding_stats{}).get();
+        }, { &handler }).get();
+
+        BOOST_REQUIRE_GT(handler.stats().collections_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().cells_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().partitions_bigger_than_threshold, 0);
+        BOOST_REQUIRE_EQUAL(handler.stats().rows_bigger_than_threshold, 0);
+    }
+}
