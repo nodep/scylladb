@@ -1748,7 +1748,8 @@ public:
     }
 
     virtual future<uint64_t> size(void) override {
-        return _client->get_object_size(_object_name);
+        co_await maybe_update_stats();
+        co_return _stats->size;
     }
 
     virtual future<struct stat> stat(void) override {
