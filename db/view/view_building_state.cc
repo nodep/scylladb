@@ -8,6 +8,7 @@
  */
 
 #include "db/view/view_building_state.hh"
+#include "utils/UUID_gen.hh"
 
 namespace db {
 
@@ -22,9 +23,10 @@ view_building_task::view_building_task(utils::UUID id, task_type type, bool abor
         , replica(replica)
         , last_token(last_token) {}
 
-view_building_state::view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table)
+view_building_state::view_building_state(building_tasks tasks_state, std::optional<table_id> processed_base_table, std::optional<utils::UUID> min_alive_uuid)
         : tasks_state(std::move(tasks_state))
-        , currently_processed_base_table(std::move(processed_base_table)) {}
+        , currently_processed_base_table(std::move(processed_base_table))
+        , min_alive_uuid(std::move(min_alive_uuid)) {}
 
 views_state::views_state(std::map<table_id, std::vector<table_id>> views_per_base, view_build_status_map status_map)
         : views_per_base(std::move(views_per_base))
@@ -125,6 +127,24 @@ std::map<dht::token, std::vector<view_building_task>> view_building_state::colle
         tasks[task.last_token].push_back(task);
     }
     return tasks;
+}
+
+task_uuid_generator::task_uuid_generator(api::timestamp_type base_ts)
+        : _next_ts(base_ts) {}
+
+utils::UUID task_uuid_generator::operator()() {
+    return utils::UUID_gen::get_random_time_UUID_from_micros(
+            std::chrono::microseconds{_next_ts++});
+}
+
+task_uuid_generator view_building_state::make_task_uuid_generator(api::timestamp_type ts) const {
+    if (min_alive_uuid) {
+        auto lower_bound = utils::UUID_gen::micros_timestamp(*min_alive_uuid);
+        if (ts <= lower_bound) {
+            ts = lower_bound + 1;
+        }
+    }
+    return task_uuid_generator{ts};
 }
 
 }

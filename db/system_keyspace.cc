@@ -1310,6 +1310,7 @@ schema_ptr system_keyspace::view_building_tasks() {
         return schema_builder(NAME, VIEW_BUILDING_TASKS, std::make_optional(id))
                 .with_column("key", utf8_type, column_kind::partition_key)
                 .with_column("id", timeuuid_type, column_kind::clustering_key)
+                .with_column("min_task_id", timeuuid_type, column_kind::static_column)
                 .with_column("type", utf8_type)
                 .with_column("aborted", boolean_type)
                 .with_column("base_id", uuid_type)
@@ -2750,12 +2751,36 @@ future<mutation> system_keyspace::make_remove_view_build_status_on_host_mutation
 
 static constexpr auto VIEW_BUILDING_KEY = "view_building";
 
-future<db::view::building_tasks> system_keyspace::get_view_building_tasks() {
-    static const sstring query = format("SELECT id, type, aborted, base_id, view_id, last_token, host_id, shard FROM {}.{} WHERE key = '{}'", NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+future<std::pair<db::view::building_tasks, std::optional<utils::UUID>>> system_keyspace::get_view_building_tasks() {
     using namespace db::view;
 
+    // When the VIEW_BUILDING_TASKS_MIN_TASK_ID feature is active, read the static
+    // column min_task_id first and use it as a lower bound for the clustering row
+    // scan. This skips tombstoned rows below the boundary, avoiding dead-cell
+    // warnings from the tombstone_warn_threshold check.
+    std::optional<utils::UUID> min_task_id;
+    if (_db.features().view_building_tasks_min_task_id) {
+        auto schema = view_building_tasks();
+        auto pk = partition_key::from_single_value(*schema, data_value(VIEW_BUILDING_KEY).serialize_nonnull());
+        auto dk = dht::decorate_key(*schema, pk);
+        auto col_id = schema->get_column_definition("min_task_id")->id;
+        query::partition_slice slice(
+            query::clustering_row_ranges{},
+            {col_id},
+            {},
+            query::partition_slice::option_set::of<query::partition_slice::option::always_return_static_content>());
+        auto cmd = query::read_command(schema->id(), schema->version(), slice,
+                _db.get_query_max_result_size(), query::tombstone_limit::max);
+        auto [qr, _cache_temp] = co_await _db.query(schema, cmd, query::result_options::only_result(),
+                {dht::partition_range::make_singular(dk)}, nullptr, db::no_timeout);
+        auto rs = query::result_set::from_raw_result(schema, slice, *qr);
+        if (!rs.empty()) {
+            min_task_id = rs.row(0).get<utils::UUID>("min_task_id");
+        }
+    }
+
     building_tasks tasks;
-    co_await _qp.query_internal(query, [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
+    auto process_row = [&] (const cql3::untyped_result_set_row& row) -> future<stop_iteration> {
         auto id = row.get_as<utils::UUID>("id");
         auto type = task_type_from_string(row.get_as<sstring>("type"));
         auto aborted = row.get_as<bool>("aborted");
@@ -2780,8 +2805,18 @@ future<db::view::building_tasks> system_keyspace::get_view_building_tasks() {
             break;
         }
         co_return stop_iteration::no;
-    });
-    co_return tasks;
+    };
+
+    if (min_task_id) {
+        static const sstring bounded_query = format("SELECT id, type, aborted, base_id, view_id, last_token, host_id, shard FROM {}.{} WHERE key = '{}' AND id >= ?",
+                NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+        co_await _qp.query_internal(bounded_query, db::consistency_level::LOCAL_ONE, {*min_task_id}, 1000, std::move(process_row));
+    } else {
+        static const sstring full_query = format("SELECT id, type, aborted, base_id, view_id, last_token, host_id, shard FROM {}.{} WHERE key = '{}'",
+                NAME, VIEW_BUILDING_TASKS, VIEW_BUILDING_KEY);
+        co_await _qp.query_internal(full_query, std::move(process_row));
+    }
+    co_return std::pair{std::move(tasks), std::move(min_task_id)};
 }
 
 future<mutation> system_keyspace::make_view_building_task_mutation(api::timestamp_type ts, const db::view::view_building_task& task) {

@@ -275,11 +275,12 @@ future<> view_building_worker::create_staging_sstable_tasks() {
 
     utils::chunked_vector<canonical_mutation> cmuts;
     auto guard = co_await _group0.client().start_operation(_as);
+    auto uuid_gen = _vb_state_machine.building_state.make_task_uuid_generator(guard.write_timestamp());
     auto my_host_id = _db.get_token_metadata().get_topology().my_host_id();
     for (auto& [table_id, sst_infos]: _sstables_to_register) {
         for (auto& sst_info: sst_infos) {
             view_building_task task {
-                utils::UUID_gen::get_time_UUID(), view_building_task::task_type::process_staging, false,
+                uuid_gen(), view_building_task::task_type::process_staging, false,
                 table_id, ::table_id{}, {my_host_id, sst_info.shard}, sst_info.last_token
             };
             auto mut = co_await _sys_ks.make_view_building_task_mutation(guard.write_timestamp(), task);

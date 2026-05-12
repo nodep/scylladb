@@ -793,16 +793,18 @@ static future<> add_view_building_tasks_mutations(storage_proxy& sp, view_ptr vi
 
     auto& db = sp.local_db();
     auto& sys_ks = sp.system_keyspace();
+    auto& vb_sm = sp.view_building_state_machine();
 
     auto base_id = view->view_info()->base_id();
     auto& base_cf = db.find_column_family(base_id);
     auto erm = base_cf.get_effective_replication_map();
     auto& tablet_map = erm->get_token_metadata().tablets().get_tablet_map(base_id);
+    auto uuid_gen = vb_sm.building_state.make_task_uuid_generator(ts);
 
     co_await tablet_map.for_each_tablet([&] (auto tid, const auto& tablet_info) -> future<> {
         auto last_token = tablet_map.get_last_token(tid);
         for (auto& replica: tablet_info.replicas) {
-            auto id = utils::UUID_gen::get_time_UUID();
+            auto id = uuid_gen();
             view_building_task task {
                 id, view_building_task::task_type::build_range, false,
                 base_id, view->id(), replica, last_token

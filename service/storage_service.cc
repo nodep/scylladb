@@ -806,7 +806,7 @@ future<> storage_service::view_building_state_load() {
     };
 
 
-    auto vb_tasks = co_await _sys_ks.local().get_view_building_tasks();
+    auto [vb_tasks, min_alive_uuid] = co_await _sys_ks.local().get_view_building_tasks();
     auto processing_base_table = co_await _sys_ks.local().get_view_building_processing_base_id();
 
     std::map<table_id, std::vector<table_id>> views_per_base;
@@ -825,7 +825,7 @@ future<> storage_service::view_building_state_load() {
         })
         | std::ranges::to<db::view::views_state::view_build_status_map>();
 
-    db::view::view_building_state building_state {std::move(vb_tasks), std::move(processing_base_table)};
+    db::view::view_building_state building_state {std::move(vb_tasks), std::move(processing_base_table), std::move(min_alive_uuid)};
     db::view::views_state views_state {std::move(views_per_base), std::move(status_map)};
 
     _view_building_state_machine.building_state = std::move(building_state);

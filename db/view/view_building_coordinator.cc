@@ -11,6 +11,7 @@
 #include <exception>
 #include <ranges>
 #include <seastar/core/abort_source.hh>
+#include <seastar/coroutine/maybe_yield.hh>
 #include <seastar/coroutine/parallel_for_each.hh>
 #include <seastar/core/on_internal_error.hh>
 #include "db/view/view_building_coordinator.hh"
@@ -179,7 +180,10 @@ future<> view_building_coordinator::clean_finished_tasks() {
         co_return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
+
+    // Collect tasks eligible for deletion: must still be in state and not aborted.
+    std::vector<utils::UUID> tasks_to_delete;
     for (auto& [replica, tasks]: _finished_tasks) {
         for (auto& task_id: tasks) {
             // The task might be aborted in the meantime. In this case we cannot remove it because we need it to create a new task.
@@ -189,15 +193,65 @@ future<> view_building_coordinator::clean_finished_tasks() {
             //       If yes, we can just remove it instead of aborting it.
             auto task_opt = _vb_sm.building_state.get_task(*_vb_sm.building_state.currently_processed_base_table, replica, task_id);
             if (task_opt && !task_opt->get().aborted) {
-                builder.del_task(task_id);
-                vbc_logger.debug("Removing finished task with ID: {}", task_id);
+                tasks_to_delete.push_back(task_id);
             }
         }
     }
 
-    co_await commit_mutations(std::move(guard), {builder.build()}, "remove finished view building tasks");
-    for (auto& [_, tasks_set]: _finished_tasks) {
-        tasks_set.clear();
+    if (!tasks_to_delete.empty()) {
+        // Find the minimum UUID (by timeuuid ordering) among tasks that are NOT being
+        // deleted — i.e., alive tasks that must remain in the table.
+        // Everything strictly below this boundary is safe to cover with one range tombstone.
+        const std::unordered_set<utils::UUID> to_delete_set(tasks_to_delete.begin(), tasks_to_delete.end());
+        std::optional<utils::UUID> min_alive_uuid;
+        for (auto& [base_id, base_tasks] : _vb_sm.building_state.tasks_state) {
+            for (auto& [replica, rep_tasks] : base_tasks) {
+                auto check = [&](const utils::UUID& id) {
+                    if (!to_delete_set.contains(id)
+                            && (!min_alive_uuid || timeuuid_tri_compare(id, *min_alive_uuid) < 0)) {
+                        min_alive_uuid = id;
+                    }
+                };
+                for (auto& [id, task] : rep_tasks.staging_tasks) {
+                    check(id);
+                }
+                for (auto& [view_id, task_m] : rep_tasks.view_tasks) {
+                    for (auto& [id, task] : task_m) {
+                        check(id);
+                    }
+                }
+                co_await coroutine::maybe_yield();
+            }
+        }
+
+        if (min_alive_uuid) {
+            vbc_logger.debug("Removing finished tasks before ID: {} using range tombstone", *min_alive_uuid);
+            builder.del_tasks_before(*min_alive_uuid);
+            for (auto& task_id : tasks_to_delete) {
+                // Tasks below min_alive_uuid are already covered by the range tombstone.
+                if (timeuuid_tri_compare(task_id, *min_alive_uuid) < 0) {
+                    continue;
+                }
+                vbc_logger.debug("Removing finished task with ID: {}", task_id);
+                builder.del_task(task_id);
+            }
+        } else {
+            // No alive tasks remain — one range tombstone covers everything.
+            vbc_logger.debug("No alive tasks remain, removing all finished tasks using range tombstone");
+            builder.del_all_tasks();
+        }
+
+        if (_db.features().view_building_tasks_min_task_id) {
+            // If min_alive_uuid == std::nullopt, set min_task_id to a fresh UUID,
+            // so future scans start past all the just-deleted rows (new tasks created
+            // later will have larger UUIDs).
+            builder.set_min_task_id(min_alive_uuid ? *min_alive_uuid : utils::UUID_gen::get_time_UUID());
+        }
+
+        co_await commit_mutations(std::move(guard), {builder.build()}, "remove finished view building tasks");
+        for (auto& [_, tasks_set]: _finished_tasks) {
+            tasks_set.clear();
+        }
     }
 }
 
@@ -533,7 +587,7 @@ void view_building_coordinator::generate_tablet_migration_updates(utils::chunked
     }
 
     auto last_token = tmap.get_last_token(gid.tablet);
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
 
     auto create_task_copy_on_pending_replica = [&] (const view_building_task& task) {
         auto new_id = builder.new_id();
@@ -601,7 +655,7 @@ void view_building_coordinator::generate_tablet_resize_updates(utils::chunked_ve
         return;
     }
     bool is_split = old_tmap.tablet_count() < new_tmap.tablet_count();
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
 
     auto create_task_copy = [&] (const view_building_task& task, dht::token last_token) -> utils::UUID {
         auto new_id = builder.new_id();
@@ -671,7 +725,7 @@ void view_building_coordinator::abort_tasks(utils::chunked_vector<canonical_muta
     }
     vbc_logger.debug("Generating abort mutations for tasks for table {}", table_id);
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto abort_task_map = [&] (const task_map& task_map) {
         for (auto& [id, _]: task_map) {
             vbc_logger.debug("Aborting task {}", id);
@@ -700,7 +754,7 @@ void abort_view_building_tasks(const view_building_state_machine& vb_sm,
     }
     vbc_logger.debug("Generating abort mutations for tasks for table {} on replica {} and last token {}", table_id, replica, last_token);
 
-    view_building_task_mutation_builder builder(write_timestamp);
+    view_building_task_mutation_builder builder(write_timestamp, vb_sm.building_state.make_task_uuid_generator(write_timestamp));
     auto abort_task_map = [&] (const task_map& task_map) {
         for (auto& [id, task]: task_map) {
             if (task.last_token == last_token) {
@@ -742,7 +796,7 @@ void view_building_coordinator::rollback_aborted_tasks(utils::chunked_vector<can
         return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto& base_tasks = _vb_sm.building_state.tasks_state.at(table_id);
     for (auto& [_, replica_tasks]: base_tasks) {
         for (auto& [_, building_task_map]: replica_tasks.view_tasks) {
@@ -759,7 +813,7 @@ void view_building_coordinator::rollback_aborted_tasks(utils::chunked_vector<can
         return;
     }
 
-    view_building_task_mutation_builder builder(guard.write_timestamp());
+    view_building_task_mutation_builder builder(guard.write_timestamp(), _vb_sm.building_state.make_task_uuid_generator(guard.write_timestamp()));
     auto& replica_tasks = _vb_sm.building_state.tasks_state.at(table_id).at(replica);
     for (auto& [_, building_task_map]: replica_tasks.view_tasks) {
         rollback_task_map(builder, building_task_map);
