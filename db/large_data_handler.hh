@@ -29,6 +29,9 @@ class large_data_handler {
 public:
     struct stats {
         int64_t partitions_bigger_than_threshold = 0; // number of large partition updates exceeding threshold_bytes
+        int64_t rows_bigger_than_threshold = 0; // number of large row updates exceeding row_threshold_bytes
+        int64_t cells_bigger_than_threshold = 0; // number of large cell updates exceeding cell_threshold_bytes
+        int64_t collections_bigger_than_threshold = 0; // number of large collection updates exceeding collection_elements_count_threshold
     };
 
 private:
@@ -82,6 +85,7 @@ public:
             const clustering_key_prefix* clustering_key, uint64_t row_size) {
         SCYLLA_ASSERT(running());
         if (row_size > _row_threshold_bytes) [[unlikely]] {
+            ++_stats.rows_bigger_than_threshold;
             return with_sem([&sst, &partition_key, clustering_key, row_size, this] {
                 return record_large_rows(sst, partition_key, clustering_key, row_size);
             }).then([] {
@@ -102,6 +106,8 @@ public:
             const clustering_key_prefix* clustering_key, const column_definition& cdef, uint64_t cell_size, uint64_t collection_elements) {
         SCYLLA_ASSERT(running());
         above_threshold_result above_threshold{.size = cell_size > _cell_threshold_bytes, .elements = collection_elements > _collection_elements_count_threshold};
+        _stats.cells_bigger_than_threshold += above_threshold.size;
+        _stats.collections_bigger_than_threshold += above_threshold.elements;
         if (above_threshold.size || above_threshold.elements) [[unlikely]] {
             return with_sem([&sst, &partition_key, clustering_key, &cdef, cell_size, collection_elements, this] {
                 return record_large_cells(sst, partition_key, clustering_key, cdef, cell_size, collection_elements);
