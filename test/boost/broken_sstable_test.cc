@@ -12,6 +12,7 @@
 
 #include "test/boost/sstable_test.hh"
 #include "test/lib/exception_utils.hh"
+#include "sstables/exceptions.hh"
 
 using namespace sstables;
 
@@ -30,6 +31,7 @@ struct my_consumer {
 static future<> broken_sst(sstring dir, sstables::generation_type::int_t generation, schema_ptr s, sstring msg, std::optional<sstring> sst_name,
     sstable_version_types version = la) {
   return sstables::test_env::do_with_async([=] (sstables::test_env& env) {
+    sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
     try {
         sstable_ptr sstp = env.reusable_sst(s, dir, generation, version).get();
         auto r = sstp->make_reader(s, env.make_reader_permit(), query::full_partition_range, s->full_slice());
@@ -55,6 +57,7 @@ static future<> broken_sst(sstring dir, sstables::generation_type::int_t generat
 
 SEASTAR_TEST_CASE(test_empty_index) {
   return sstables::test_env::do_with_async([&] (sstables::test_env& env) {
+    sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
     auto s = schema_builder("test_ks", "test_table")
                  .with_column("pk", int32_type, column_kind::partition_key)
                  .with_column("ck", int32_type, column_kind::clustering_key)

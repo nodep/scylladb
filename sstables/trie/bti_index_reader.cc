@@ -49,7 +49,7 @@ struct row_index_header_parser : public data_consumer::continuous_data_consumer<
     {}
     void verify_end_state() {
         if (!_finished) {
-            throw sstables::malformed_sstable_exception(fmt::format("row_index_header_parser: verify_end_state: not finished"));
+            throw_malformed_sstable_exception(fmt::format("row_index_header_parser: verify_end_state: not finished"));
         }
     }
     bool non_consuming() const {

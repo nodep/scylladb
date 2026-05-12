@@ -37,6 +37,7 @@
 #include "partition_slice_builder.hh"
 #include "sstables/sstable_mutation_reader.hh"
 #include "sstables/binary_search.hh"
+#include "sstables/exceptions.hh"
 
 #include <boost/range/combine.hpp>
 
@@ -869,7 +870,7 @@ BOOST_AUTO_TEST_CASE(test_parse_path_good) {
         }
     };
     for (auto& [path, expected_ks, expected_cf, expected_desc] : sstables) {
-        auto [desc, ks, cf] = parse_path(path);
+        auto [desc, ks, cf] = parse_path(path).value();
         BOOST_CHECK_EQUAL(ks, expected_ks);
         BOOST_CHECK_EQUAL(cf, expected_cf);
         BOOST_CHECK_EQUAL(expected_desc.generation, desc.generation);
@@ -902,7 +903,7 @@ BOOST_AUTO_TEST_CASE(test_parse_path_bad) {
         "/scylla/system/truncated~38c19fd0fb863310a4b70d0cc66628aa/mc-2-grand-Data.db",
     };
     for (auto path : paths) {
-        BOOST_CHECK_THROW(parse_path(path), std::exception);
+        BOOST_CHECK(!parse_path(path).has_value());
     }
 }
 
@@ -927,7 +928,7 @@ static future<> test_component_digest_persistence(component_type component, ssta
         BOOST_REQUIRE(has_component);
 
         auto toc_path = fmt::to_string(sst_original->toc_filename());
-        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
         auto dir_path = std::filesystem::path(toc_path).parent_path().string();
 
         std::optional<uint32_t> original_digest;
@@ -1035,6 +1036,7 @@ static void corrupt_sstable(sstables::shared_sstable sst, component_type compone
 
 static future<> test_component_digest_validation(component_type component, sstable::version_types version, sstring expected_message, compress_sstable compress = compress_sstable::no) {
     return test_env::do_with_async([component, version, expected_message = std::move(expected_message), compress] (test_env& env) mutable {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto random_spec = tests::make_random_schema_specification(
             "ks",
             std::uniform_int_distribution<size_t>(1, 4),
@@ -1052,7 +1054,7 @@ static future<> test_component_digest_validation(component_type component, sstab
         BOOST_REQUIRE(digest.has_value());
 
         auto toc_path = fmt::to_string(sst->toc_filename());
-        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name());
+        auto entry_desc = sstables::parse_path(toc_path, schema->ks_name(), schema->cf_name()).value();
         auto dir_path = std::filesystem::path(toc_path).parent_path().string();
 
         corrupt_sstable(sst, component);

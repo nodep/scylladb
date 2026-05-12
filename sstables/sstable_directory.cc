@@ -380,7 +380,10 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
         while (auto de = co_await lister.get()) {
             auto component_path = _directory / de->name;
             auto comps = sstables::parse_path(component_path, directory._schema->ks_name(), directory._schema->cf_name());
-            handle(std::move(comps), component_path);
+            if (!comps) {
+                throw_malformed_sstable_exception(comps.error());
+            }
+            handle(std::move(*comps), component_path);
         }
     }));
 
@@ -418,7 +421,7 @@ future<> sstable_directory::filesystem_components_lister::process(sstable_direct
     // log and proceed.
     for (auto& path : _state->generations_found | std::views::values) {
         if (flags.throw_on_missing_toc) {
-            throw sstables::malformed_sstable_exception(seastar::format("At directory: {}: no TOC found for SSTable {}!. Refusing to boot", _directory.native(), path.native()));
+            throw_malformed_sstable_exception(seastar::format("At directory: {}: no TOC found for SSTable {}!. Refusing to boot", _directory.native(), path.native()));
         } else {
             dirlog.info("Found incomplete SSTable {} at directory {}. Removing", path.native(), _directory.native());
             _state->files_for_removal.insert(path.native());
@@ -449,7 +452,11 @@ future<> sstable_directory::sstables_registry_components_lister::process(sstable
 future<> sstable_directory::restore_components_lister::process(sstable_directory& directory, process_flags flags) {
     co_await coroutine::parallel_for_each(_toc_filenames, [flags, &directory] (sstring toc_filename) -> future<> {
         std::filesystem::path sst_path{toc_filename};
-        entry_descriptor desc = sstables::parse_path(sst_path, "", "");
+        auto result = sstables::parse_path(sst_path, "", "");
+        if (!result) {
+            throw_malformed_sstable_exception(result.error());
+        }
+        entry_descriptor desc = std::move(*result);
         if (!sstable_generation_generator::maybe_owned_by_this_shard(desc.generation)) {
             co_return;
         }

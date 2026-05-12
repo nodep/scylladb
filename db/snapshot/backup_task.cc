@@ -17,7 +17,6 @@
 #include "db/snapshot-ctl.hh"
 #include "db/snapshot/backup_task.hh"
 #include "schema/schema_fwd.hh"
-#include "sstables/exceptions.hh"
 #include "sstables/sstables.hh"
 #include "sstables/sstable_directory.hh"
 #include "sstables/sstables_manager.hh"
@@ -164,22 +163,23 @@ future<> backup_task_impl::process_snapshot_dir() {
             auto file_path = _snapshot_dir / name;
             auto st = co_await file_stat(directory, name);
             total += st.size;
-            try {
-                auto desc = sstables::parse_path(file_path, "", "");
-                const auto& gen = desc.generation;
-                _sstable_comps[gen].emplace_back(name);
-                _sstables_in_snapshot.insert(desc.generation);
-                ++num_sstable_comps;
-
-                // When the SSTable is only linked-to by the snapshot directory,
-                // it is already deleted from the table's base directory, and
-                // therefore it better be uploaded earlier to free-up its capacity.
-                if (desc.component == sstables::component_type::Data && st.number_of_links == 1) {
-                    snap_log.debug("backup_task: SSTable with generation {} is already deleted from the table", gen);
-                    _deleted_sstables.push_back(gen);
-                }
-            } catch (const sstables::malformed_sstable_exception&) {
+            auto result = sstables::parse_path(file_path, "", "");
+            if (!result) {
                 _files.emplace_back(name);
+                continue;
+            }
+            auto desc = std::move(*result);
+            const auto& gen = desc.generation;
+            _sstable_comps[gen].emplace_back(name);
+            _sstables_in_snapshot.insert(desc.generation);
+            ++num_sstable_comps;
+
+            // When the SSTable is only linked-to by the snapshot directory,
+            // it is already deleted from the table's base directory, and
+            // therefore it better be uploaded earlier to free-up its capacity.
+            if (desc.component == sstables::component_type::Data && st.number_of_links == 1) {
+                snap_log.debug("backup_task: SSTable with generation {} is already deleted from the table", gen);
+                _deleted_sstables.push_back(gen);
             }
         }
         _total_progress.total = total;

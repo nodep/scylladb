@@ -14,7 +14,6 @@
 #include "init.hh"
 #include "supervisor.hh"
 #include "directories.hh"
-#include "sstables/exceptions.hh"
 #include "sstables/open_info.hh"
 #include "utils/disk-error-handler.hh"
 #include "utils/lister.hh"
@@ -172,15 +171,14 @@ future<> directories::verify_owner_and_mode_of_data_dir(directories::set dir_set
             return do_verify_owner_and_mode(std::move(path), recursive::yes, 0, [verify_data_and_index_files] (const fs::path& dir, const directory_entry& de) {
                 auto path = dir / de.name;
                 component_type path_component_type;
-                try {
-                    // use parse_path to deduce the component type as using system calls
-                    // like stat/lstat will load the inode/dentry into the cache.
-                    auto descriptor_tuple = sstables::parse_path(path);
-                    path_component_type = std::get<0>(descriptor_tuple).component;
-                } catch (sstables::malformed_sstable_exception&) {
+                // use parse_path to deduce the component type as using system calls
+                // like stat/lstat will load the inode/dentry into the cache.
+                auto result = sstables::parse_path(path);
+                if (!result) {
                     // path is not a SSTable component - do not filter it out
                     return true;
                 }
+                path_component_type = std::get<0>(*result).component;
                 auto data_or_index_file = (path_component_type == component_type::Data || path_component_type == component_type::Index);
                 return verify_data_and_index_files ? data_or_index_file : !data_or_index_file;
             });

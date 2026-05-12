@@ -79,7 +79,7 @@ public:
     data_consumer::proceed consume_range_tombstone_start(clustering_key_prefix ck, bound_kind k, tombstone t) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_start(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
         if (_mf_filter->current_tombstone()) {
-            throw sstables::malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("Range tombstones have to be disjoint: current opened range tombstone {}, new tombstone {}",
                            _mf_filter->current_tombstone(), t));
         }
@@ -90,12 +90,12 @@ public:
     data_consumer::proceed consume_range_tombstone_end(clustering_key_prefix ck, bound_kind k, tombstone t) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_end(ck={}, k={}, t={})", fmt::ptr(this), ck, k, t);
         if (!_mf_filter->current_tombstone()) {
-            throw sstables::malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("Closing range tombstone that wasn't opened: clustering {}, kind {}, tombstone {}",
                            ck, k, t));
         }
         if (_mf_filter->current_tombstone() != t) {
-            throw sstables::malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("Range tombstone with ck {} and two different tombstones at ends: {}, {}",
                            ck, _mf_filter->current_tombstone(), t));
         }
@@ -106,11 +106,11 @@ public:
     data_consumer::proceed consume_range_tombstone_boundary(position_in_partition pos, tombstone left, tombstone right) {
         sstlog.trace("mp_row_consumer_m {}: consume_range_tombstone_boundary(pos={}, left={}, right={})", fmt::ptr(this), pos, left, right);
         if (!_mf_filter->current_tombstone()) {
-            throw sstables::malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("Closing range tombstone that wasn't opened: pos {}, tombstone {}", pos, left));
         }
         if (_mf_filter->current_tombstone() != left) {
-            throw sstables::malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("Range tombstone at {} and two different tombstones at ends: {}, {}",
                            pos, _mf_filter->current_tombstone(), left));
         }
@@ -166,7 +166,7 @@ public:
 
     void check_schema_mismatch(const column_translation::column_info& column_info, const column_definition& column_def) const {
         if (column_info.schema_mismatch) {
-            throw malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                     format("{} definition in serialization header does not match schema. Expected {} but got {}",
                         column_def.name_as_text(),
                         column_def.type->name(),
@@ -180,7 +180,7 @@ public:
             sstring name = sstring(to_string_view(*column_info.name));
             auto it = _schema->dropped_columns().find(name);
             if (it == _schema->dropped_columns().end() || timestamp > it->second.timestamp) {
-                throw malformed_sstable_exception(format("Column {} missing in current schema", name));
+                throw_malformed_sstable_exception(format("Column {} missing in current schema", name));
             }
         }
     }
@@ -399,20 +399,20 @@ public:
                 [] (const collection_type_impl& ctype) -> const abstract_type& { return *ctype.value_comparator(); },
                 [&] (const user_type_impl& utype) -> const abstract_type& {
                     if (cell_path.size() != sizeof(int16_t)) {
-                        throw malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
+                        throw_malformed_sstable_exception(format("wrong size of field index while reading UDT column: expected {}, got {}",
                                     sizeof(int16_t), cell_path.size()));
                     }
 
                     auto field_idx = deserialize_field_index(cell_path);
                     if (field_idx >= utype.size()) {
-                        throw malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
+                        throw_malformed_sstable_exception(format("field index too big while reading UDT column: type has {} fields, got {}",
                                     utype.size(), field_idx));
                     }
 
                     return *utype.type(field_idx);
                 },
                 [] (const abstract_type& o) -> const abstract_type& {
-                    throw malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
+                    throw_malformed_sstable_exception(format("attempted to read multi-cell column, but expected type was {}", o.name()));
                 }
             ));
             auto ac = is_deleted ? atomic_cell::make_dead(timestamp, local_deletion_time)
@@ -559,7 +559,7 @@ public:
         sstlog.trace("mp_row_consumer_m {}: on_end_of_stream()", fmt::ptr(this));
         if (_mf_filter && _mf_filter->current_tombstone()) {
             if (_mf_filter->out_of_range()) {
-                throw sstables::malformed_sstable_exception("Unclosed range tombstone.");
+                throw_malformed_sstable_exception("Unclosed range tombstone.");
             }
             auto result = _mf_filter->apply(position_in_partition_view::after_all_clustered_rows(), {});
             for (auto&& rt : result.rts) {
@@ -904,7 +904,7 @@ private:
                         _is_first_unfiltered = false;
                         goto row_body_label;
                     } else {
-                        throw malformed_sstable_exception("static row should be a first unfiltered in a partition");
+                        throw_malformed_sstable_exception("static row should be a first unfiltered in a partition");
                     }
                 }
                 start_row(_regular_row);
@@ -924,7 +924,7 @@ private:
                     continue;
                 }
                 if (_null_component_occured) {
-                    throw malformed_sstable_exception("non-null component after null component");
+                    throw_malformed_sstable_exception("non-null component after null component");
                 }
                 if (is_block_empty()) {
                     _row_key.push_back({});
@@ -971,7 +971,7 @@ private:
             }
             if (_extended_flags.is_static()) {
                 if (_flags.has_timestamp() || _flags.has_ttl() || _flags.has_deletion()) {
-                    throw malformed_sstable_exception(format("Static row has unexpected flags: timestamp={}, ttl={}, deletion={}",
+                    throw_malformed_sstable_exception(format("Static row has unexpected flags: timestamp={}, ttl={}, deletion={}",
                         _flags.has_timestamp(), _flags.has_ttl(), _flags.has_deletion()));
                 }
             } else {
@@ -994,7 +994,7 @@ private:
                 }
                 if (_extended_flags.has_scylla_shadowable_deletion()) {
                     if (!_has_shadowable_tombstones) {
-                        throw malformed_sstable_exception("Scylla shadowable tombstone flag is set but not supported on this SSTables");
+                        throw_malformed_sstable_exception("Scylla shadowable tombstone flag is set but not supported on this SSTables");
                     }
                     co_yield this->read_unsigned_vint(*_processing_data);
                     _row_shadowable_tombstone.timestamp = parse_timestamp(_header, this->_u64);
@@ -1155,7 +1155,7 @@ private:
             _left_range_tombstone.deletion_time = parse_expiry(_header, this->_u64);
             if (!is_boundary_between_adjacent_intervals(_range_tombstone_kind)) {
                 if (!is_bound_kind(_range_tombstone_kind)) {
-                    throw sstables::malformed_sstable_exception(
+                    throw_malformed_sstable_exception(
                         format("Corrupted range tombstone: invalid boundary type {}", _range_tombstone_kind));
                 }
                 _sst->get_stats().on_range_tombstone_read();
@@ -1219,7 +1219,7 @@ public:
         // is the first state corresponding to the contents of a new partition.
         if (_state != state::DELETION_TIME
                 && (_state != state::PARTITION_START || data_consumer::primitive_consumer::active())) {
-            throw malformed_sstable_exception("end of input, but not end of partition");
+            throw_malformed_sstable_exception("end of input, but not end of partition");
         }
     }
 
@@ -1410,7 +1410,7 @@ private:
         }
 
         if (!_consumer.is_mutation_end()) {
-            throw malformed_sstable_exception(format("consumer not at partition boundary, position: {}",
+            throw_malformed_sstable_exception(format("consumer not at partition boundary, position: {}",
                                                      position_in_partition_view::printer(*_schema, _consumer.position())), _sst->get_filename());
         }
 

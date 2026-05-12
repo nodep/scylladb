@@ -29,8 +29,7 @@
 #include "test/lib/cql_assertions.hh"
 #include "utils/lister.hh"
 #include "db/config.hh"
-
-#include <fmt/core.h>
+#include "sstables/exceptions.hh"
 #include <fmt/ranges.h>
 #include <boost/algorithm/string/erase.hpp>
 
@@ -189,6 +188,7 @@ SEASTAR_TEST_CASE(sstable_directory_test_table_simple_empty_directory_scan) {
 // Test unrecoverable SSTable: missing a file that is expected in the TOC.
 SEASTAR_TEST_CASE(sstable_directory_test_table_scan_incomplete_sstables) {
     return sstables::test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto sst = make_sstable_for_this_shard(std::bind(new_sstable, std::ref(env), generation_type(this_shard_id())));
 
         // Now there is one sstable to the upload directory, but it is incomplete and one component is missing.
@@ -206,6 +206,7 @@ SEASTAR_TEST_CASE(sstable_directory_test_table_scan_incomplete_sstables) {
 // reproducing https://github.com/scylladb/scylla/issues/10697
 SEASTAR_TEST_CASE(sstable_directory_test_table_scan_invalid_file) {
     return sstables::test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto& dir = env.tempdir();
         auto sst = make_sstable_for_this_shard(std::bind(new_env_sstable, std::ref(env)));
 
@@ -276,6 +277,7 @@ SEASTAR_TEST_CASE(sstable_directory_test_unlink_sstable_leaves_no_orphans) {
 // Test the absence of TOC. Behavior is controllable by a flag
 SEASTAR_TEST_CASE(sstable_directory_test_table_missing_toc) {
     return sstables::test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto sst = make_sstable_for_this_shard(std::bind(new_env_sstable, std::ref(env)));
         remove_file(test(sst).filename(sstables::component_type::TOC).native()).get();
 
@@ -296,6 +298,7 @@ SEASTAR_TEST_CASE(sstable_directory_test_table_missing_toc) {
 // is not around (but mentioned in the TOC), then this is an error.
 SEASTAR_THREAD_TEST_CASE(sstable_directory_test_temporary_statistics) {
     sstables::test_env::do_with_sharded_async([] (sharded<test_env>& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto sst = make_sstable_for_this_shard(std::bind(new_env_sstable, std::ref(env.local())));
         auto tempstr = test(sst).filename(component_type::TemporaryStatistics);
         tests::touch_file(tempstr.native()).get();

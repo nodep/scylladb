@@ -77,6 +77,7 @@
 #include "readers/combined.hh"
 #include "utils/assert.hh"
 #include "utils/pretty_printers.hh"
+#include "sstables/exceptions.hh"
 
 BOOST_AUTO_TEST_SUITE(sstable_compaction_test)
 
@@ -570,6 +571,7 @@ static void compact_corrupted_by_compression_mode(const std::string& tname,
         const sstring& error_msg)
 {
     test_env::do_with_async([&] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto compact = [&] (schema_ptr schema, std::vector<shared_sstable> to_compact) {
             auto sst_gen = env.make_sst_factory(schema);
             auto cf = env.make_table_for_tests(schema);
@@ -3472,6 +3474,7 @@ SEASTAR_THREAD_TEST_CASE(sstable_scrub_abort_mode_malformed_sstable_test) {
     auto muts = tests::generate_random_mutations(test.random_schema(), 3).get();
 
     test.run(schema, muts, [] (table_for_tests& table, compaction::compaction_group_view& ts, std::vector<sstables::shared_sstable> sstables) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         BOOST_REQUIRE(sstables.size() == 1);
         auto sst = sstables.front();
         corrupt_sstable(sst);

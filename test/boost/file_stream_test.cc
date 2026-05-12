@@ -11,6 +11,7 @@
 #include "message/messaging_service.hh"
 #include "test/lib/log.hh"
 #include "test/lib/sstable_utils.hh"
+#include "sstables/exceptions.hh"
 
 #include <boost/lexical_cast.hpp>
 #include <seastar/testing/thread_test_case.hh>
@@ -164,6 +165,7 @@ static future<> corrupt_data_component(sstables::shared_sstable sst) {
 using compress_sstable = bool_class<struct compress_sstable_tag>;
 static future<>
 do_test_sstable_stream(cql_test_env& env, compress_sstable compress, std::function<future<>(shared_sstable)> corruption_fn = nullptr, const sstring& expected_error_msg = "") {
+    sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
     bool verb_register = false;
     auto ops_id = file_stream_id::create_random_id();
     auto& db = env.local_db();

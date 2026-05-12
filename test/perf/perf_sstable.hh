@@ -227,7 +227,7 @@ public:
         auto dir = co_await open_directory(sst_dir_path.native());
         auto h = dir.list_directory([&](directory_entry de) -> future<> {
             std::filesystem::path sst_path = sst_dir_path / de.name.begin();
-            auto entry = parse_path(sst_path, s->ks_name(), s->cf_name());
+            auto entry = parse_path(sst_path, s->ks_name(), s->cf_name()).value();
             if (entry.component == component_type::TOC) {
                 auto sst = _env.make_sstable(s, this->dir(), entry.generation, entry.version);
                 co_await sst->load(s->get_sharder());

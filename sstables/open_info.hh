@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <expected>
 #include <seastar/core/sstring.hh>
 #include <seastar/core/file.hh>
 #include <seastar/core/sharded.hh>
@@ -43,11 +44,11 @@ struct entry_descriptor {
 
 // Parses sstable file path extracting entry_descriptor from it. Returns the descriptor
 // and the keyspace.table pair of strings.
-std::tuple<entry_descriptor, sstring, sstring> parse_path(const std::filesystem::path& sst_path);
+std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> parse_path(const std::filesystem::path& sst_path);
 
 // Use the given ks and cf and don't attempt to extract it from the dir path.
 // This allows loading sstables from any path, but the filename still has to be valid.
-entry_descriptor parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf);
+std::expected<entry_descriptor, sstring> parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf);
 
 // contains data for loading a sstable using components shared by a single shard;
 // can be moved across shards

@@ -48,4 +48,30 @@ struct bufsize_mismatch_exception : malformed_sstable_exception {
     {}
 };
 
+// Controls whether malformed sstable errors abort the process (generating a coredump) or throw an
+// exception. Aborting is useful when the malformed sstable error is caused by memory corruption
+// rather than actual sstable corruption, as it allows post-mortem analysis of the coredump.
+// Controlled by the --abort-on-malformed-sstable-error command-line option.
+// Returns the previous value of the flag.
+bool set_abort_on_malformed_sstable_error(bool value) noexcept;
+bool abort_on_malformed_sstable_error() noexcept;
+
+// Use these helpers instead of directly throwing malformed_sstable_exception or
+// bufsize_mismatch_exception. They check the abort_on_malformed_sstable_error flag and either
+// abort the process (with logging) or throw the appropriate exception.
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg);
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg, component_name filename);
+[[noreturn]] void throw_bufsize_mismatch_exception(size_t size, size_t expected);
+
+// Disables aborting on malformed sstable errors for a scope.
+//
+// Intended for tests which intentionally corrupt sstables and expect
+// malformed_sstable_exception to be thrown rather than the process aborting.
+class scoped_no_abort_on_malformed_sstable_error {
+    bool _prev;
+public:
+    scoped_no_abort_on_malformed_sstable_error() noexcept;
+    ~scoped_no_abort_on_malformed_sstable_error();
+};
+
 }

@@ -43,8 +43,7 @@
 #include "db/large_data_handler.hh"
 #include "db/config.hh"
 #include "readers/combined.hh"
-
-#include <fmt/ranges.h>
+#include "sstables/exceptions.hh"
 
 using namespace sstables;
 
@@ -5842,6 +5841,7 @@ SEASTAR_TEST_CASE(test_legacy_udt_in_collection_table) {
 
 SEASTAR_TEST_CASE(test_compression_premature_eof) {
     return test_env::do_with_async([] (test_env& env) {
+        sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
         auto stable_dir = "./test/resource/sstables/compression-premature-eof";
         sstable_assertions sst(env, ZSTD_MULTIPLE_CHUNKS_SCHEMA, stable_dir);
         sst.load();

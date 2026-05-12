@@ -46,10 +46,10 @@ inline api::timestamp_type parse_timestamp(const serialization_header& header,
 inline gc_clock::duration parse_ttl(int64_t value) {
     if (!is_expired_liveness_ttl(value)) {
         if (value < 0) {
-            throw malformed_sstable_exception(format("Negative ttl: {}", value));
+            throw_malformed_sstable_exception(format("Negative ttl: {}", value));
         }
         if (value > max_ttl.count()) {
-            throw malformed_sstable_exception(format("Too big ttl: {}", value));
+            throw_malformed_sstable_exception(format("Too big ttl: {}", value));
         }
     }
     return gc_clock::duration(value);

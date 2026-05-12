@@ -7,7 +7,9 @@
  */
 
 #include "utils/log.hh"
+#include <atomic>
 #include <concepts>
+#include <cstdlib>
 #include <vector>
 #include <limits>
 #include <algorithm>
@@ -30,6 +32,7 @@
 #include <seastar/util/short_streams.hh>
 #include <seastar/util/memory-data-source.hh>
 #include <seastar/util/memory-data-sink.hh>
+#include <expected>
 #include <iterator>
 #include <seastar/core/coroutine.hh>
 #include <seastar/coroutine/maybe_yield.hh>
@@ -109,6 +112,41 @@ thread_local utils::updateable_value<bool> global_cache_index_pages(true);
 
 logging::logger sstlog("sstable");
 
+static std::atomic<bool> _abort_on_malformed_sstable_error{false};
+
+bool set_abort_on_malformed_sstable_error(bool value) noexcept {
+    return _abort_on_malformed_sstable_error.exchange(value, std::memory_order_relaxed);
+}
+
+bool abort_on_malformed_sstable_error() noexcept {
+    return _abort_on_malformed_sstable_error.load(std::memory_order_relaxed);
+}
+
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg) {
+    if (_abort_on_malformed_sstable_error.load(std::memory_order_relaxed)) {
+        sstlog.error("malformed sstable error (aborting): {}", msg);
+        std::abort();
+    }
+    throw malformed_sstable_exception(std::move(msg));
+}
+
+[[noreturn]] void throw_malformed_sstable_exception(sstring msg, component_name filename) {
+    throw_malformed_sstable_exception(format("{} in sstable {}", msg, filename));
+}
+
+[[noreturn]] void throw_bufsize_mismatch_exception(size_t size, size_t expected) {
+    throw_malformed_sstable_exception(format("Buffer improperly sized to hold requested data. Got: {:d}. Expected: {:d}", size, expected));
+}
+
+scoped_no_abort_on_malformed_sstable_error::scoped_no_abort_on_malformed_sstable_error() noexcept
+    : _prev(set_abort_on_malformed_sstable_error(false))
+{
+}
+
+scoped_no_abort_on_malformed_sstable_error::~scoped_no_abort_on_malformed_sstable_error() {
+    set_abort_on_malformed_sstable_error(_prev);
+}
+
 [[noreturn]] void on_parse_error(sstring message, std::optional<component_name> filename) {
     auto make_exception = [&] {
         if (message.empty()) {
@@ -119,11 +157,19 @@ logging::logger sstlog("sstable");
         }
         return malformed_sstable_exception(message);
     };
+    if (abort_on_malformed_sstable_error()) {
+        sstlog.error("malformed sstable error (aborting): {}", make_exception().what());
+        std::abort();
+    }
     auto ex = std::make_exception_ptr(make_exception());
     on_internal_error(sstlog, std::move(ex));
 }
 
 [[noreturn, gnu::noinline]] void on_bti_parse_error(uint64_t pos) {
+    if (abort_on_malformed_sstable_error()) {
+        sstlog.error("malformed sstable error (aborting): BTI parse error for node at pos {}", pos);
+        std::abort();
+    }
     on_internal_error(sstlog, fmt::format("BTI parse error for node at pos {}", pos));
 }
 
@@ -241,7 +287,7 @@ static typename Map::key_type reverse_map(const Value& v, const Map& map) {
 // and we need to do something about it.
 static void check_buf_size(temporary_buffer<char>& buf, size_t expected) {
     if (buf.size() < expected) {
-        throw bufsize_mismatch_exception(buf.size(), expected);
+        throw_bufsize_mismatch_exception(buf.size(), expected);
     }
 }
 
@@ -659,20 +705,20 @@ future<> parse(const schema& schema, sstable_version_types v, random_access_read
                 break;
             case metadata_type::Serialization:
                 if (v < sstable_version_types::mc) {
-                    throw malformed_sstable_exception(
+                    throw_malformed_sstable_exception(
                         "Statistics is malformed: SSTable is in 2.x format but contains serialization header.");
                 } else {
                     co_await parse<serialization_header>(schema, v, in, s.contents[type]);
                 }
                 break;
             default:
-                throw malformed_sstable_exception(fmt::format("Invalid metadata type at Statistics file: {} ", int(type)));
+                throw_malformed_sstable_exception(fmt::format("Invalid metadata type at Statistics file: {} ", int(type)));
             }
         }
     } catch (const malformed_sstable_exception&) {
         throw;
     } catch (...) {
-        throw malformed_sstable_exception(fmt::format("Statistics file is malformed: {}", std::current_exception()));
+        throw_malformed_sstable_exception(fmt::format("Statistics file is malformed: {}", std::current_exception()));
     }
 }
 
@@ -808,7 +854,7 @@ future<> parse(const schema& s, sstable_version_types v, random_access_reader& i
 
     co_await parse(s, v, in, c.name, c.options, chunk_len, data_len);
     if (chunk_len == 0) {
-        throw malformed_sstable_exception("CompressionInfo is malformed: zero chunk_len");
+        throw_malformed_sstable_exception("CompressionInfo is malformed: zero chunk_len");
     }
     c.set_uncompressed_chunk_length(chunk_len);
     c.set_uncompressed_file_length(data_len);
@@ -890,12 +936,12 @@ future<> sstable::read_toc(sstable_open_config cfg) noexcept {
                 }
             }
             if (!_recognized_components.size()) {
-                throw malformed_sstable_exception("Empty TOC", toc_filename());
+                throw_malformed_sstable_exception("Empty TOC", toc_filename());
             }
         });
     } catch (std::system_error& e) {
         if (e.code() == std::error_code(ENOENT, std::system_category())) {
-            throw malformed_sstable_exception(fmt::format("{}: file not found", toc_filename()));
+            throw_malformed_sstable_exception(fmt::format("{}: file not found", toc_filename()));
         }
         throw;
     }
@@ -1048,11 +1094,11 @@ future<> sstable::do_read_simple(component_type type,
         _metadata_size_on_disk += size;
     }  catch (std::system_error& e) {
         if (e.code() == std::error_code(ENOENT, std::system_category())) {
-            throw malformed_sstable_exception(fmt::format("{}: file not found", component_name));
+            throw_malformed_sstable_exception(fmt::format("{}: file not found", component_name));
         }
         throw;
     } catch (malformed_sstable_exception& e) {
-        throw malformed_sstable_exception(e.what(), component_name);
+        throw_malformed_sstable_exception(e.what(), component_name);
     }
 }
 
@@ -1243,7 +1289,7 @@ void sstable::validate_component_digest(component_type type, uint32_t computed_d
         if (_ignore_component_digest_mismatch) {
             sstlog.warn("{}", msg);
         } else {
-            throw malformed_sstable_exception(msg);
+            throw_malformed_sstable_exception(msg);
         }
     }
 }
@@ -1256,7 +1302,7 @@ future<> sstable::validate_index_digest() const {
         }
         auto computed_digest = co_await compute_component_file_digest(f, size);
         if (*expected_digest != computed_digest) {
-            throw malformed_sstable_exception(
+            throw_malformed_sstable_exception(
                 fmt::format("{} digest mismatch in {}: expected {}, computed {}",
                             type, get_filename(), *expected_digest, computed_digest));
         }
@@ -1920,7 +1966,7 @@ void sstable::build_delayed_filter(uint64_t num_partitions) {
         }
     }
     if (processed_hashes != num_partitions) {
-        throw malformed_sstable_exception(fmt::format("Temporary hashes file {} was supposed to contain {} hashes, but it contains only {} hashes",
+        throw_malformed_sstable_exception(fmt::format("Temporary hashes file {} was supposed to contain {} hashes, but it contains only {} hashes",
             filename(component_type::TemporaryHashes), num_partitions, processed_hashes));
     }
 
@@ -2122,7 +2168,7 @@ void prepare_summary(summary& s, uint64_t expected_partition_count, uint32_t min
             !!(expected_partition_count % min_index_interval);
     // FIXME: handle case where max_expected_entries is greater than max value stored by uint32_t.
     if (max_expected_entries > std::numeric_limits<uint32_t>::max()) {
-        throw malformed_sstable_exception("Current sampling level (" + to_sstring(downsampling::BASE_SAMPLING_LEVEL) + ") not enough to generate summary.");
+        throw_malformed_sstable_exception("Current sampling level (" + to_sstring(downsampling::BASE_SAMPLING_LEVEL) + ") not enough to generate summary.");
     }
 
     s.header.memory_size = 0;
@@ -2893,7 +2939,7 @@ sstable::make_full_scan_reader(
     return kl::make_full_scan_reader(shared_from_this(), std::move(schema), std::move(permit), std::move(trace_state), monitor, integrity);
 }
 
-static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(const std::filesystem::path& sst_path, sstring* const provided_ks, sstring* const provided_cf) {
+static std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> make_entry_descriptor(const std::filesystem::path& sst_path, sstring* const provided_ks, sstring* const provided_cf) {
     // examples of fname look like
     //   la-42-big-Data.db
     //   ka-42-big-Data.db
@@ -2935,10 +2981,14 @@ static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(cons
                 ks = dirmatch[1].str();
                 cf = dirmatch[2].str();
             } else {
-                throw malformed_sstable_exception(seastar::format("invalid path for file {}: {}. Path doesn't match known pattern.", fname, sstdir));
+                return std::unexpected{seastar::format("invalid path for file {}: {}. Path doesn't match known pattern.", fname, sstdir)};
             }
         }
-        version = version_from_string(match[1].str());
+        try {
+            version = version_from_string(match[1].str());
+        } catch (const std::exception& e) {
+            return std::unexpected{seastar::format("failed to parse version for sstable filename {}: {}", fname, e)};
+        }
         generation = match[2].str();
         format = sstring(match[3].str());
         component = sstring(match[4].str());
@@ -2952,18 +3002,25 @@ static std::tuple<entry_descriptor, sstring, sstring> make_entry_descriptor(cons
         generation = match[3].str();
         component = sstring(match[4].str());
     } else {
-        throw malformed_sstable_exception(seastar::format("invalid version for file {}. Name doesn't match any known version.", fname));
+        return std::unexpected{seastar::format("invalid version for file {}. Name doesn't match any known version.", fname)};
     }
-    return std::make_tuple(entry_descriptor(generation_type::from_string(generation), version, format_from_string(format), sstable::component_from_sstring(version, component)), ks, cf);
+    try {
+        return std::make_tuple(entry_descriptor(generation_type::from_string(generation), version, format_from_string(format), sstable::component_from_sstring(version, component)), ks, cf);
+    } catch (const std::exception& e) {
+        return std::unexpected{seastar::format("failed to parse sstable filename {}: {}", fname, e.what())};
+    }
 }
 
-std::tuple<entry_descriptor, sstring, sstring> parse_path(const std::filesystem::path& sst_path) {
+std::expected<std::tuple<entry_descriptor, sstring, sstring>, sstring> parse_path(const std::filesystem::path& sst_path) {
     return make_entry_descriptor(sst_path, nullptr, nullptr);
 }
 
-entry_descriptor parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf) {
+std::expected<entry_descriptor, sstring> parse_path(const std::filesystem::path& sst_path, sstring ks, sstring cf) {
     auto full = make_entry_descriptor(sst_path, &ks, &cf);
-    return std::get<0>(full);
+    if (!full) {
+        return std::unexpected{full.error()};
+    }
+    return std::get<0>(*full);
 }
 
 sstable_version_types version_from_string(std::string_view s) {
@@ -3319,10 +3376,10 @@ void sstable::set_first_and_last_keys() {
         first = decorate_key("first", _partitions_db_footer->first_key.get_bytes());
         last = decorate_key("last", _partitions_db_footer->last_key.get_bytes());
     } else {
-        throw malformed_sstable_exception(format("{}: neither Summary.db nor Partitions.db component is present, can't determine first and last partition key", get_filename()));
+        throw_malformed_sstable_exception(format("{}: neither Summary.db nor Partitions.db component is present, can't determine first and last partition key", get_filename()));
     }
     if (first.value().tri_compare(*_schema, last.value()) > 0) {
-        throw malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first.value(), last.value()));
+        throw_malformed_sstable_exception(format("{}: first and last keys of summary are misordered: first={} > last={}", get_filename(), first.value(), last.value()));
     }
     _first = std::move(first.value());
     _last = std::move(last.value());
@@ -4294,7 +4351,11 @@ public:
 };
 
 std::unique_ptr<sstable_stream_sink> create_stream_sink(schema_ptr schema, sstables_manager& sstm, const data_dictionary::storage_options& s_opts, sstable_state state, std::string_view component_filename, sstable_stream_sink_cfg cfg) {
-    auto desc = parse_path(component_filename, schema->ks_name(), schema->cf_name());
+    auto desc_result = parse_path(component_filename, schema->ks_name(), schema->cf_name());
+    if (!desc_result) {
+        throw_malformed_sstable_exception(desc_result.error());
+    }
+    auto desc = std::move(*desc_result);
     auto sst = sstm.make_sstable(schema, s_opts, desc.generation, state, desc.version, desc.format);
 
     auto type = desc.component;
@@ -4363,7 +4424,7 @@ namespace trie {
 future<bti_partitions_db_footer> read_bti_partitions_db_footer(const schema& s, sstable_version_types v, const seastar::file& f, uint64_t file_size) {
     file_random_access_reader reader(f, file_size, default_sstable_buffer_size);
     if (file_size < 24) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db file is too small: file_size={}", file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db file is too small: file_size={}", file_size));
     }
     co_await reader.seek(file_size - 24);
     uint64_t keys_position;
@@ -4373,10 +4434,10 @@ future<bti_partitions_db_footer> read_bti_partitions_db_footer(const schema& s, 
     co_await parse(s, v, reader, partition_count);
     co_await parse(s, v, reader, trie_root);
     if (trie_root >= file_size) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: trie_root={}, file_size={}", trie_root, file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db malformed: trie_root={}, file_size={}", trie_root, file_size));
     }
     if (keys_position >= file_size) {
-        throw malformed_sstable_exception(fmt::format("Partitions.db malformed: keys_position={}, file_size={}", keys_position, file_size));
+        throw_malformed_sstable_exception(fmt::format("Partitions.db malformed: keys_position={}, file_size={}", keys_position, file_size));
     }
     co_await reader.seek(keys_position);
     disk_string<uint16_t> first_key;

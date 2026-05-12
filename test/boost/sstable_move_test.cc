@@ -16,6 +16,7 @@
 #include "test/lib/sstable_utils.hh"
 #include "test/lib/simple_schema.hh"
 #include "sstable_test.hh"
+#include "sstables/exceptions.hh"
 
 using namespace sstables;
 namespace fs = std::filesystem;
@@ -131,6 +132,7 @@ SEASTAR_THREAD_TEST_CASE(test_sstable_move_exists_failure) {
     auto scf = make_sstable_compressor_factory_for_tests_in_thread();
     auto env = test_env({}, *scf);
     auto stop_env = defer([&env] { env.stop().get(); });
+    sstables::scoped_no_abort_on_malformed_sstable_error no_abort;
 
     // please note, the SSTables used by this test are stored under
     // get_test_dir("uncompressed", "ks", fs::path(uncompressed_dir())), so the

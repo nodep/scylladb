@@ -38,6 +38,7 @@
 #include "replica/database.hh"
 #include "sstables/sstables_manager.hh"
 #include "sstables/sstable_directory.hh"
+#include "sstables/exceptions.hh"
 #include "types/list.hh"
 #include "data_dictionary/impl.hh"
 #include "data_dictionary/data_dictionary.hh"
@@ -614,7 +615,11 @@ schema_ptr do_load_schema_from_sstable(const db::config& dbcfg, std::filesystem:
 
     schema_ptr bootstrap_schema = schema_builder(keyspace, table).with_column("pk", int32_type, column_kind::partition_key).build();
 
-    const auto ed = sstables::parse_path(sstable_path, keyspace, table);
+    auto ed_result = sstables::parse_path(sstable_path, keyspace, table);
+    if (!ed_result) {
+        sstables::throw_malformed_sstable_exception(ed_result.error());
+    }
+    const auto ed = std::move(*ed_result);
     const auto dir_path = sstable_path.parent_path();
     auto local = data_dictionary::make_local_options(dir_path);
     auto bootstrap_sst = sst_man.make_sstable(bootstrap_schema, local, ed.generation, sstables::sstable_state::normal, ed.version, ed.format);
