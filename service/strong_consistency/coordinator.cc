@@ -19,9 +19,9 @@
 #include "idl/strong_consistency/state_machine.dist.hh"
 #include "idl/strong_consistency/state_machine.dist.impl.hh"
 #include "gms/gossiper.hh"
+#include "utils/histogram_metrics_helper.hh"
 
 namespace service::strong_consistency {
-
 
 static logging::logger logger("sc_coordinator");
 
@@ -48,6 +48,68 @@ struct read_timeout : public exceptions::read_timeout_exception {
         )
     {}
 };
+
+void stats::register_stats() {
+    namespace sm = seastar::metrics;
+    sm::label reason_label("reason");
+
+    _metrics.add_group("strong_consistency_coordinator", {
+        sm::make_summary("write_latency_summary", sm::description("Strong consistency write latency summary"),
+            [this] { return to_metrics_summary(write.summary()); }).set_skip_when_empty(),
+
+        sm::make_histogram("write_latency", sm::description("Strong consistency write latency histogram"),
+            {}, [this] { return to_metrics_histogram(write.histogram()); })
+            .aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_timeout,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("timeout")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_status_unknown,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("status_unknown")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_errors", write_errors_other,
+            sm::description("number of strong consistency write requests that failed"),
+            {reason_label("other")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_node_bounces", write_node_bounces,
+            sm::description("number of strong consistency write requests bounced to another node"))
+            .set_skip_when_empty(),
+
+        sm::make_counter("write_shard_bounces", write_shard_bounces,
+            sm::description("number of strong consistency write requests bounced to another shard"))
+            .set_skip_when_empty(),
+
+        sm::make_summary("read_latency_summary", sm::description("Strong consistency read latency summary"),
+            [this] { return to_metrics_summary(read.summary()); }).set_skip_when_empty(),
+
+        sm::make_histogram("read_latency", sm::description("Strong consistency read latency histogram"),
+            {}, [this] { return to_metrics_histogram(read.histogram()); })
+            .aggregate({seastar::metrics::shard_label}).set_skip_when_empty(),
+
+        sm::make_counter("read_errors", read_errors_timeout,
+            sm::description("number of strong consistency read requests that failed"),
+            {reason_label("timeout")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_errors", read_errors_other,
+            sm::description("number of strong consistency read requests that failed"),
+            {reason_label("other")})
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_node_bounces", read_node_bounces,
+            sm::description("number of strong consistency read requests bounced to another node"))
+            .set_skip_when_empty(),
+
+        sm::make_counter("read_shard_bounces", read_shard_bounces,
+            sm::description("number of strong consistency read requests bounced to another shard"))
+            .set_skip_when_empty(),
+    });
+}
 
 static const locator::tablet_replica* find_replica(const locator::tablet_info& tinfo, locator::host_id id) {
     const auto it = std::ranges::find_if(tinfo.replicas,
@@ -170,6 +232,7 @@ coordinator::coordinator(groups_manager& groups_manager, replica::database& db, 
     , _db(db)
     , _gossiper(gossiper)
 {
+    _stats.register_stats();
 }
 
 future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
@@ -180,6 +243,11 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
 {
     auto aoe = abort_on_expiry<timeout_clock>(timeout);
     [[maybe_unused]] const auto subs = chain_abort_sources(aoe.abort_source(), as);
+
+    utils::latency_counter lc;
+    lc.start();
+    auto mark_write_latency = defer([this, &lc] { _stats.write.mark(lc.stop().latency()); });
+    bool commit_status_unknown_ex = false;
 
     try {
         auto op_result = co_await create_operation_ctx(*schema, token, aoe.abort_source());
@@ -245,7 +313,11 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
                     logger.debug("mutate(): add_entry, got commit_status_unknown {}, table {}.{}, tablet {}, term {}",
                         ex, schema->ks_name(), schema->cf_name(), op.tablet_id, term);
 
+                    ++_stats.write_errors_status_unknown;
                     // FIXME: use a dedicated ERROR_CODE instead of SERVER_ERROR
+                    // FIXME: when a dedicated ERROR_CODE will be used,
+                    //        we can get rid of the boolean flag
+                    commit_status_unknown_ex = true;
                     throw exceptions::server_exception(
                         "The outcome of this statement is unknown. It may or may not have been applied. "
                         "Retrying the statement may be necessary.");
@@ -271,8 +343,12 @@ future<value_or_redirect<>> coordinator::mutate(schema_ptr schema,
                 || try_catch<seastar::timed_out_error>(ex) || try_catch<seastar::condition_variable_timed_out>(ex)) {
             logger.trace("mutate(): request timed out with error {}, table {}.{}, token {}",
                 ex, schema->ks_name(), schema->cf_name(), token);
+            ++_stats.write_errors_timeout;
             co_return coroutine::return_exception(write_timeout(schema->ks_name(), schema->cf_name()));
         } else {
+            if (!commit_status_unknown_ex) {
+                ++_stats.write_errors_other;
+            }
             logger.trace("mutate(): unknown exception {}, table {}.{}, token {}",
                 ex, schema->ks_name(), schema->cf_name(), token);
             // We know nothing about other errors. Let the CQL server convert them to SERVER_ERROR.
@@ -291,6 +367,10 @@ auto coordinator::query(schema_ptr schema,
 {
     auto aoe = abort_on_expiry<timeout_clock>(timeout);
     [[maybe_unused]] const auto subs = chain_abort_sources(aoe.abort_source(), as);
+
+    utils::latency_counter lc;
+    lc.start();
+    auto mark_read_latency = defer([this, &lc] { _stats.read.mark(lc.stop().latency()); });
 
     try {
         auto op_result = co_await create_operation_ctx(*schema, ranges[0].start()->value().token(), aoe.abort_source());
@@ -323,10 +403,12 @@ auto coordinator::query(schema_ptr schema,
                 || try_catch<timed_out_error>(ex)) {
             logger.trace("query(): request timed out with error {}, table {}.{}, read cmd {}",
                 ex, schema->ks_name(), schema->cf_name(), cmd);
+            ++_stats.read_errors_timeout;
             co_return coroutine::return_exception(read_timeout(schema->ks_name(), schema->cf_name()));
         } else {
             logger.trace("mutate(): unknown exception {}, table {}.{}, read cmd {}",
                 ex, schema->ks_name(), schema->cf_name(), cmd);
+            ++_stats.read_errors_other;
             // We know nothing about other errors. Let the CQL server convert them to SERVER_ERROR.
             throw;
         }

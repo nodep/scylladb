@@ -71,7 +71,7 @@ future<shared_ptr<result_message>> modification_statement::execute_without_check
     using namespace service::strong_consistency;
     if (const auto* redirect = get_if<need_redirect>(&mutate_result)) {
         bool is_write = true;
-        co_return co_await redirect_statement(qp, options, redirect->target, timeout, is_write);
+        co_return co_await redirect_statement(qp, options, redirect->target, timeout, is_write, coordinator.get().get_stats());
     }
     utils::get_local_injector().inject("sc_modification_statement_timeout", [&] {
         throw exceptions::mutation_write_timeout_exception{"", "", options.get_consistency(), 0, 0, db::write_type::SIMPLE};

@@ -159,6 +159,30 @@ async def test_basic_write_read(manager: ManagerClient):
         non_replica_host_id = [host_id for host_id in host_ids if str(host_id) not in replica_host_ids][0]
         non_replica_host = host_by_host_id(non_replica_host_id)
 
+        async def collect_metrics():
+            leader_metrics_query = await manager.metrics.query(leader_host.address)
+            leader_metrics = {
+                'scylla_strong_consistency_coordinator_write_latency_count': leader_metrics_query.get('scylla_strong_consistency_coordinator_write_latency_count') or 0,
+                'scylla_strong_consistency_coordinator_read_latency_count':  leader_metrics_query.get('scylla_strong_consistency_coordinator_read_latency_count') or 0,
+            }
+            non_leader_metrics_query = await manager.metrics.query(non_leader_replica_host.address)
+            non_leader_metrics = {
+                'scylla_strong_consistency_coordinator_write_node_bounces': non_leader_metrics_query.get('scylla_strong_consistency_coordinator_write_node_bounces') or 0,
+                'scylla_strong_consistency_coordinator_read_latency_count': non_leader_metrics_query.get('scylla_strong_consistency_coordinator_read_latency_count') or 0,
+            }
+            non_replica_metrics_query = await manager.metrics.query(non_replica_host.address)
+            non_replica_metrics = {
+                'scylla_strong_consistency_coordinator_write_node_bounces': non_replica_metrics_query.get('scylla_strong_consistency_coordinator_write_node_bounces') or 0,
+                'scylla_strong_consistency_coordinator_read_node_bounces':  non_replica_metrics_query.get('scylla_strong_consistency_coordinator_read_node_bounces') or 0,
+            }
+
+            return {
+                'leader': leader_metrics,
+                'replica': non_leader_metrics,
+                'non_replica': non_replica_metrics,
+            }     
+        metrics_before = await collect_metrics()
+
         logger.info(f"Run INSERT statement on leader {leader_host}")
         await cql.run_async(f"INSERT INTO {ks}.test (pk, c) VALUES (10, 20)", host=leader_host)
 
@@ -228,6 +252,12 @@ async def test_basic_write_read(manager: ManagerClient):
         row = rows[0]
         assert row.pk == 10
         assert row.c == 70
+
+        metrics_after = await collect_metrics()
+        # Validate that all matrics were increased after read/write operations
+        for host in metrics_after.keys():
+            for metric_name in metrics_after[host].keys():
+                assert metrics_after[host][metric_name] > metrics_before[host][metric_name]
 
         # Check that we can restart a server with an active tablets raft group
         await manager.server_restart(servers[2].server_id)

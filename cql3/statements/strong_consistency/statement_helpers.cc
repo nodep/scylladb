@@ -12,19 +12,23 @@
 #include "cql3/query_processor.hh"
 #include "replica/database.hh"
 #include "locator/tablet_replication_strategy.hh"
+#include "service/strong_consistency/coordinator.hh"
 
 namespace cql3::statements::strong_consistency {
 future<::shared_ptr<cql_transport::messages::result_message>> redirect_statement(query_processor& qp,
         const query_options& options,
         const locator::tablet_replica& target,
         db::timeout_clock::time_point timeout,
-        bool is_write)
+        bool is_write,
+        service::strong_consistency::stats& stats)
 {
     auto&& func_values_cache = const_cast<cql3::query_options&>(options).take_cached_pk_function_calls();
     const auto my_host_id = qp.db().real_database().get_token_metadata().get_topology().my_host_id();
     if (target.host != my_host_id) {
+        ++(is_write ? stats.write_node_bounces : stats.read_node_bounces);
         co_return qp.bounce_to_node(target, std::move(func_values_cache), timeout, is_write);
     }
+    ++(is_write ? stats.write_shard_bounces : stats.read_shard_bounces);
     co_return qp.bounce_to_shard(target.shard, std::move(func_values_cache));
 }
 

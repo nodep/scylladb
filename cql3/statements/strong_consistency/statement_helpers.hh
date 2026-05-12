@@ -11,6 +11,8 @@
 #include "cql3/cql_statement.hh"
 #include "locator/tablets.hh"
 
+namespace service::strong_consistency { struct stats; }
+
 namespace cql3::statements::strong_consistency {
 
 future<::shared_ptr<cql_transport::messages::result_message>> redirect_statement(
@@ -18,7 +20,8 @@ future<::shared_ptr<cql_transport::messages::result_message>> redirect_statement
     const query_options& options,
     const locator::tablet_replica& target,
     db::timeout_clock::time_point timeout,
-    bool is_write);
+    bool is_write,
+    service::strong_consistency::stats& stats);
 
 bool is_strongly_consistent(data_dictionary::database db, std::string_view ks_name);
 
