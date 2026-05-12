@@ -31,7 +31,7 @@ from typing import Iterable, Type, Union
 from cassandra.util import Duration
 import yaml
 
-from test.cluster.object_store.conftest import s3_server
+from test.pylib.object_storage import s3_server
 
 
 def simple_no_clustering_table(cql, keyspace):

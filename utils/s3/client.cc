@@ -153,6 +153,10 @@ shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, s
     return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), mem, std::move(gf), private_tag{});
 }
 
+shared_ptr<client> client::make(std::string endpoint, endpoint_config_ptr cfg, semaphore& mem, std::unique_ptr<http::experimental::retry_strategy> rs, global_factory gf) {
+    return seastar::make_shared<client>(std::move(endpoint), std::move(cfg), mem, std::move(gf), private_tag{}, std::move(rs));
+}
+
 shared_ptr<client> client::make(std::string ep, std::string region, std::string iam_role_arn, semaphore& memory, global_factory gf) {
     auto url = utils::http::parse_simple_url(ep);
     endpoint_config cfg = {
@@ -663,6 +667,61 @@ future<> client::delete_object(sstring object_name, seastar::abort_source* as) {
     s3l.trace("DELETE {}", object_name);
     auto req = http::request::make("DELETE", _host, object_name);
     co_await make_request(std::move(req), ignore_reply, http::reply::status_type::no_content, as);
+}
+
+future<> client::create_bucket(sstring bucket_name, seastar::abort_source* as) {
+    s3l.trace("PUT bucket /{}", bucket_name);
+    auto req = http::request::make("PUT", _host, format("/{}", bucket_name));
+    co_await make_request(std::move(req), ignore_reply, *_retry_strategy,
+        [&bucket_name](std::exception_ptr ex) {
+            try {
+                std::rethrow_exception(ex);
+            } catch (const aws::aws_exception& e) {
+                if (e.error().get_error_type() == aws::aws_error_type::BUCKET_ALREADY_OWNED_BY_YOU) {
+                    s3l.debug("create_bucket /{}: bucket already owned by us, treating as success", bucket_name);
+                    return;
+                }
+            }
+            map_s3_client_exception(std::move(ex));
+        }, http::reply::status_type::ok, as);
+}
+
+future<> client::delete_bucket(sstring bucket_name, seastar::abort_source* as) {
+    s3l.trace("DELETE bucket /{}", bucket_name);
+    auto req = http::request::make("DELETE", _host, format("/{}", bucket_name));
+    co_await make_request(std::move(req), ignore_reply, http::reply::status_type::no_content, as);
+}
+
+future<> client::delete_bucket_with_objects(sstring bucket_name, seastar::abort_source* as) {
+    s3l.trace("DELETE bucket with objects /{}", bucket_name);
+    bucket_lister lister(shared_from_this(), bucket_name, "", 100);
+    constexpr size_t default_concurrency = 16;
+    std::vector<directory_entry> entries;
+    entries.reserve(default_concurrency);
+    bool stop = false;
+    while (true) {
+        std::optional<directory_entry> entry;
+        while (entries.size() < default_concurrency) {
+            entry = co_await lister.get();
+            if (entry) {
+                entries.push_back(std::move(*entry));
+            } else {
+                stop = true;
+                break;
+            }
+        }
+        if (!entries.empty()) {
+            co_await max_concurrent_for_each(entries, default_concurrency, [this, as, bucket_name](const auto& entry) {
+                return delete_object(format("/{}/{}", bucket_name, entry.name), as);
+            });
+            entries.clear();
+        }
+        if (stop) {
+            break;
+        }
+    }
+    co_await lister.close();
+    co_await delete_bucket(bucket_name, as);
 }
 
 sstring parse_multipart_copy_upload_etag(sstring& body) {

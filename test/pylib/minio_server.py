@@ -118,6 +118,11 @@ class MinioServer:
             "s3:ListBucketMultipartUploads",
             "s3:GetBucketLocation",
         ]
+        global_actions = [
+            "s3:CreateBucket",
+            "s3:DeleteBucket",
+            "s3:ListAllMyBuckets",
+        ]
         object_actions = [
             "s3:AbortMultipartUpload",
             "s3:DeleteObject",
@@ -133,13 +138,19 @@ class MinioServer:
                 'Action': bucket_actions,
                 'Effect': 'Allow',
                 'Principal': {'AWS': ['*']},
-                'Resource': [ f'arn:aws:s3:::{self.bucket_name}' ]
+                'Resource': [ 'arn:aws:s3:::*' ]
+            },
+            {
+                'Action': global_actions,
+                'Effect': 'Allow',
+                'Principal': {'AWS': ['*']},
+                'Resource': [ 'arn:aws:s3:::*' ]
             },
             {
                 'Action': object_actions,
                 'Effect': 'Allow',
                 'Principal': {'AWS': ['*']},
-                'Resource': [ f'arn:aws:s3:::{self.bucket_name}/*' ]
+                'Resource': [ 'arn:aws:s3:::*/*' ]
             }
         ]
         return {'Statement': statement,
