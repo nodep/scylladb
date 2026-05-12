@@ -15,6 +15,8 @@
 #include "schema/schema_fwd.hh"
 #include "sstables/shared_sstable.hh"
 #include "tasks/task_manager.hh"
+#include "db/consistency_level_type.hh"
+#include "locator/tablets.hh"
 
 using namespace seastar;
 
@@ -22,10 +24,15 @@ namespace replica {
 class database;
 }
 
+struct minimal_sst_info;
+struct restore_result {
+};
+
 namespace sstables { class storage_manager; }
 
 namespace netw { class messaging_service; }
 namespace db {
+class system_distributed_keyspace;
 namespace view {
 class view_builder;
 class view_building_worker;
@@ -36,6 +43,7 @@ class storage_service;
 }
 namespace locator {
 class effective_replication_map;
+class tablet_metadata_guard;
 }
 
 struct stream_progress {
@@ -80,6 +88,7 @@ private:
     sharded<db::view::view_building_worker>& _view_building_worker;
     shared_ptr<task_manager_module> _task_manager_module;
     sstables::storage_manager& _storage_manager;
+    db::system_distributed_keyspace& _sys_dist_ks;
     seastar::scheduling_group _sched_group;
 
     // Note that this is obviously only valid for the current shard. Users of
@@ -96,6 +105,9 @@ private:
             shared_ptr<stream_progress> progress);
 
     future<seastar::shared_ptr<const locator::effective_replication_map>> await_topology_quiesced_and_get_erm(table_id table_id);
+    future<> download_tablet_sstables(locator::global_tablet_id tid, locator::tablet_metadata_guard&);
+    future<sstables::shared_sstable> attach_sstable(table_id tid, const minimal_sst_info& min_info) const;
+
 public:
     sstables_loader(sharded<replica::database>& db,
             sharded<service::storage_service>& ss,
@@ -104,6 +116,7 @@ public:
             sharded<db::view::view_building_worker>& vbw,
             tasks::task_manager& tm,
             sstables::storage_manager& sstm,
+            db::system_distributed_keyspace& sys_dist_ks,
             seastar::scheduling_group sg);
 
     future<> stop();
@@ -134,7 +147,10 @@ public:
             sstring prefix, std::vector<sstring> sstables,
             sstring endpoint, sstring bucket, stream_scope scope, bool primary_replica);
 
+    future<tasks::task_id> restore_tablets(table_id, sstring keyspace, sstring table, sstring snap_name, sstring endpoint, sstring bucket, utils::chunked_vector<sstring> manifests);
+
     class download_task_impl;
+    class tablet_restore_task_impl;
 };
 
 template <>
@@ -169,3 +185,5 @@ struct tablet_sstable_collection {
 // Another prerequisite is that the sstables' token ranges are sorted by its `start` in descending order.
 future<std::vector<tablet_sstable_collection>> get_sstables_for_tablets_for_tests(const std::vector<sstables::shared_sstable>& sstables,
                                                                                   std::vector<dht::token_range>&& tablets_ranges);
+
+future<size_t> populate_snapshot_sstables_from_manifests(sstables::storage_manager& sm, db::system_distributed_keyspace& sys_dist_ks, sstring keyspace, sstring table, sstring endpoint, sstring bucket, sstring expected_snapshot_name, utils::chunked_vector<sstring> manifest_prefixes, db::consistency_level cl = db::consistency_level::EACH_QUORUM);
