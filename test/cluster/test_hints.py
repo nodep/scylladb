@@ -48,6 +48,21 @@ async def await_sync_point(client: TCPRESTClient, server_ip: IPAddress, sync_poi
         case _:
             pytest.fail(f"Unexpected response from the server: {response}")
 
+# Remove a rack from the replication rack list for a given keyspace
+async def remove_rack(cql, rack, ks):
+    repl_v2 = await cql.run_async(f"SELECT replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+    replicas = set()
+    for key, value in repl_v2[0].replication_v2.items():
+        if key.startswith("dc:"):
+            replicas.add(value)
+    if rack in replicas:
+        replicas.remove(rack)
+        repl_list = list(replicas)
+        await cql.run_async(f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {repl_list}}}")
+    else:
+        logger.debug(f"rack {rack} is not in {replicas}; ALTER KEYSPACE for {ks} not issued.")
+
+
 # Write with RF=1 and CL=ANY to a dead node should write hints and succeed
 async def test_write_cl_any_to_dead_node_generates_hints(manager: ManagerClient):
     node_count = 2
@@ -323,6 +338,10 @@ async def test_draining_hints(manager: ManagerClient):
     await manager.server_start(s2.server_id)
 
     await cql.run_async(f"ALTER KEYSPACE ks WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {[s2.rack, s3.rack]}}}")
+
+    await remove_rack(cql, s1.rack, 'system_traces')
+    await remove_rack(cql, s1.rack, 'audit')
+
     async with asyncio.TaskGroup() as tg:
         _ = tg.create_task(manager.decommission_node(s1.server_id, timeout=60))
         _ = tg.create_task(await_sync_point(manager.api.client, s1.ip_addr, sync_point, 60))
@@ -354,6 +373,9 @@ async def test_canceling_hint_draining(manager: ManagerClient):
     await manager.api.enable_injection(s1.ip_addr, "hinted_handoff_pause_hint_replay", False, {})
     await nodetool.excludenode(cql, host_id2)
     await cql.run_async(f"ALTER KEYSPACE ks WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {[s1.rack, s3.rack]}}}")
+
+    await remove_rack(cql, s2.rack, 'system_traces')
+    await remove_rack(cql, s2.rack, 'audit')
 
     await manager.remove_node(s1.server_id, s2.server_id)
     await manager.server_stop_gracefully(s1.server_id)
