@@ -11,6 +11,7 @@ import time
 import logging
 import re
 
+from cassandra import InvalidRequest  # type: ignore
 from cassandra.cluster import NoHostAvailable  # type: ignore
 from cassandra.query import SimpleStatement, ConsistencyLevel
 
@@ -165,6 +166,39 @@ async def assert_rows_present(cql, table: str, pk: str, keys, present: bool) -> 
         assert keys.issubset(results), f"{keys} vs. {results}"
     else:
         assert len(keys.intersection(results)) == 0, f"{keys} vs. {results}"
+
+
+# Remove a rack from the replication rack list for a given keyspace
+async def remove_rack(cql, rack, ks, timeout: float = 120):
+    """
+    Auto-RF changes the rack lists of the system keyspaces on its own, so the
+    rack list has to be re-read on every attempt. An ALTER computed from a stale
+    rack list is rejected either because an RF change is already in flight
+    ("Another RF change for this keyspace ... ongoing") or, if auto-RF grew the
+    list meanwhile, because it would change the RF by more than one ("Only one
+    DC's RF can be changed at a time and not by more than 1").
+    """
+    deadline = time.time() + timeout
+    while True:
+        repl_v2 = await cql.run_async(f"SELECT replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+        replicas = set()
+        for key, value in repl_v2[0].replication_v2.items():
+            if key.startswith("dc:"):
+                replicas.add(value)
+        if rack not in replicas:
+            logger.debug(f"rack {rack} is not in {replicas}; ALTER KEYSPACE for {ks} not issued.")
+            return
+        repl_list = sorted(replicas - {rack})
+        try:
+            await cql.run_async(
+                f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {repl_list}}}")
+            return
+        except InvalidRequest as exc:
+            retryable = "ongoing" in str(exc) or "not by more than 1" in str(exc)
+            if not retryable or time.time() >= deadline:
+                raise
+            logger.info(f"Retrying ALTER KEYSPACE {ks} after: {exc}")
+            await asyncio.sleep(1)
 
 
 # Write with RF=1 and CL=ANY to a dead node should write hints and succeed
@@ -444,6 +478,10 @@ async def test_draining_hints(manager: ScyllaClusterManager):
     await manager.server_start(s2.server_id)
 
     await cql.run_async(f"ALTER KEYSPACE ks WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {[s2.rack, s3.rack]}}}")
+
+    await remove_rack(cql, s1.rack, 'system_traces')
+    await remove_rack(cql, s1.rack, 'audit')
+
     async with asyncio.TaskGroup() as tg:
         _ = tg.create_task(manager.decommission_node(s1.server_id, timeout=60))
         _ = tg.create_task(await_sync_point(manager.api.client, s1.ip_addr, sync_point, 60))
@@ -475,6 +513,9 @@ async def test_canceling_hint_draining(manager: ScyllaClusterManager):
     await manager.api.enable_injection(s1.ip_addr, "hinted_handoff_pause_hint_replay", False, {})
     await nodetool.excludenode(cql, host_id2)
     await cql.run_async(f"ALTER KEYSPACE ks WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {[s1.rack, s3.rack]}}}")
+
+    await remove_rack(cql, s2.rack, 'system_traces')
+    await remove_rack(cql, s2.rack, 'audit')
 
     await manager.remove_node(s1.server_id, s2.server_id)
     await manager.server_stop_gracefully(s1.server_id)
@@ -567,7 +608,8 @@ async def test_hint_to_leaving_when_reducing_rf(manager: ScyllaClusterManager):
         {"dc": "dc1", "rack": "r1"},
         {"dc": "dc1", "rack": "r2"},
         {"dc": "dc1", "rack": "r3"},
-    ], cmdline=cmdline)
+    ], cmdline=cmdline,
+        config={"error_injections_at_startup": ["auto_rf_keyspaces_use_vnodes"]})
     cql = await manager.get_cql_exclusive(servers[0])
     await manager.disable_tablet_balancing()
 
