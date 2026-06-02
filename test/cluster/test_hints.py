@@ -322,7 +322,26 @@ async def test_draining_hints(manager: ManagerClient):
     sync_point = await create_sync_point(manager.api.client, s1.ip_addr)
     await manager.server_start(s2.server_id)
 
+    # Remove a rack from the replication rack list for a given keyspace
+    # If the rack is not in the rack list, this is a no-op
+    async def remove_rack(rack, ks):
+        repl_v2 = await cql.run_async(f"SELECT replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+        replicas = set()
+        for key, value in repl_v2[0].replication_v2.items():
+            if key.startswith("dc:"):
+                replicas.add(value)
+        if rack in replicas:
+            replicas.remove(rack)
+            repl_list = list(replicas)
+            await cql.run_async(f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {repl_list}}}")
+        else:
+            logger.debug(f"rack {rack} is not in {replicas}; ALTER KEYSPACE for {ks} not issued.")
+
     await cql.run_async(f"ALTER KEYSPACE ks WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {[s2.rack, s3.rack]}}}")
+
+    await remove_rack(s1.rack, 'system_traces')
+    await remove_rack(s1.rack, 'audit')
+
     async with asyncio.TaskGroup() as tg:
         _ = tg.create_task(manager.decommission_node(s1.server_id, timeout=60))
         _ = tg.create_task(await_sync_point(manager.api.client, s1.ip_addr, sync_point, 60))
