@@ -395,7 +395,8 @@ async def test_lwt_state_is_preserved_on_tablet_rebuild(manager: ManagerClient):
         logs = []
         for s in servers:
             logs.append(await manager.server_open_log(s.server_id))
-        assert sum([len(await log.grep('Initiating repair phase of tablet rebuild')) for log in logs]) == 1
+        table_id = await manager.get_table_or_view_id(ks, 'test')
+        assert sum([len(await log.grep(f'Initiating repair phase of tablet rebuild.*{table_id}')) for log in logs]) == 1
 
         # Step 5. Do the SERIAL (paxos) read of c from {n3, n4}.
         await set_injection([servers[1]], 'paxos_error_before_save_promise')
