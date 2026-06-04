@@ -219,10 +219,11 @@ async def verify_max_repaired_at(manager, scylla_path, servers, ks, max_repaired
             assert repaired_at <= max_repaired_at
     await asyncio.gather(*[process_server_keys(server) for server in servers])
 
-async def trigger_tablet_merge(manager, servers, logs):
+async def trigger_tablet_merge(manager, servers, logs, for_table_id=None):
     s1_log = logs[0]
     s1_mark = await s1_log.mark()
-    await inject_error_on(manager, "tablet_force_tablet_count_decrease", servers)
+    params = {} if for_table_id is None else {'for_table_id': for_table_id}
+    await inject_error_on(manager, "tablet_force_tablet_count_decrease", servers, params=params)
     await s1_log.wait_for('Detected tablet merge for table', from_mark=s1_mark)
     await inject_error_off(manager, "tablet_force_tablet_count_decrease", servers)
 
@@ -596,7 +597,7 @@ async def test_tablet_incremental_repair_merge_higher_repaired_at_number(manager
     scylla_path = await manager.server_get_exe(servers[0].server_id)
 
     s1_mark = await logs[0].mark()
-    await trigger_tablet_merge(manager, servers, logs)
+    await trigger_tablet_merge(manager, servers, logs, table_id)
     # The merge process will set the unrepaired sstable with repaired_at=3 to repaired_at=0 during merge
     await logs[0].wait_for('Updating repaired_at for tablet merge .* old=3 new=0 sstables_repaired_at=2', from_mark=s1_mark)
     await logs[0].wait_for('Completed updating repaired_at=.* for tablet merge', from_mark=s1_mark)
@@ -637,7 +638,7 @@ async def test_tablet_incremental_repair_merge_correct_repaired_at_number_after_
     scylla_path = await manager.server_get_exe(servers[0].server_id)
 
     # Trigger merge
-    await trigger_tablet_merge(manager, servers, logs)
+    await trigger_tablet_merge(manager, servers, logs, table_id)
 
     # Verify sstables_repaired_at should be 3 after merge
     for server, host in zip(servers, hosts):
