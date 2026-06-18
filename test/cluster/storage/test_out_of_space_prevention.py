@@ -67,9 +67,13 @@ global_cmdline = ["--disk-space-monitor-normal-polling-interval-in-seconds", "1"
                   "--commitlog-segment-size-in-mb", "2",
                   "--schema-commitlog-segment-size-in-mb", "4",
                   "--tablet-load-stats-refresh-interval-in-seconds", "1",
+                  # Leave system keyspaces on vnodes to avoid running
+                  # out of space due to the system keyspaces taking up space
+                  "--error-injections-at-startup", "auto_rf_keyspaces_use_vnodes"
                   ]
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_user_writes_rejection(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     async with space_limited_servers(manager, volumes_factory, ["20M"]*3, cmdline=global_cmdline) as servers:
         cql, hosts = await manager.get_ready_cql(servers)
@@ -121,6 +125,7 @@ async def test_user_writes_rejection(manager: ScyllaClusterManager, volumes_fact
                 await cql.run_async(SimpleStatement(next(wgen), consistency_level=ConsistencyLevel.ALL))
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_autotoggle_compaction(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     cmdline = [*global_cmdline,
                "--logger-log-level", "compaction=debug"]
@@ -249,6 +254,7 @@ async def test_reject_split_compaction(manager: ScyllaClusterManager, volumes_fa
                     await log.wait_for(f"Split task .* for table {cf} .* stopped, reason: Compaction for {cf} was stopped due to: drain", from_mark=mark)
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_split_compaction_not_triggered(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     cmd = [*global_cmdline,
            "--logger-log-level", "compaction=debug"]
@@ -282,6 +288,7 @@ async def test_split_compaction_not_triggered(manager: ScyllaClusterManager, vol
                     assert await s1_log.grep(f"compaction.*Split {cf}", from_mark=s1_mark) == []
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_tablet_repair(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     async with space_limited_servers(manager, volumes_factory, ["20M"]*3, cmdline=global_cmdline) as servers:
         cql, _ = await manager.get_ready_cql(servers)
@@ -348,6 +355,7 @@ async def test_tablet_repair(manager: ScyllaClusterManager, volumes_factory: Cal
                 await manager.api.wait_task(servers[0].ip_addr, task_id)
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_autotoggle_reject_incoming_migrations(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     async with space_limited_servers(manager, volumes_factory, ["20M"]*3, cmdline=global_cmdline) as servers:
         await manager.disable_tablet_balancing()
@@ -407,6 +415,7 @@ async def test_autotoggle_reject_incoming_migrations(manager: ScyllaClusterManag
                 mark, _ = await log.wait_for("Streaming for tablet migration .* successful", from_mark=mark)
 
 
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_node_restart_while_tablet_split(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
     cmd = [*global_cmdline,
            "--logger-log-level", "compaction=debug"]
