@@ -24,6 +24,7 @@ from test.pylib.util import wait_for
 from test.pylib.rest_client import HTTPError
 from test.cluster.tasks.task_manager_client import TaskManagerClient
 from test.cluster.util import wait_for_token_ring_and_group0_consistency
+from test.cluster.test_tablets_lwt import wait_for_auto_rf_settled
 import statistics
 
 logger = logging.getLogger(__name__)
@@ -486,6 +487,10 @@ async def create_cluster(topology, manager, logger, object_storage=None):
         logger.info(f'Created node {s.ip_addr} in {dc}.{rack}')
         servers.append(s)
         host_ids[s.server_id] = await manager.get_host_id(s.server_id)
+
+    # Wait for auto-RF to complete before tests start restoring
+    await wait_for_auto_rf_settled(manager, time.time() + 120)
+    await manager.api.quiesce_topology(servers[0].ip_addr)
 
     return servers,host_ids
 
