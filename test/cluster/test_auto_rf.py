@@ -40,6 +40,31 @@ AUTO_RF_KEYSPACES = (
     (SYSTEM_TRACES_KS, SYSTEM_TRACES_TABLES, 2),
 )
 
+# Auto-RF only expands to racks/DCs where some *non-auto-RF* tablets keyspace
+# already places replicas, see
+# service::topology_coordinator::get_racks_for_auto_rf_change().
+# Tests which expect auto-RF to expand therefore have to provide such a
+# keyspace as the "eligibility anchor". A numeric RF makes all racks of the
+# listed DCs eligible, which is the most convenient anchor, but it requires
+# disabling rf_rack_valid_keyspaces: otherwise CREATE/ALTER KEYSPACE expands
+# the numeric RF into a rack list, which would only make that single rack
+# eligible.
+NUMERIC_RF_CFG = {"rf_rack_valid_keyspaces": "false"}
+
+
+async def create_anchor_keyspace(cql, dcs: list[str]) -> str:
+    """Create a non-auto-RF tablets keyspace with numeric RF=1 in every DC in `dcs`."""
+    opts = ", ".join(f"'{dc}': 1" for dc in dcs)
+    return await create_new_test_keyspace(
+        cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', {opts}}}")
+
+
+async def alter_anchor_keyspace(cql, ks: str, dcs: list[str]) -> None:
+    """Extend the anchor keyspace to cover every DC in `dcs`."""
+    opts = ", ".join(f"'{dc}': 1" for dc in dcs)
+    await cql.run_async(
+        f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', {opts}}}")
+
 
 async def add_servers_and_update_map(manager: ManagerClient, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], count: int, property_file: list[dict[str, str]] | dict[str, str], config: dict[str, str] | None = None) -> list[ServerInfo]:
     """Add multiple servers and update the host_to_dc_rack map incrementally."""
@@ -115,25 +140,27 @@ async def test_auto_rf_ks_coverage(manager: ManagerClient):
     Note: This is a coverage test, not a full behavioral test.
           The full auto RF functionality is tested in `test_auto_rf_behavior`.
     """
-    cfg_audit = {"audit": "table"}
+    cfg_audit = {"audit": "table"} | NUMERIC_RF_CFG
 
     logger.info("Create first rack and verify that the schemas are created")
     servers = []
     host_to_dc_rack = {}
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
     cql = manager.get_cql()
+    anchor_ks = await create_anchor_keyspace(cql, ['dc1'])
     for ks, tables, _ in AUTO_RF_KEYSPACES:
-        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']})
+        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Add a second rack and verify it is added to the RF")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
     for ks, tables, _ in AUTO_RF_KEYSPACES:
-        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']})
+        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=120)
 
     logger.info("Add a second dc with two racks and verify it is added to the RF")
     await add_servers_and_update_map(manager, servers, host_to_dc_rack, 2, [{"dc": "dc2", "rack": "r1"}, {"dc": "dc2", "rack": "r2"}], cfg_audit)
+    await alter_anchor_keyspace(cql, anchor_ks, ['dc1', 'dc2'])
     for ks, tables, _ in AUTO_RF_KEYSPACES:
-        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2'], 'dc2': ['r1', 'r2']})
+        await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2'], 'dc2': ['r1', 'r2']}, timeout=120)
 
 
 @pytest.mark.asyncio
@@ -150,17 +177,18 @@ async def test_auto_rf_behavior(manager: ManagerClient):
     """
     ks = AUDIT_KS
     tables = AUDIT_TABLES
-    cfg_audit = {"audit": "table"}
+    cfg_audit = {"audit": "table"} | NUMERIC_RF_CFG
 
     logger.info("Create first rack and verify that schema is created")
     servers = []
     host_to_dc_rack = {}
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
     cql = manager.get_cql()
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']})
+    anchor_ks = await create_anchor_keyspace(cql, ['dc1'])
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Check schema after restart")
-    await asyncio.gather(*[manager.server_stop(s.server_id) for s in servers])
+    await asyncio.gather(*[manager.server_stop(s.server_id, convict=False) for s in servers])
     await asyncio.gather(*[manager.server_start(s.server_id) for s in servers])
     cql = manager.get_cql()
     await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
@@ -172,11 +200,11 @@ async def test_auto_rf_behavior(manager: ManagerClient):
 
     logger.info("Add a second rack with two nodes and verify it is added to the RF")
     r2_servers = await add_servers_and_update_map(manager, servers, host_to_dc_rack, 2, [{"dc": "dc1", "rack": "r2"}, {"dc": "dc1", "rack": "r2"}], cfg_audit)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']})
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=120)
 
     logger.info("Add a third rack and verify it is added to the RF")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r3"}, cfg_audit)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']})
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']}, timeout=120)
 
     logger.info("Add a fourth rack and verify it is not added to the RF (RF goal 3 has been reached)")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r4"}, cfg_audit)
@@ -186,7 +214,8 @@ async def test_auto_rf_behavior(manager: ManagerClient):
 
     logger.info("Add a node in a new dc and verify it is added to the RF of the new DC")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc2", "rack": "r1"}, cfg_audit)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']})
+    await alter_anchor_keyspace(cql, anchor_ks, ['dc1', 'dc2'])
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']}, timeout=120)
 
     logger.info("Add a zero-token node in a new dc and verify the RF is not changed")
     cfg_zero_token = {"join_ring": "false"}
@@ -240,7 +269,9 @@ async def test_auto_rf_audit_ks_late_creation(manager: ManagerClient):
         {"dc": "dc2", "rack": "r1"},
         {"dc": "dc2", "rack": "r2"},
     ]
-    cfg = {"tablet_load_stats_refresh_interval_in_seconds": "1"}
+    # Audit is enabled by default, it has to be disabled explicitly to
+    # postpone the creation of the audit keyspace.
+    cfg = {"tablet_load_stats_refresh_interval_in_seconds": "1", "audit": "none"} | NUMERIC_RF_CFG
     await add_servers_and_update_map(manager, servers, host_to_dc_rack, 4, property_files, config=cfg)
 
     logger.info("Verify the audit schema does not exist yet")
@@ -248,11 +279,14 @@ async def test_auto_rf_audit_ks_late_creation(manager: ManagerClient):
     rows = await cql.run_async(f"SELECT keyspace_name FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
     assert len(rows) == 0, f"Keyspace {ks} should not exist yet"
 
+    logger.info("Create the eligibility anchor keyspace covering both DCs")
+    await create_anchor_keyspace(cql, ['dc1', 'dc2'])
+
     logger.info("Add a new node with audit enabled")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg | {"audit": "table"})
 
     logger.info("Verify the audit schema is created with correct RF")
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2'], 'dc2': ['r1', 'r2']}, timeout=30)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2'], 'dc2': ['r1', 'r2']}, timeout=120)
 
 
 # ---------------------------------------------------------------------------
@@ -323,41 +357,37 @@ async def wait_for_auto_rf_to_settle(manager: ManagerClient, server: ServerInfo,
 
 
 async def wait_for_rf_change_task(manager: ManagerClient, server: ServerInfo, cql, ks: str,
-                                  timeout: float = 120.0) -> None:
+                                  before_tasks: set, timeout: float = 120.0) -> None:
     """
-    Wait until a keyspace_rf_change task for `ks` is scheduled AND completes
-    successfully. Use this in positive tests that expect auto-RF to act.
+    Wait until a keyspace_rf_change task for `ks` which is not in `before_tasks`
+    is scheduled AND completes successfully. Use this in positive tests that
+    expect auto-RF to act.
+
+    Note that the task may already be in the "done" state when we first see it:
+    auto-RF changes are scheduled by the topology coordinator in parallel with
+    the operation that triggered them, so a quick RF change can complete before
+    the triggering statement returns to the client. Hence we only require that
+    a *new* task shows up, not that we catch it in a non-final state.
     """
     task_mgr = TaskManagerClient(manager.api)
     deadline = time.time() + timeout
 
-    # Wait for the task to appear (either running or done).
-    task_id = None
-    while task_id is None:
-        for t in await _list_rf_change_tasks(manager, server, ks):
-            # Ignore tasks that existed before we were called and are already
-            # finished (they belong to a previous step). A freshly scheduled
-            # task will either be pending in system.topology_requests or
-            # present in a non-"done" state for at least a brief moment, so
-            # require that we actually observe pending work or a running task.
-            if t.state in ("created", "running", "suspended"):
-                task_id = t.task_id
-                break
-        if task_id is None and await get_pending_rf_changes(cql, ks) > 0:
-            # Pending in sys_ks but task manager hasn't exposed it yet.
-            await asyncio.sleep(0.2)
-            continue
-        if task_id is not None:
+    new_tasks: set = set()
+    while not new_tasks:
+        tasks = await _list_rf_change_tasks(manager, server, ks)
+        new_tasks = {t.task_id for t in tasks} - before_tasks
+        if new_tasks:
             break
         if time.time() >= deadline:
             raise AssertionError(f"no keyspace_rf_change task appeared for {ks} within {timeout}s")
         await asyncio.sleep(0.2)
 
-    logger.info(f"Waiting for rf_change task {task_id} on {ks} to complete")
-    status = await task_mgr.wait_for_task(server.ip_addr, task_id)
-    assert status.state == "done", (
-        f"keyspace_rf_change task {task_id} for {ks} ended in state "
-        f"{status.state}: {status.error}")
+    for task_id in new_tasks:
+        logger.info(f"Waiting for rf_change task {task_id} on {ks} to complete")
+        status = await task_mgr.wait_for_task(server.ip_addr, task_id)
+        assert status.state == "done", (
+            f"keyspace_rf_change task {task_id} for {ks} ended in state "
+            f"{status.state}: {status.error}")
     # And make sure nothing else is still pending (defense in depth).
     await wait_for_auto_rf_to_settle(manager, server, cql, ks)
 
@@ -419,7 +449,7 @@ async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ManagerClient)
     await cql.run_async(
         f"ALTER KEYSPACE {user_ks} WITH replication = "
         f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2']}}")
-    await wait_for_rf_change_task(manager, server0, cql, ks)
+    await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=0)
 
     await cql.run_async(f"DROP KEYSPACE {user_ks}")
@@ -466,7 +496,7 @@ async def test_auto_rf_expansion_gated_by_user_dc(manager: ManagerClient):
     await cql.run_async(
         f"ALTER KEYSPACE {user_ks} WITH replication = "
         f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1'], 'dc2': ['r1']}}")
-    await wait_for_rf_change_task(manager, server0, cql, ks)
+    await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables,
                         {'dc1': ['r1'], 'dc2': ['r1']}, timeout=0)
 
@@ -485,7 +515,10 @@ async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: M
     """
     ks = AUDIT_KS
     tables = AUDIT_TABLES
-    cfg_audit = {"audit": "table"}
+    # rf_rack_valid_keyspaces has to be disabled, otherwise CREATE KEYSPACE
+    # expands the numeric RF into a single-rack rack list and the keyspace
+    # would only make that one rack eligible.
+    cfg_audit = {"audit": "table"} | NUMERIC_RF_CFG
 
     logger.info("Start cluster with 1 node in dc1/r1, audit enabled")
     servers = []
@@ -498,12 +531,13 @@ async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: M
     user_ks = await create_new_test_keyspace(
         cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1}")
     await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Add a node in dc1/r2 -- all racks are eligible, so audit must expand to r2")
+    before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
-    await wait_for_rf_change_task(manager, server0, cql, ks)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=0)
+    await wait_for_rf_change_task(manager, server0, cql, ks, before_tasks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=60)
 
     await cql.run_async(f"DROP KEYSPACE {user_ks}")
 
@@ -536,6 +570,14 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Manage
     cql = manager.get_cql()
     server0 = servers[0]
 
+    async def get_replication() -> dict:
+        rows = await cql.run_async(
+            f"SELECT replication, replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
+        assert len(rows) == 1
+        replication = parse_replication_options(rows[0].replication_v2 or rows[0].replication)
+        replication.pop('class', None)
+        return replication
+
     logger.info("Wait for audit keyspace to appear")
     async def wait_audit_exists():
         deadline = time.time() + 60
@@ -547,6 +589,14 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Manage
             await asyncio.sleep(1)
         raise AssertionError(f"audit keyspace did not appear within 60s")
     await wait_audit_exists()
+
+    # The replication options the keyspace was created with. Note that the
+    # exact value depends on which node created the keyspace and on whether
+    # the numeric RF was expanded into a rack list by CREATE KEYSPACE, so it
+    # must not be hardcoded here -- the point of the test is that auto-RF
+    # leaves it alone.
+    initial_replication = await get_replication()
+    logger.info(f"Initial replication options of {ks}: {initial_replication}")
 
     logger.info("Wait for the coordinator to settle, then assert no RF change task ran for audit")
     before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
@@ -562,11 +612,8 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Manage
         f"Without any non-auto-RF tablet keyspace, auto-RF should not schedule "
         f"any task for {ks}, but observed {len(new_tasks)} new task(s): {new_tasks}")
 
-    rows = await cql.run_async(
-        f"SELECT replication, replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
-    assert len(rows) == 1
-    replication = parse_replication_options(rows[0].replication_v2 or rows[0].replication)
-    replication.pop('class', None)
-    assert replication == {'dc1': '1'}, (
-        f"Auto-RF unexpectedly modified {ks} replication: got {replication}. "
-        f"Without any non-auto-RF tablet keyspace, no rack should be eligible.")
+    replication = await get_replication()
+    assert replication == initial_replication, (
+        f"Auto-RF unexpectedly modified {ks} replication: got {replication}, "
+        f"expected {initial_replication}. Without any non-auto-RF tablet "
+        f"keyspace, no rack should be eligible.")
