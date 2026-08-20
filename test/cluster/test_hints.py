@@ -20,7 +20,7 @@ from test.pylib.scylla_cluster import ReplaceConfig
 from test.pylib.util import gather_safely, wait_for
 
 from test.pylib import nodetool
-from test.cluster.util import get_topology_coordinator, keyspace_has_tablets, new_test_keyspace, new_test_table
+from test.cluster.util import alter_keyspace_retry_ongoing_rf_change, get_topology_coordinator, keyspace_has_tablets, new_test_keyspace, new_test_table
 
 
 logger = logging.getLogger(__name__)
@@ -58,7 +58,10 @@ async def remove_rack(cql, rack, ks):
     if rack in replicas:
         replicas.remove(rack)
         repl_list = list(replicas)
-        await cql.run_async(f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {repl_list}}}")
+        # Auto-RF adjusts the replication of the system keyspaces on its own,
+        # so this ALTER can lose the race against an RF change already in flight.
+        await alter_keyspace_retry_ongoing_rf_change(
+            cql, f"ALTER KEYSPACE {ks} WITH REPLICATION = {{'class': 'NetworkTopologyStrategy', 'dc': {repl_list}}}")
     else:
         logger.debug(f"rack {rack} is not in {replicas}; ALTER KEYSPACE for {ks} not issued.")
 
