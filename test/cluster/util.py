@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import pytest
+from cassandra import InvalidRequest                    # type: ignore # pylint: disable=no-name-in-module
 from cassandra.cluster import ConnectionException, ConsistencyLevel, NoHostAvailable, Session, SimpleStatement  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
 from test.pylib.internal_types import ServerInfo, HostID
@@ -771,3 +772,40 @@ def get_replica_count(rf: ReplicationOption) -> int:
         get_replica_count(["2"]) == 2
     """
     return len(rf) if type(rf) is list else int(rf)
+
+
+async def alter_keyspace_retry_ongoing_rf_change(cql, stmt: str, timeout: float = 120) -> None:
+    """
+    Execute an ALTER KEYSPACE statement, retrying while an RF change for that
+    keyspace is already in flight.
+
+    The auto-RF mechanism changes the replication options of the system
+    keyspaces (audit, system_traces) on its own, and the server rejects a
+    concurrent RF change for the same keyspace. Tests which alter those
+    keyspaces have to cope with losing that race.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            await cql.run_async(stmt)
+            return
+        except InvalidRequest as exc:
+            if "ongoing" not in str(exc) or time.time() >= deadline:
+                raise
+            logger.info(f"Retrying '{stmt}' after: {exc}")
+            await asyncio.sleep(1)
+
+
+async def quiesce_and_disable_tablet_balancing(manager: ManagerClient, server_ip: str) -> None:
+    """
+    Let the tablet balancer finish its pending work, then disable it.
+
+    The auto-RF system keyspaces (audit, system_traces) are created with a
+    per-shard tablet count goal, so the balancer splits their tablets shortly
+    after the cluster is started. A pending resize makes quiesce_topology
+    defer forever, and with the balancer disabled the resize is never
+    finalized, so tests which disable balancing and later quiesce the topology
+    have to let that initial resize complete first.
+    """
+    await manager.api.quiesce_topology(server_ip)
+    await manager.disable_tablet_balancing()
