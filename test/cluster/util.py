@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 
 import pytest
+from cassandra import InvalidRequest                    # type: ignore # pylint: disable=no-name-in-module
 from cassandra.cluster import ConnectionException, ConsistencyLevel, NoHostAvailable, Session, SimpleStatement  # type: ignore # pylint: disable=no-name-in-module
 from cassandra.pool import Host                          # type: ignore # pylint: disable=no-name-in-module
 from test.pylib.internal_types import ServerInfo, HostID
@@ -265,11 +266,27 @@ async def check_token_ring_and_group0_consistency(manager: ScyllaClusterManager)
         assert token_ring_ids == group0_ids
 
 
-async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager, deadline: float) -> None:
+# Transition states which only reflect tablet load balancing activity rather
+# than a node operation. With the auto-RF system keyspaces on tablets the
+# balancer is busy most of the time, so tests which only care about node
+# operations must not wait for these to go away.
+TABLET_TRANSITION_STATES = frozenset((
+    "tablet draining",
+    "tablet migration",
+    "tablet resize finalization",
+    "tablet split finalization",
+))
+
+
+async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager, deadline: float,
+                                                  ignore_tablet_transitions: bool = False) -> None:
     """Wait until there is no pending topology transition.
     Polls system.topology until the transition_state column is null,
     indicating that the topology coordinator has finished processing the
     current operation (whether it completed successfully or was rolled back).
+
+    With ignore_tablet_transitions, transition states which belong to tablet
+    load balancing rather than to a node operation are not waited for.
     """
     cql = manager.get_cql()
 
@@ -293,8 +310,12 @@ async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager,
         if not rs:
             logger.warning(f"Topology transition not visible: system.topology row not found, retrying")
             return None
-        if rs[0].transition_state is not None:
-            logger.warning(f"Topology transition still in progress: {rs[0].transition_state}")
+        transition_state = rs[0].transition_state
+        if ignore_tablet_transitions and transition_state in TABLET_TRANSITION_STATES:
+            logger.info(f"Ignoring tablet transition state: {transition_state}")
+            return True
+        if transition_state is not None:
+            logger.warning(f"Topology transition still in progress: {transition_state}")
             return None
         return True
 
@@ -382,7 +403,27 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Scyl
     live_host_ids = frozenset(host.host_id for host in live_hosts)
     ignored_host_ids = frozenset(host.host_id for host in ignored_hosts)
 
-    topo_results = await asyncio.gather(*(cql.run_async("SELECT * FROM system.topology", host=host) for cql, host in zip(cqls, live_hosts)))
+    # The rows are compared across nodes below, so they have to be read from a
+    # point in time in which all nodes agree. Tablet migrations of the auto-RF
+    # system keyspaces keep advancing system.topology (in particular
+    # fence_version), so a plain read can easily catch two nodes at different
+    # versions. Issue a read barrier on every node and retry until the nodes
+    # agree; if they never do, fall through and let the assertions report it.
+    async def read_topology():
+        await asyncio.gather(*(read_barrier(manager.api, get_host_api_address(host)) for host in live_hosts))
+        return await asyncio.gather(*(cql.run_async("SELECT * FROM system.topology", host=host) for cql, host in zip(cqls, live_hosts)))
+
+    deadline = time.time() + 60
+    while True:
+        topo_results = await read_topology()
+        live_rows = [[row for row in res if row.host_id in live_host_ids] for res in topo_results]
+        if all(rows == live_rows[0] for rows in live_rows):
+            break
+        if time.time() >= deadline:
+            logging.warning("system.topology still differs between nodes, proceeding to report the difference")
+            break
+        logging.info("system.topology differs between nodes, retrying")
+        await asyncio.sleep(1)
 
     for host, topo_res in zip(live_hosts, topo_results):
         logging.info(f"Dumping the state of system.topology as seen by {host}:")
@@ -787,3 +828,72 @@ def get_replica_count(rf: ReplicationOption) -> int:
         get_replica_count(["2"]) == 2
     """
     return len(rf) if type(rf) is list else int(rf)
+
+
+async def alter_keyspace_retry_ongoing_rf_change(cql, stmt: str, timeout: float = 120) -> None:
+    """
+    Execute an ALTER KEYSPACE statement, retrying while an RF change for that
+    keyspace is already in flight.
+
+    The auto-RF mechanism changes the replication options of the system
+    keyspaces (audit, system_traces) on its own, and the server rejects a
+    concurrent RF change for the same keyspace. Tests which alter those
+    keyspaces have to cope with losing that race.
+    """
+    deadline = time.time() + timeout
+    while True:
+        try:
+            await cql.run_async(stmt)
+            return
+        except InvalidRequest as exc:
+            if "ongoing" not in str(exc) or time.time() >= deadline:
+                raise
+            logger.info(f"Retrying '{stmt}' after: {exc}")
+            await asyncio.sleep(1)
+
+
+async def wait_for_auto_rf_settled(cql, timeout: float = 120) -> None:
+    """
+    Wait until auto-RF has no work left to do.
+
+    The auto-RF system keyspaces (audit, system_traces) are on tablets, and the
+    topology coordinator expands their replication on its own as racks become
+    eligible. Every such change bumps the topology version and rewrites their
+    tablet maps, so a test which reads the topology twice can see the two reads
+    disagree. disable_tablet_balancing() does not help here: auto-RF is a
+    separate source of topology mutations, not balancer work.
+
+    Note that creating a non-auto-RF tablets keyspace is itself what makes racks
+    eligible, so the expansion is typically triggered by the test's own setup and
+    has to be waited for after it.
+    """
+    deadline = time.time() + timeout
+    while True:
+        pending = await cql.run_async(
+            "SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
+            "AND done=False ALLOW FILTERING")
+        # Between finishing one RF change and queueing the next the request table is
+        # empty, so the needs_auto_rf_change flag has to be checked as well.
+        rows = await cql.run_async("SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'")
+        needs_change = bool(rows and rows[0].needs_auto_rf_change)
+        if not pending and not needs_change:
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(f"auto-RF did not settle within {timeout}s: "
+                               f"pending={len(pending)}, needs_auto_rf_change={needs_change}")
+        await asyncio.sleep(0.5)
+
+
+async def quiesce_and_disable_tablet_balancing(manager: ManagerClient, server_ip: str) -> None:
+    """
+    Let the tablet balancer finish its pending work, then disable it.
+
+    The auto-RF system keyspaces (audit, system_traces) are created with a
+    per-shard tablet count goal, so the balancer splits their tablets shortly
+    after the cluster is started. A pending resize makes quiesce_topology
+    defer forever, and with the balancer disabled the resize is never
+    finalized, so tests which disable balancing and later quiesce the topology
+    have to let that initial resize complete first.
+    """
+    await manager.api.quiesce_topology(server_ip)
+    await manager.disable_tablet_balancing()
