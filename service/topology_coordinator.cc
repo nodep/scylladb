@@ -1595,6 +1595,10 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
     }
 
     std::vector<std::pair<sstring, size_t>> get_keyspaces_that_require_auto_rf_change(const group0_guard& guard) {
+        // Note that a keyspace may need a change even if the RF goal is already
+        // met in every DC it replicates to: a new DC may have become eligible
+        // and has to be added to the replication options.
+        const auto allowed_racks = get_racks_for_auto_rf_change();
         std::vector<std::pair<sstring, size_t>> result;
         for (const auto& [ks_name, goal] : get_auto_rf_keyspaces()) {
             if (!_db.has_keyspace(ks_name)) {
@@ -1609,17 +1613,17 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             }
 
             auto options = ks_md->strategy_options();
-            for (const auto& [dc, rf] : options) {
-                auto rf_data = locator::replication_factor_data(rf);
-                if (rf_data.is_rack_based()) {
-                    auto rack_list = rf_data.get_rack_list();
-                    if (rack_list.size() < goal) {
-                        result.emplace_back(ks_name, goal);
-                        break;
-                    }
-                } else {
-                    result.emplace_back(ks_name, goal);
-                }
+            bool needs_change = std::ranges::any_of(options, [goal = goal] (const auto& e) {
+                auto rf_data = locator::replication_factor_data(e.second);
+                return !rf_data.is_rack_based() || rf_data.get_rack_list().size() < goal;
+            });
+            if (!needs_change) {
+                needs_change = std::ranges::any_of(allowed_racks, [&options] (const auto& e) {
+                    return !options.contains(e.first);
+                });
+            }
+            if (needs_change) {
+                result.emplace_back(ks_name, goal);
             }
         }
         return result;
