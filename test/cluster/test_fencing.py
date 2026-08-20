@@ -59,7 +59,12 @@ def all_hints_metrics(metrics: ScyllaMetrics) -> list[str]:
 
 @pytest.mark.parametrize("tablets_enabled", [True, False])
 async def test_fence_writes(request, manager: ScyllaClusterManager, tablets_enabled: bool):
-    cfg = {'tablets_mode_for_new_keyspaces' : 'enabled' if tablets_enabled else 'disabled'}
+    # Auto-RF must be suppressed for the same reason the load balancer is
+    # disabled below: the RF changes it schedules for the system keyspaces bump
+    # the topology version, which breaks the version == fence_version condition
+    # the test relies on.
+    cfg = {'tablets_mode_for_new_keyspaces' : 'enabled' if tablets_enabled else 'disabled',
+           'error_injections_at_startup': ['skip_auto_rf_change']}
 
     logger.info("Bootstrapping first two nodes")
     servers = await manager.servers_add(2, config=cfg, property_file=[
@@ -127,8 +132,12 @@ async def test_fence_writes(request, manager: ScyllaClusterManager, tablets_enab
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_fence_hints(request, manager: ScyllaClusterManager):
     logger.info("Bootstrapping cluster with three nodes")
+    # Auto-RF is suppressed for the same reason the load balancer is disabled
+    # below: the RF changes it schedules for the system keyspaces bump the
+    # topology version, which breaks the version == fence_version condition
+    # the test relies on.
     s0 = await manager.server_add(
-        config={'error_injections_at_startup': ['decrease_hints_flush_period']},
+        config={'error_injections_at_startup': ['decrease_hints_flush_period', 'skip_auto_rf_change']},
         cmdline=['--logger-log-level', 'hints_manager=trace'],
         property_file={"dc": "dc1", "rack": "r1"})
 
@@ -139,7 +148,9 @@ async def test_fence_hints(request, manager: ScyllaClusterManager):
     # which the test relies on.
     await manager.disable_tablet_balancing()
 
-    [s1, s2] = await manager.servers_add(2, property_file=[
+    [s1, s2] = await manager.servers_add(2,
+        config={'error_injections_at_startup': ['skip_auto_rf_change']},
+        property_file=[
         {"dc": "dc1", "rack": "r2"},
         {"dc": "dc1", "rack": "r3"}
     ])
