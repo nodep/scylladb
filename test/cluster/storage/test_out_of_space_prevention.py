@@ -623,6 +623,9 @@ global_cmdline_with_disabled_monitor = [
     # budget of 5 reports/minute, so a later stall is logged as a bare
     # "Rate-limit: suppressed N backtraces" line with no backtrace (SCYLLADB-3850).
     "--blocked-reactor-reports-per-minute", "60",
+    # Leave system keyspaces on vnodes to avoid running
+    # out of space due to the system keyspaces taking up space
+    "--error-injections-at-startup", "auto_rf_keyspaces_use_vnodes",
 ]
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_sstables_incrementally_released_during_streaming(manager: ScyllaClusterManager, volumes_factory: Callable) -> None:
