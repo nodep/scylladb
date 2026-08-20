@@ -638,9 +638,17 @@ def verify_ownership(resp, expected_ip, expected_ownership, delta):
     assert actual_ip == expected_ip
     assert float(actual_ownership) == pytest.approx(expected_ownership, abs=delta)
 
-def test_get_ownership_tablets_disabled(cql, this_dc, rest_api):
-    resp = rest_api.send("GET", f"storage_service/ownership")
-    verify_ownership(resp=resp, expected_ip=rest_api.host, expected_ownership=1.0, delta=0.001)
+def test_get_ownership_with_only_system_tablet_keyspaces(cql, this_dc, rest_api):
+    # The auto-RF system keyspaces (audit, system_traces) always use tablets,
+    # so storage_service/ownership is rejected even when no user keyspace uses
+    # tablets. See test_get_ownership_tablets_enabled for the same check with a
+    # user tablet keyspace.
+    resp = rest_api.send("GET", "storage_service/ownership")
+    assert resp.status_code == requests.codes.bad_request
+
+    actual_error_reason = resp.json()["message"]
+    expected_error_reason = "storage_service/ownership cannot be used when a keyspace uses tablets"
+    assert expected_error_reason == actual_error_reason
 
 def test_get_effective_ownership_tablets_disabled_null_keyspace(cql, this_dc, rest_api):
     # 'null' triggers a special handler path - effective ownership of non-system keyspaces.
