@@ -339,6 +339,7 @@ async def test_remove_node_violating_rf_rack_with_rack_list(manager: ScyllaClust
 
 @pytest.mark.parametrize("op", ["remove", "decommission"])
 @pytest.mark.parametrize("scenario", ["last_in_dc", "last_in_rack"])
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_remove_last_node_in_dc_violating_rf_rack(manager: ScyllaClusterManager, op: str, scenario: str):
     """
     Test that removing the last node in a DC or rack is rejected when a
