@@ -262,11 +262,27 @@ async def check_token_ring_and_group0_consistency(manager: ScyllaClusterManager)
         assert token_ring_ids == group0_ids
 
 
-async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager, deadline: float) -> None:
+# Transition states which only reflect tablet load balancing activity rather
+# than a node operation. With the auto-RF system keyspaces on tablets the
+# balancer is busy most of the time, so tests which only care about node
+# operations must not wait for these to go away.
+TABLET_TRANSITION_STATES = frozenset((
+    "tablet draining",
+    "tablet migration",
+    "tablet resize finalization",
+    "tablet split finalization",
+))
+
+
+async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager, deadline: float,
+                                                  ignore_tablet_transitions: bool = False) -> None:
     """Wait until there is no pending topology transition.
     Polls system.topology until the transition_state column is null,
     indicating that the topology coordinator has finished processing the
     current operation (whether it completed successfully or was rolled back).
+
+    With ignore_tablet_transitions, transition states which belong to tablet
+    load balancing rather than to a node operation are not waited for.
     """
     cql = manager.get_cql()
 
@@ -290,8 +306,12 @@ async def wait_for_no_pending_topology_transition(manager: ScyllaClusterManager,
         if not rs:
             logger.warning(f"Topology transition not visible: system.topology row not found, retrying")
             return None
-        if rs[0].transition_state is not None:
-            logger.warning(f"Topology transition still in progress: {rs[0].transition_state}")
+        transition_state = rs[0].transition_state
+        if ignore_tablet_transitions and transition_state in TABLET_TRANSITION_STATES:
+            logger.info(f"Ignoring tablet transition state: {transition_state}")
+            return True
+        if transition_state is not None:
+            logger.warning(f"Topology transition still in progress: {transition_state}")
             return None
         return True
 
@@ -379,7 +399,27 @@ async def check_system_topology_and_cdc_generations_v3_consistency(manager: Scyl
     live_host_ids = frozenset(host.host_id for host in live_hosts)
     ignored_host_ids = frozenset(host.host_id for host in ignored_hosts)
 
-    topo_results = await asyncio.gather(*(cql.run_async("SELECT * FROM system.topology", host=host) for cql, host in zip(cqls, live_hosts)))
+    # The rows are compared across nodes below, so they have to be read from a
+    # point in time in which all nodes agree. Tablet migrations of the auto-RF
+    # system keyspaces keep advancing system.topology (in particular
+    # fence_version), so a plain read can easily catch two nodes at different
+    # versions. Issue a read barrier on every node and retry until the nodes
+    # agree; if they never do, fall through and let the assertions report it.
+    async def read_topology():
+        await asyncio.gather(*(read_barrier(manager.api, get_host_api_address(host)) for host in live_hosts))
+        return await asyncio.gather(*(cql.run_async("SELECT * FROM system.topology", host=host) for cql, host in zip(cqls, live_hosts)))
+
+    deadline = time.time() + 60
+    while True:
+        topo_results = await read_topology()
+        live_rows = [[row for row in res if row.host_id in live_host_ids] for res in topo_results]
+        if all(rows == live_rows[0] for rows in live_rows):
+            break
+        if time.time() >= deadline:
+            logging.warning("system.topology still differs between nodes, proceeding to report the difference")
+            break
+        logging.info("system.topology differs between nodes, retrying")
+        await asyncio.sleep(1)
 
     for host, topo_res in zip(live_hosts, topo_results):
         logging.info(f"Dumping the state of system.topology as seen by {host}:")
