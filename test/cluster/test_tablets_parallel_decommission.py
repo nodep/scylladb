@@ -289,7 +289,16 @@ async def test_remove_is_canceled_if_there_is_node_down(manager: ScyllaClusterMa
     cmdline = [
         '--logger-log-level', 'load_balancer=debug',
     ]
-    servers = await manager.servers_add(5, cmdline=cmdline, property_file=[
+    # The test stops nodes while a removenode request is queued. Auto-RF would
+    # meanwhile schedule an RF change for the system keyspaces (the test keyspace
+    # created below makes rack1 and rack2 eligible). The tablet migrations of such
+    # an RF change need a global token metadata barrier which requires every node
+    # to be up (see the FIXME in
+    # service::topology_coordinator::global_tablet_token_metadata_barrier()), so
+    # the coordinator would retry the barrier forever and never cancel the queued
+    # request.
+    config = {'error_injections_at_startup': ['skip_auto_rf_change']}
+    servers = await manager.servers_add(5, cmdline=cmdline, config=config, property_file=[
         {"dc": "dc1", "rack": "rack1"},
         {"dc": "dc1", "rack": "rack1"},
         {"dc": "dc1", "rack": "rack2"},
