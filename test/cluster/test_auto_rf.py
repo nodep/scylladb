@@ -312,6 +312,12 @@ async def get_pending_rf_changes(cql, ks: str) -> int:
     return len(rows)
 
 
+async def needs_auto_rf_change(cql) -> bool:
+    """Return whether the topology coordinator still has auto-RF work to do."""
+    rows = await cql.run_async("SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'")
+    return bool(rows and rows[0].needs_auto_rf_change)
+
+
 async def _list_rf_change_tasks(manager: ManagerClient, server: ServerInfo, ks: str):
     """Return all keyspace_rf_change tasks known to the task manager for `ks`.
 
@@ -345,14 +351,20 @@ async def wait_for_auto_rf_to_settle(manager: ManagerClient, server: ServerInfo,
         pending = await get_pending_rf_changes(cql, ks)
         tasks = await _list_rf_change_tasks(manager, server, ks)
         running = [t for t in tasks if t.state in ("created", "running", "suspended")]
-        if pending == 0 and not running:
+        # needs_auto_rf_change is what makes the coordinator revisit the auto-RF
+        # keyspaces. Between two consecutive steps of a multi-step expansion
+        # there is a window in which the flag is set but the next request has
+        # not been created yet, so checking the requests alone is not enough.
+        needs_change = await needs_auto_rf_change(cql)
+        if pending == 0 and not running and not needs_change:
             final = {t.task_id for t in tasks}
             new_tasks = final - initial
             return len(new_tasks)
         if time.time() - start > timeout:
             raise AssertionError(
                 f"auto-RF for {ks} did not settle within {timeout}s: "
-                f"pending={pending}, running_tasks={[t.task_id for t in running]}")
+                f"pending={pending}, needs_auto_rf_change={needs_change}, "
+                f"running_tasks={[t.task_id for t in running]}")
         await asyncio.sleep(0.5)
 
 
@@ -450,7 +462,7 @@ async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ManagerClient)
         f"ALTER KEYSPACE {user_ks} WITH replication = "
         f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2']}}")
     await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=0)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=60)
 
     await cql.run_async(f"DROP KEYSPACE {user_ks}")
 
@@ -498,7 +510,7 @@ async def test_auto_rf_expansion_gated_by_user_dc(manager: ManagerClient):
         f"{{'class': 'NetworkTopologyStrategy', 'dc1': ['r1'], 'dc2': ['r1']}}")
     await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables,
-                        {'dc1': ['r1'], 'dc2': ['r1']}, timeout=0)
+                        {'dc1': ['r1'], 'dc2': ['r1']}, timeout=60)
 
     await cql.run_async(f"DROP KEYSPACE {user_ks}")
 
