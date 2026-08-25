@@ -585,6 +585,7 @@ async def test_view_building_failure(manager: ScyllaClusterManager):
         await check_view_contents(cql, ks, "tab", "mv_cf_view")
 
 # Reproduces scylladb/scylladb#25912
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_concurrent_tablet_migrations(manager: ScyllaClusterManager):
     """
     The test creates a situation where a single tablet is replicated across
