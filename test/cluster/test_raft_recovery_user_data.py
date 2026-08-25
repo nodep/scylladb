@@ -62,7 +62,7 @@ async def test_raft_recovery_user_data(manager: ScyllaClusterManager, remove_dea
     # makes auto-RF-managed system keyspaces use vnodes instead of tablets, so they
     # don't take part in tablet topology validation and dc2 removal proceeds without
     # further intervention.
-    cfg['error_injections_at_startup'] = 'auto_rf_keyspaces_use_vnodes'
+    cfg['error_injections_at_startup'] = ['auto_rf_keyspaces_use_vnodes']
 
     logging.info(f'dbglog cfg: {cfg}')
 
