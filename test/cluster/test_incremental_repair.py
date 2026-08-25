@@ -789,7 +789,13 @@ async def test_incremental_repair_finishes_when_tablet_skips_end_repair_stage(ma
 @pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
 async def test_incremental_repair_rejoin_do_tablet_operation(manager):
     cmdline = ['--logger-log-level', 'raft_topology=debug']
-    servers = await manager.servers_add(3, auto_rack_dc="dc1", cmdline=cmdline)
+    # repair_finish_wait cannot be scoped to a single table, so it is also hit by
+    # the repair phase of the tablet rebuilds which auto-RF triggers for the
+    # system keyspaces. Nobody releases those, so they hold the repair slot until
+    # they abort on the injection's timeout and the repair of the test table is
+    # never initiated. Keep the system keyspaces on vnodes to avoid that.
+    config = {'error_injections_at_startup': ['auto_rf_keyspaces_use_vnodes']}
+    servers = await manager.servers_add(3, auto_rack_dc="dc1", config=config, cmdline=cmdline)
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}") as ks:
         async with new_test_table(manager, ks, "pk int PRIMARY KEY, t text") as cf:
