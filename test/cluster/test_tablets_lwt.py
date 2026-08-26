@@ -794,7 +794,7 @@ async def test_no_uncertainty_for_reads(manager: ScyllaClusterManager):
     # ("Scheduling auto RF change for keyspace"), we wait for the topology to
     # quiesce so the fence version is stable for the duration of the LWT.
     coord_host = await get_topology_coordinator(manager)
-    coord_srv = await find_server_by_host_id(manager, servers, coord_host)
+    coord_srv = await manager.find_server_by_host_id(servers, coord_host)
     coord_log = await manager.server_open_log(coord_srv.server_id)
     await manager.disable_tablet_balancing()
 
