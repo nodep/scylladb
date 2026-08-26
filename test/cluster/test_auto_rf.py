@@ -12,7 +12,7 @@ import pytest
 
 from test.pylib.rest_client import HTTPError
 from test.pylib.tablets import get_all_tablet_replicas
-from test.pylib.manager_client import ManagerClient
+from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.internal_types import ServerInfo, HostID
 from test.cluster.tasks.task_manager_client import TaskManagerClient
 from test.cluster.util import create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts
@@ -66,7 +66,7 @@ async def alter_anchor_keyspace(cql, ks: str, dcs: list[str]) -> None:
         f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', {opts}}}")
 
 
-async def add_servers_and_update_map(manager: ManagerClient, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], count: int, property_file: list[dict[str, str]] | dict[str, str], config: dict[str, str] | None = None) -> list[ServerInfo]:
+async def add_servers_and_update_map(manager: ScyllaClusterManager, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], count: int, property_file: list[dict[str, str]] | dict[str, str], config: dict[str, str] | None = None) -> list[ServerInfo]:
     """Add multiple servers and update the host_to_dc_rack map incrementally."""
     new_servers = await manager.servers_add(count, property_file=property_file, config=config)
     servers.extend(new_servers)
@@ -76,13 +76,13 @@ async def add_servers_and_update_map(manager: ManagerClient, servers: list[Serve
     return new_servers
 
 
-async def add_server_and_update_map(manager: ManagerClient, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], property_file: dict[str, str], config: dict[str, str] | None = None) -> ServerInfo:
+async def add_server_and_update_map(manager: ScyllaClusterManager, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], property_file: dict[str, str], config: dict[str, str] | None = None) -> ServerInfo:
     """Add a server and update the host_to_dc_rack map incrementally."""
     new_servers = await add_servers_and_update_map(manager, servers, host_to_dc_rack, 1, [property_file], config)
     return new_servers[0]
 
 
-async def verify_schema(cql, manager: ManagerClient, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], ks: str, tables: set[str], expected_replication: dict[str, list[str]], timeout: int = 10, retry_interval: int = 1) -> None:
+async def verify_schema(cql, manager: ScyllaClusterManager, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], ks: str, tables: set[str], expected_replication: dict[str, list[str]], timeout: int = 10, retry_interval: int = 1) -> None:
     async def _check():
         # Verify keyspace exists
         rows = await cql.run_async(f"SELECT replication, replication_v2 FROM system_schema.keyspaces WHERE keyspace_name='{ks}'")
@@ -133,7 +133,7 @@ async def verify_schema(cql, manager: ManagerClient, servers: list[ServerInfo], 
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_ks_coverage(manager: ManagerClient):
+async def test_auto_rf_ks_coverage(manager: ScyllaClusterManager):
     """
     Verify that Scylla applies the automatic replication factor to all eligible system keyspaces.
     The list of eligible keyspaces is currently hardcoded.
@@ -164,7 +164,7 @@ async def test_auto_rf_ks_coverage(manager: ManagerClient):
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_behavior(manager: ManagerClient):
+async def test_auto_rf_behavior(manager: ScyllaClusterManager):
     """
     Verify all aspects of the automatic replication factor mechanism:
     * Per-DC replication factors are automatically expanded as nodes in new racks join the cluster.
@@ -247,7 +247,7 @@ async def test_auto_rf_behavior(manager: ManagerClient):
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_audit_ks_late_creation(manager: ManagerClient):
+async def test_auto_rf_audit_ks_late_creation(manager: ScyllaClusterManager):
     """
     Verify that the audit keyspace can be created and auto-expanded on an existing cluster.
 
@@ -318,7 +318,7 @@ async def needs_auto_rf_change(cql) -> bool:
     return bool(rows and rows[0].needs_auto_rf_change)
 
 
-async def _list_rf_change_tasks(manager: ManagerClient, server: ServerInfo, ks: str):
+async def _list_rf_change_tasks(manager: ScyllaClusterManager, server: ServerInfo, ks: str):
     """Return all keyspace_rf_change tasks known to the task manager for `ks`.
 
     This includes pending/running tasks and recently-completed tasks still
@@ -329,7 +329,7 @@ async def _list_rf_change_tasks(manager: ManagerClient, server: ServerInfo, ks: 
     return [t for t in tasks if t.type == "keyspace_rf_change"]
 
 
-async def wait_for_auto_rf_to_settle(manager: ManagerClient, server: ServerInfo, cql, ks: str,
+async def wait_for_auto_rf_to_settle(manager: ScyllaClusterManager, server: ServerInfo, cql, ks: str,
                                      timeout: float = 120.0) -> int:
     """
     Wait until the topology coordinator has finished acting on `ks`:
@@ -368,7 +368,7 @@ async def wait_for_auto_rf_to_settle(manager: ManagerClient, server: ServerInfo,
         await asyncio.sleep(0.5)
 
 
-async def wait_for_rf_change_task(manager: ManagerClient, server: ServerInfo, cql, ks: str,
+async def wait_for_rf_change_task(manager: ScyllaClusterManager, server: ServerInfo, cql, ks: str,
                                   before_tasks: set, timeout: float = 120.0) -> None:
     """
     Wait until a keyspace_rf_change task for `ks` which is not in `before_tasks`
@@ -405,7 +405,7 @@ async def wait_for_rf_change_task(manager: ManagerClient, server: ServerInfo, cq
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ManagerClient):
+async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ScyllaClusterManager):
     """
     Verify that auto-RF on the audit keyspace only expands to racks that are
     already present in the rack list of some other (non-auto-RF) tablets
@@ -468,7 +468,7 @@ async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ManagerClient)
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_expansion_gated_by_user_dc(manager: ManagerClient):
+async def test_auto_rf_expansion_gated_by_user_dc(manager: ScyllaClusterManager):
     """
     Same gating rule, but at the DC dimension: auto-RF must not add a new DC
     to audit's replication options until some non-auto-RF tablets keyspace
@@ -516,7 +516,7 @@ async def test_auto_rf_expansion_gated_by_user_dc(manager: ManagerClient):
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: ManagerClient):
+async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: ScyllaClusterManager):
     """
     If a non-auto-RF tablets keyspace uses a numeric RF (e.g. dc1: 1), then
     all racks in that DC are considered eligible for auto-RF expansion,
@@ -555,7 +555,7 @@ async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: M
 
 
 @pytest.mark.asyncio
-async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: ManagerClient):
+async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: ScyllaClusterManager):
     """
     Regression test for the chicken-and-egg case: when there is no
     non-auto-RF tablets keyspace in the cluster at all, auto-RF has nothing
