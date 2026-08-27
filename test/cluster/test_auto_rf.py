@@ -10,12 +10,11 @@ import logging
 
 import pytest
 
-from test.pylib.rest_client import HTTPError
 from test.pylib.tablets import get_all_tablet_replicas
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.internal_types import ServerInfo, HostID
 from test.cluster.tasks.task_manager_client import TaskManagerClient
-from test.cluster.util import create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts
+from test.cluster.util import alter_keyspace_retry_ongoing_rf_change, create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts
 
 
 logger = logging.getLogger(__name__)
@@ -44,12 +43,33 @@ AUTO_RF_KEYSPACES = (
 # already places replicas, see
 # service::topology_coordinator::get_racks_for_auto_rf_change().
 # Tests which expect auto-RF to expand therefore have to provide such a
-# keyspace as the "eligibility anchor". A numeric RF makes all racks of the
-# listed DCs eligible, which is the most convenient anchor, but it requires
-# disabling rf_rack_valid_keyspaces: otherwise CREATE/ALTER KEYSPACE expands
-# the numeric RF into a rack list, which would only make that single rack
-# eligible.
+# keyspace as the "eligibility anchor". There are two flavors:
+#
+# * A numeric RF marks every rack of the listed DCs eligible. That is the
+#   convenient anchor for tests which only care *that* expansion happens, but
+#   it requires disabling rf_rack_valid_keyspaces (NUMERIC_RF_CFG): otherwise
+#   CREATE/ALTER KEYSPACE expands the numeric RF into a rack list, which would
+#   make only that single rack eligible.
+# * An explicit rack list marks exactly the listed racks eligible. Tests which
+#   assert *which* rack auto-RF picks have to use this flavor, because it is the
+#   only one which gives the test control over the eligible set. It needs no
+#   config override: prepare_options() passes an explicit rack list through
+#   unchanged, so it works with the default rf_rack_valid_keyspaces=true.
 NUMERIC_RF_CFG = {"rf_rack_valid_keyspaces": "false"}
+
+
+def sorted_racks(replication: dict[str, list[str] | str]) -> dict[str, list[str] | str]:
+    """
+    Normalize replication options for comparison.
+
+    A rack list is semantically a set: auto-RF appends the rack it picks, so the
+    order of the racks in system_schema.keyspaces is not significant.
+    """
+    return {dc: sorted(rf) if isinstance(rf, list) else rf for dc, rf in replication.items()}
+
+
+def rack_list_opts(racks_per_dc: dict[str, list[str]]) -> str:
+    return ", ".join(f"'{dc}': {racks}" for dc, racks in racks_per_dc.items())
 
 
 async def create_anchor_keyspace(cql, dcs: list[str]) -> str:
@@ -64,6 +84,33 @@ async def alter_anchor_keyspace(cql, ks: str, dcs: list[str]) -> None:
     opts = ", ".join(f"'{dc}': 1" for dc in dcs)
     await cql.run_async(
         f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', {opts}}}")
+
+
+async def create_rack_anchor_keyspace(cql, racks_per_dc: dict[str, list[str]]) -> str:
+    """Create a non-auto-RF tablets keyspace replicating to exactly `racks_per_dc`."""
+    return await create_new_test_keyspace(
+        cql, f"WITH replication = {{'class': 'NetworkTopologyStrategy', {rack_list_opts(racks_per_dc)}}}")
+
+
+async def set_anchor_racks(cql, ks: str, racks_per_dc: dict[str, list[str]]) -> None:
+    """
+    Set the rack lists of a rack-list anchor keyspace, i.e. the set of racks
+    auto-RF is allowed to expand into.
+
+    `racks_per_dc` has to list every DC the anchor currently replicates to:
+    implicitly dropping a DC is rejected for tablets keyspaces. A single ALTER
+    may change only one DC, and only by one rack, see
+    cql3::statements::alter_keyspace_statement::validate().
+    """
+    await alter_keyspace_retry_ongoing_rf_change(
+        cql, f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', {rack_list_opts(racks_per_dc)}}}")
+
+
+async def assert_no_pending_rf_change(cql, ks: str) -> None:
+    """Assert that auto-RF has not queued an RF change for `ks`."""
+    rows = await cql.run_async(f"SELECT * FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
+                               f"AND new_keyspace_rf_change_ks_name='{ks}' AND done=False ALLOW FILTERING")
+    assert len(rows) == 0, f"Unexpected pending RF change requests for keyspace {ks}: {rows}"
 
 
 async def add_servers_and_update_map(manager: ScyllaClusterManager, servers: list[ServerInfo], host_to_dc_rack: dict[HostID, tuple[str, str]], count: int, property_file: list[dict[str, str]] | dict[str, str], config: dict[str, str] | None = None) -> list[ServerInfo]:
@@ -93,7 +140,7 @@ async def verify_schema(cql, manager: ScyllaClusterManager, servers: list[Server
         expected_repl_strategy = 'org.apache.cassandra.locator.NetworkTopologyStrategy'
         assert replication.get('class') == expected_repl_strategy, f"Invalid replication class for keyspace {ks}: expected = {expected_repl_strategy}, actual = {replication.get('class')}"
         replication.pop('class')
-        assert replication == expected_replication, f"Invalid replication options for keyspace {ks}: expected = {expected_replication}, actual = {replication}"
+        assert sorted_racks(replication) == sorted_racks(expected_replication), f"Invalid replication options for keyspace {ks}: expected = {expected_replication}, actual = {replication}"
 
         # Verify tablets are enabled
         rows = await cql.run_async(f"SELECT initial_tablets FROM system_schema.scylla_keyspaces WHERE keyspace_name = '{ks}'")
@@ -168,23 +215,26 @@ async def test_auto_rf_behavior(manager: ScyllaClusterManager):
     """
     Verify all aspects of the automatic replication factor mechanism:
     * Per-DC replication factors are automatically expanded as nodes in new racks join the cluster.
+    * Auto-RF only expands into racks which already hold non-auto-RF replicas.
     * Replication options are expanded to add new DCs when nodes in new DCs join the cluster.
     * Replication factors are not expanded beyond the RF goal.
     * Zero-token nodes do not trigger RF expansions.
     * Rack decommission by ALTER KEYSPACE works correctly.
 
-    This test uses the audit keyspace as the test subject.
+    This test uses the audit keyspace as the test subject. It drives the set of
+    eligible racks through a rack-list anchor keyspace, which is what lets it
+    assert *which* rack auto-RF picks - see the anchor comment above.
     """
     ks = AUDIT_KS
     tables = AUDIT_TABLES
-    cfg_audit = {"audit": "table"} | NUMERIC_RF_CFG
+    cfg_audit = {"audit": "table"}
 
     logger.info("Create first rack and verify that schema is created")
     servers = []
     host_to_dc_rack = {}
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
     cql = manager.get_cql()
-    anchor_ks = await create_anchor_keyspace(cql, ['dc1'])
+    anchor_ks = await create_rack_anchor_keyspace(cql, {'dc1': ['r1']})
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Check schema after restart")
@@ -198,23 +248,29 @@ async def test_auto_rf_behavior(manager: ScyllaClusterManager):
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
 
-    logger.info("Add a second rack with two nodes and verify it is added to the RF")
+    logger.info("Add a second rack with two nodes and verify it is not added to the RF while it is not eligible")
     r2_servers = await add_servers_and_update_map(manager, servers, host_to_dc_rack, 2, [{"dc": "dc1", "rack": "r2"}, {"dc": "dc1", "rack": "r2"}], cfg_audit)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+    await assert_no_pending_rf_change(cql, ks)
+
+    logger.info("Make the second rack eligible and verify it is added to the RF")
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2']})
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=120)
 
     logger.info("Add a third rack and verify it is added to the RF")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r3"}, cfg_audit)
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2', 'r3']})
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']}, timeout=120)
 
     logger.info("Add a fourth rack and verify it is not added to the RF (RF goal 3 has been reached)")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r4"}, cfg_audit)
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2', 'r3', 'r4']})
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']}, timeout=0)
-    rows = await cql.run_async(f"SELECT * FROM system.topology_requests WHERE request_type='keyspace_rf_change' AND new_keyspace_rf_change_ks_name='{ks}' AND done=False ALLOW FILTERING")
-    assert len(rows) == 0, f"Unexpected pending RF change requests for keyspace {ks}"
+    await assert_no_pending_rf_change(cql, ks)
 
     logger.info("Add a node in a new dc and verify it is added to the RF of the new DC")
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc2", "rack": "r1"}, cfg_audit)
-    await alter_anchor_keyspace(cql, anchor_ks, ['dc1', 'dc2'])
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2', 'r3', 'r4'], 'dc2': ['r1']})
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']}, timeout=120)
 
     logger.info("Add a zero-token node in a new dc and verify the RF is not changed")
@@ -222,27 +278,44 @@ async def test_auto_rf_behavior(manager: ScyllaClusterManager):
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "zero-token-dc", "rack": "zero-token-rack"}, cfg_audit | cfg_zero_token)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']})
 
-    logger.info("Remove the second rack from the replication options and verify auto-RF will add the fourth rack to the rack list")
-    await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r3', 'r4'], 'dc2': ['r1']})
+    # Removing a rack from an auto-RF keyspace only sticks if the rack stops
+    # being eligible as well: otherwise auto-RF fills the freed RF slot with the
+    # very same rack again. Drop r2 from the anchor first, so that the slot
+    # freed by the ALTER below is filled by r4 instead.
+    logger.info("Remove the second rack from the replication options and verify auto-RF adds the fourth rack instead")
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r3', 'r4'], 'dc2': ['r1']})
+    await alter_keyspace_retry_ongoing_rf_change(cql, f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r3', 'r4'], 'dc2': ['r1']}, timeout=120)
 
-    logger.info("Remove the fourth rack from the replication options and bring back the second rack")
-    await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
+    logger.info("Remove the fourth rack from the replication options and verify auto-RF leaves the rack list alone")
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r3'], 'dc2': ['r1']})
+    await alter_keyspace_retry_ongoing_rf_change(cql, f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r3'], 'dc2': ['r1']})
-    await cql.run_async(f"ALTER KEYSPACE {ks} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']}}")
-    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']})
+    await assert_no_pending_rf_change(cql, ks)
+
+    logger.info("Make the second rack eligible again and verify auto-RF expands into it without an ALTER")
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']})
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3'], 'dc2': ['r1']}, timeout=120)
 
     logger.info("Decommission a node from a rack with multiple nodes")
     await manager.decommission_node(r2_servers[0].server_id)
 
-    logger.info("Decommission the last node from a rack (expected to fail because inter-rack tablet migrations are not supported)")
-    with pytest.raises(HTTPError, match="Decommission failed"):
-        logger.info("Decommission another node")
-        await manager.decommission_node(r2_servers[1].server_id)
+    logger.info("Decommission the last node from a rack (expected to fail while the rack is still in a rack list)")
+    await manager.decommission_node(
+        r2_servers[1].server_id,
+        expected_error="its removal would make some existing keyspace RF-rack-invalid")
 
-    logger.info("Remove the rack from the replication options of all auto-RF-enabled keyspaces and retry decommission (expected to succeed)")
-    await cql.run_async(f"ALTER KEYSPACE {AUDIT_KS} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
-    await cql.run_async(f"ALTER KEYSPACE {SYSTEM_TRACES_KS} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1'], 'dc2': ['r1']}}")
+    logger.info("Remove the rack from the replication options of all keyspaces and retry decommission (expected to succeed)")
+    # The anchor has to give up the rack first: while r2 is still eligible,
+    # auto-RF would immediately expand back into it and block the decommission.
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r3'], 'dc2': ['r1']})
+    await alter_keyspace_retry_ongoing_rf_change(cql, f"ALTER KEYSPACE {AUDIT_KS} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1', 'r3'], 'dc2': ['r1']}}")
+    await alter_keyspace_retry_ongoing_rf_change(cql, f"ALTER KEYSPACE {SYSTEM_TRACES_KS} WITH replication = {{'class': 'NetworkTopologyStrategy', 'dc1': ['r1'], 'dc2': ['r1']}}")
+    # Wait until both auto-RF keyspaces have settled without r2, so that the
+    # decommission below does not race an in-flight RF change. system_traces has
+    # an RF goal of 2, so it refills the freed slot with the remaining eligible rack.
+    await verify_schema(cql, manager, servers, host_to_dc_rack, AUDIT_KS, AUDIT_TABLES, {'dc1': ['r1', 'r3'], 'dc2': ['r1']}, timeout=120)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, SYSTEM_TRACES_KS, SYSTEM_TRACES_TABLES, {'dc1': ['r1', 'r3'], 'dc2': ['r1']}, timeout=120)
     await manager.decommission_node(r2_servers[1].server_id)
 
 
