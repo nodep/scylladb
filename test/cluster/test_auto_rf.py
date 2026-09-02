@@ -702,3 +702,102 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Scylla
         f"Auto-RF unexpectedly modified {ks} replication: got {replication}, "
         f"expected {initial_replication}. Without any non-auto-RF tablet "
         f"keyspace, no rack should be eligible.")
+
+
+# ---------------------------------------------------------------------------
+# Bounded scheduling.
+# ---------------------------------------------------------------------------
+
+
+async def count_rf_change_requests(cql, ks: str) -> int:
+    """Return the number of keyspace_rf_change requests ever scheduled for `ks`.
+
+    system.topology_requests rows are written with a one month TTL, so this
+    counts completed (including failed) requests as well as pending ones.
+    """
+    rows = await cql.run_async(
+        f"SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
+        f"AND new_keyspace_rf_change_ks_name='{ks}' ALLOW FILTERING")
+    return len(rows)
+
+
+@pytest.mark.asyncio
+@pytest.mark.skip_mode(mode='release', reason='error injections are not supported in release mode')
+async def test_auto_rf_rejected_change_is_not_rescheduled_in_a_loop(manager: ScyllaClusterManager):
+    """
+    Regression test for the auto-RF scheduling loop.
+
+    A keyspace_rf_change which the request handler rejects is dropped without
+    leaving a trace in group0: the request is removed from the queue and marked
+    done with the error. service::ongoing_rf_change() therefore finds nothing
+    pending on the coordinator's next iteration,
+    get_keyspaces_that_require_auto_rf_change() re-detects the same shortfall,
+    and the very same request is scheduled again. For a rejection which is
+    persistent this used to be an unbounded loop: 3480 requests at ~50 ms
+    intervals were observed in one run, starving every other topology operation.
+
+    The rejection is driven here by the keyspace_rf_change_fail injection. The
+    tablet state which makes the real rejection persistent (a tablet holding
+    fewer replicas than the keyspace's RF while every rack in the RF is still
+    placeable) is transient and could not be constructed synthetically, and the
+    defect is the unbounded re-issue rather than any particular rejection.
+
+    Two things are asserted: that only a handful of requests are scheduled over
+    a fixed window, and that auto-RF still converges once the rejection is gone.
+    """
+    ks = AUDIT_KS
+    tables = AUDIT_TABLES
+    cfg_audit = {"audit": "table"}
+
+    # Long enough to leave the unfixed coordinator no excuse - at ~50 ms per
+    # iteration it would schedule hundreds of requests in this window - while
+    # the backoff (1s, doubling) allows at most six.
+    window = 30
+    max_scheduled = 10
+
+    logger.info("Start cluster with 1 node in dc1/r1, audit enabled")
+    servers = []
+    host_to_dc_rack = {}
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r1"}, cfg_audit)
+    cql = manager.get_cql()
+    server0 = servers[0]
+
+    logger.info("Create a rack-list anchor keyspace pinned to dc1:['r1'] and let auto-RF settle")
+    anchor_ks = await create_rack_anchor_keyspace(cql, {'dc1': ['r1']})
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
+
+    logger.info("Add a node in dc1/r2, still ineligible for auto-RF")
+    await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
+
+    # The injection is keyspace-filtered because user ALTERs go through the same
+    # request handler: the anchor ALTER below has to keep working. Every node
+    # gets it - the coordinator may move.
+    logger.info(f"Make every keyspace_rf_change for {ks} fail")
+    injection = "keyspace_rf_change_fail"
+    for s in servers:
+        await manager.api.enable_injection(s.ip_addr, injection, one_shot=False, parameters={"keyspace": ks})
+
+    before = await count_rf_change_requests(cql, ks)
+
+    logger.info(f"Make r2 eligible, so that auto-RF wants to expand {ks} into it")
+    await set_anchor_racks(cql, anchor_ks, {'dc1': ['r1', 'r2']})
+
+    logger.info(f"Let the coordinator run for {window}s with the RF change failing")
+    await asyncio.sleep(window)
+    scheduled = await count_rf_change_requests(cql, ks) - before
+
+    logger.info(f"auto-RF scheduled {scheduled} keyspace_rf_change request(s) for {ks} in {window}s")
+    assert scheduled >= 2, (
+        f"auto-RF scheduled {scheduled} keyspace_rf_change request(s) for {ks}, expected it to "
+        f"attempt and retry the expansion into r2 - the test is not exercising the loop")
+    assert scheduled <= max_scheduled, (
+        f"auto-RF re-scheduled a rejected keyspace_rf_change for {ks} {scheduled} times in "
+        f"{window}s, expected at most {max_scheduled}: failed requests are not being backed off")
+
+    logger.info("Stop failing the RF change and verify auto-RF still converges")
+    for s in servers:
+        await manager.api.disable_injection(s.ip_addr, injection)
+    # The coordinator has to come back on its own once the backoff elapses:
+    # disabling an injection is not a topology event.
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2']}, timeout=180)
