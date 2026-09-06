@@ -836,6 +836,38 @@ async def alter_keyspace_retry_ongoing_rf_change(cql, stmt: str, timeout: float 
             await asyncio.sleep(1)
 
 
+async def wait_for_auto_rf_settled(cql, timeout: float = 120) -> None:
+    """
+    Wait until auto-RF has no work left to do.
+
+    The auto-RF system keyspaces (audit, system_traces) are on tablets, and the
+    topology coordinator expands their replication on its own as racks become
+    eligible. Every such change bumps the topology version and rewrites their
+    tablet maps, so a test which reads the topology twice can see the two reads
+    disagree. disable_tablet_balancing() does not help here: auto-RF is a
+    separate source of topology mutations, not balancer work.
+
+    Note that creating a non-auto-RF tablets keyspace is itself what makes racks
+    eligible, so the expansion is typically triggered by the test's own setup and
+    has to be waited for after it.
+    """
+    deadline = time.time() + timeout
+    while True:
+        pending = await cql.run_async(
+            "SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
+            "AND done=False ALLOW FILTERING")
+        # Between finishing one RF change and queueing the next the request table is
+        # empty, so the needs_auto_rf_change flag has to be checked as well.
+        rows = await cql.run_async("SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'")
+        needs_change = bool(rows and rows[0].needs_auto_rf_change)
+        if not pending and not needs_change:
+            return
+        if time.time() >= deadline:
+            raise TimeoutError(f"auto-RF did not settle within {timeout}s: "
+                               f"pending={len(pending)}, needs_auto_rf_change={needs_change}")
+        await asyncio.sleep(0.5)
+
+
 async def quiesce_and_disable_tablet_balancing(manager: ManagerClient, server_ip: str) -> None:
     """
     Let the tablet balancer finish its pending work, then disable it.
