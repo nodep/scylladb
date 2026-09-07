@@ -464,7 +464,8 @@ async def test_lwt_timeout_while_creating_paxos_state_table(manager: ScyllaClust
             {
                 'name': 'raft-group-registry-fd-threshold-in-ms',
                 'value': '500'
-            }
+            },
+            'auto_rf_keyspaces_use_vnodes'
         ]
     }
 
