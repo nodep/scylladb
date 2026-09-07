@@ -608,7 +608,8 @@ async def test_hint_to_leaving_when_reducing_rf(manager: ScyllaClusterManager):
         {"dc": "dc1", "rack": "r1"},
         {"dc": "dc1", "rack": "r2"},
         {"dc": "dc1", "rack": "r3"},
-    ], cmdline=cmdline)
+    ], cmdline=cmdline,
+        config={"error_injections_at_startup": ["auto_rf_keyspaces_use_vnodes"]})
     cql = await manager.get_cql_exclusive(servers[0])
     await manager.disable_tablet_balancing()
 
