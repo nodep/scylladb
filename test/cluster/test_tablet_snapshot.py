@@ -153,7 +153,14 @@ async def test_tablet_snapshot_taken_after_replace_before_rebuild(manager: Scyll
     In that window the topology model must still list the replaced node as a replica, while
     system.topology already has it as left and the joining node as normal.
     """
-    servers = await manager.servers_add(3, auto_rack_dc="dc1")
+    # The test blocks the replace in await_tablets_rebuilt() and then throws the half
+    # joined cluster away without letting it finish. Keeping audit and system_traces on
+    # vnodes leaves the test's own keyspace as the only tablet table, which is all the
+    # assertions below need, and lets the orphaned server_start() operation complete.
+    # With those keyspaces on tablets it never does, and the manager's post-test drain
+    # waits the whole drain timeout for it and then marks the server broken.
+    servers = await manager.servers_add(3, auto_rack_dc="dc1",
+                                        config={'error_injections_at_startup': ['auto_rf_keyspaces_use_vnodes']})
     cql = manager.get_cql()
 
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 3}"
