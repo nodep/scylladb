@@ -105,6 +105,9 @@ class raft_group0_client {
     locator::shared_token_metadata& _token_metadata;
 
     // See `group0_guard::impl` for explanation of the purpose of these locks.
+    // Acquires one of the group0 mutexes, bounded by `timeout` when the caller asked for one.
+    future<semaphore_units<>> hold_mutex(semaphore&, const char* op_name, abort_source&, std::optional<raft_timeout> timeout);
+
     semaphore _read_apply_mutex = semaphore(1);
     semaphore _operation_mutex = semaphore(1);
 
@@ -157,7 +160,7 @@ public:
     // Checks maximum allowed serialized command size, server rejects bigger commands with command_is_too_big_error exception
     size_t max_command_size() const;
 
-    future<semaphore_units<>> hold_read_apply_mutex(abort_source&);
+    future<semaphore_units<>> hold_read_apply_mutex(abort_source&, std::optional<raft_timeout> timeout = std::nullopt);
 
     gc_clock::duration get_history_gc_duration() const;
     // for test only
