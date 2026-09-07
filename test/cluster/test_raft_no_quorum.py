@@ -59,7 +59,8 @@ async def test_cannot_add_new_node(manager: ScyllaClusterManager, raft_op_timeou
             {
                 'name': 'raft-group-registry-fd-threshold-in-ms',
                 'value': '500'
-            }
+            },
+            'auto_rf_keyspaces_use_vnodes'
         ]
     }
     logger.info("starting a first node (the leader)")
@@ -95,7 +96,8 @@ async def test_quorum_lost_during_node_join(manager: ScyllaClusterManager, raft_
             {
                 'name': 'raft-group-registry-fd-threshold-in-ms',
                 'value': '500'
-            }
+            },
+            'auto_rf_keyspaces_use_vnodes'
         ]
     }
     logger.info("starting a first node (the leader)")
@@ -212,7 +214,8 @@ async def test_cannot_run_operations(manager: ScyllaClusterManager, raft_op_time
             {
                 'name': 'raft-group-registry-fd-threshold-in-ms',
                 'value': '500'
-            }
+            },
+            'auto_rf_keyspaces_use_vnodes'
         ]
     }, property_file={"dc": "dc1", "rack": "rack1"})]
 
