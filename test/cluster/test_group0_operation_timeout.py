@@ -62,7 +62,6 @@ INJECTION = "wait-before-committing-rf-change-event"
 @pytest.mark.asyncio
 async def test_group0_operation_timeout_covers_the_group0_mutexes(manager: ScyllaClusterManager):
     cfg = {
-        'group0_raft_op_timeout_in_ms': str(GROUP0_OP_TIMEOUT_MS),
         # Master equivalence: keep the system keyspaces on vnodes so auto-RF is not a
         # participant. The bug is in the group0 client, not in auto-RF.
         'error_injections_at_startup': ['auto_rf_keyspaces_use_vnodes'],
@@ -75,6 +74,16 @@ async def test_group0_operation_timeout_covers_the_group0_mutexes(manager: Scyll
     coordinator_id = await get_topology_coordinator(manager)
     coord = await manager.find_server_by_host_id(servers, coordinator_id)
     logger.info(f"topology coordinator is {coord.ip_addr}")
+
+    # Shorten the group0 operation timeout only now. Setting it at startup would apply it to
+    # cluster formation too, where a legitimate join read-barrier can exceed it in debug
+    # under load, and the test would fail in servers_add() rather than on what it asserts.
+    # server_update_config only sends SIGHUP, so wait until the node has re-read the file.
+    log_file = await manager.server_open_log(coord.server_id)
+    mark = await log_file.mark()
+    await manager.server_update_config(
+            coord.server_id, 'group0_raft_op_timeout_in_ms', GROUP0_OP_TIMEOUT_MS)
+    await log_file.wait_for("completed re-reading configuration file", from_mark=mark, timeout=60)
 
     ks = "g0_timeout_repro"
     await cql.run_async(
