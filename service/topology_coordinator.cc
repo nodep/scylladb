@@ -2343,15 +2343,24 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             generate_resize_update(out, guard, table_id, resize_decision);
         }
 
-        for (const auto& completion : plan.restore_completions()) {
-            rtlogger.info("All restore transitions for table {} completed, finishing request {}", completion.table, completion.request_id);
+        if (!plan.restore_completions().empty()) {
+            // Remove every completed request from ongoing_restore_requests in ONE mutation.
+            // Each completion used to emit its own overwrite of the whole set, built from
+            // the same pre-plan snapshot at the same write timestamp; with two completions
+            // in one pass the two overwrites conflict and neither removal sticks, so both
+            // requests are re-completed on every later pass and quiesce never converges.
+            std::unordered_set<utils::UUID> finished;
+            for (const auto& completion : plan.restore_completions()) {
+                rtlogger.info("All restore transitions for table {} completed, finishing request {}", completion.table, completion.request_id);
+                finished.insert(completion.request_id);
+                out.emplace_back(
+                    topology_request_tracking_mutation_builder(completion.request_id)
+                        .done(completion.error.empty() ? std::nullopt : std::optional<sstring>(completion.error))
+                        .build());
+            }
             out.emplace_back(
                 topology_mutation_builder(guard.write_timestamp())
-                    .finish_restore_request(_topo_sm._topology.ongoing_restore_requests, completion.request_id)
-                    .build());
-            out.emplace_back(
-                topology_request_tracking_mutation_builder(completion.request_id)
-                    .done(completion.error.empty() ? std::nullopt : std::optional<sstring>(completion.error))
+                    .finish_restore_requests(_topo_sm._topology.ongoing_restore_requests, finished)
                     .build());
         }
     }
