@@ -6688,7 +6688,7 @@ class scylla_tablet_metadata(gdb.Command):
                 continue
 
             tablet_map = seastar_lw_shared_ptr(tablet_map['_value']).get()
-            log2_tablets = int(tablet_map['_log2_tablets'])
+            log2_tablets = int(tablet_map['_tablet_ids']['_log2_tablets'])
             tablet_count = 2 ** log2_tablets
             resize_decision = std_variant(tablet_map['_resize_decision']['way']).get().type.name.replace('locator::resize_decision::', '')
             resize_decision_seq_num = int(tablet_map['_resize_decision']['sequence_number'])
