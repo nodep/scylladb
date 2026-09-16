@@ -707,6 +707,96 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Scylla
         f"keyspace, no rack should be eligible.")
 
 
+@pytest.mark.asyncio
+async def test_auto_rf_deferred_while_a_node_is_dead(manager: ScyllaClusterManager):
+    """
+    Auto-RF must not schedule an RF change while a normal node is dead.
+
+    An RF change is carried out by tablet migrations, and every migration
+    passes through global_tablet_token_metadata_barrier(), which drains all
+    normal nodes. With a dead node the barrier cannot pass; the coordinator
+    retries the migration once a second and does nothing else meanwhile (no
+    resize decisions, no load balancing, no other requests). An operator can
+    choose to ALTER KEYSPACE into that situation, auto-RF must not.
+
+    Scenario:
+      1. Three nodes, one per rack, audit enabled, no user tablets keyspace,
+         so nothing is eligible and audit stays at dc1:['r1'].
+      2. Stop node 3 and wait until the others see it down.
+      3. Create a user keyspace with RF 3. The test framework enables
+         rack-list expansion, so it becomes dc1:['r1','r2','r3'], dead rack
+         included, and every live rack becomes eligible for auto-RF. Without
+         the deferral auto-RF would immediately schedule audit r1 -> r1+r2
+         and wedge on the barrier. Assert no keyspace_rf_change task is
+         scheduled for audit.
+      4. Restart node 3. Auto-RF must now expand audit to all three racks.
+    """
+    ks = AUDIT_KS
+    tables = AUDIT_TABLES
+    cfg_audit = {"audit": "table"}
+
+    logger.info("Start cluster with three nodes in dc1/r1, r2, r3, audit enabled")
+    servers = []
+    host_to_dc_rack = {}
+    await add_servers_and_update_map(
+        manager, servers, host_to_dc_rack, 3,
+        [{"dc": "dc1", "rack": "r1"},
+         {"dc": "dc1", "rack": "r2"},
+         {"dc": "dc1", "rack": "r3"}],
+        cfg_audit)
+    cql = manager.get_cql()
+    await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+    server0, server1, server2 = servers
+
+    logger.info("Without a user tablets keyspace nothing is eligible; audit must stay at dc1:['r1']")
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    logger.info("Stop node 3 and wait until the other nodes see it down")
+    await manager.server_stop(server2.server_id, convict=True)
+    await manager.server_not_sees_other_server(server0.ip_addr, server2.ip_addr)
+    await manager.server_not_sees_other_server(server1.ip_addr, server2.ip_addr)
+
+    logger.info("Create a user keyspace covering all three racks: all live racks become eligible")
+    before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    before_requests = await count_rf_change_requests(cql, ks)
+    user_ks = await create_new_test_keyspace(
+        cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3}")
+    await cql.run_async(f"CREATE TABLE {user_ks}.t (pk int PRIMARY KEY, c int)")
+
+    logger.info("Give the coordinator several iterations; it must defer, not schedule")
+    await asyncio.sleep(10)
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
+    new_tasks = after_tasks - before_tasks
+    assert not new_tasks, (
+        f"auto-RF scheduled {len(new_tasks)} keyspace_rf_change task(s) for {ks} "
+        f"while a node was dead (task ids: {new_tasks})")
+    # system.topology_requests is group0 state, so this check does not depend
+    # on which node is the coordinator.
+    new_requests = await count_rf_change_requests(cql, ks) - before_requests
+    assert new_requests == 0, (
+        f"auto-RF scheduled {new_requests} keyspace_rf_change request(s) for {ks} while a node was dead")
+    await verify_schema(cql, manager, [server0, server1], host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
+
+    deferred = False
+    for s in (server0, server1):
+        log = await manager.server_open_log(s.server_id)
+        if await log.grep("auto-rf: deferring RF changes .* until dead node\\(s\\) .* are alive again"):
+            deferred = True
+    assert deferred, "no node logged the auto-RF deferral"
+
+    logger.info("Restart node 3; auto-RF must now expand audit to all three racks")
+    await manager.server_start(server2.server_id)
+    await manager.server_sees_other_server(server0.ip_addr, server2.ip_addr)
+    await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
+    await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
+    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']}, timeout=120)
+
+    await cql.run_async(f"DROP KEYSPACE {user_ks}")
+
+
 # ---------------------------------------------------------------------------
 # Bounded scheduling.
 # ---------------------------------------------------------------------------
