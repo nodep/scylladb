@@ -1834,6 +1834,25 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
             co_return std::move(guard);
         }
 
+        // An RF change is carried out by tablet migrations, and every migration
+        // goes through global_tablet_token_metadata_barrier(), which drains all
+        // normal nodes. With a dead node the barrier cannot pass, the coordinator
+        // fiber retries the migration once a second and does nothing else in the
+        // meantime: no resize decisions, no load balancing, no other requests.
+        // An operator ALTER KEYSPACE has the same effect, but that is the
+        // operator's call. Auto-RF acts on its own, so it must not start work it
+        // knows cannot complete. Defer until every normal node is alive again;
+        // the coordinator wakes up on gossip on_up() and re-evaluates then.
+        if (const auto dead_nodes = get_dead_nodes(); !dead_nodes.empty()) {
+            rtlogger.debug("auto-rf: deferring RF changes for {} keyspace(s) until dead node(s) {} are alive again",
+                    auto_rf_keyspaces.size(), dead_nodes);
+            if (_topo_sm._topology.needs_auto_rf_change) {
+                co_await clear_needs_auto_rf_change();
+                co_return std::nullopt;
+            }
+            co_return std::move(guard);
+        }
+
         std::unordered_map<sstring, std::set<sstring>> allowed_racks = get_racks_for_auto_rf_change();
         rtlogger.debug("Eligible rack by DC: {}", allowed_racks);
         struct rf_change_candidate {
