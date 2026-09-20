@@ -852,35 +852,71 @@ async def alter_keyspace_retry_ongoing_rf_change(cql, stmt: str, timeout: float 
             await asyncio.sleep(1)
 
 
-async def wait_for_auto_rf_settled(cql, timeout: float = 120) -> None:
+async def wait_for_auto_rf_settled(manager: ScyllaClusterManager, deadline: float,
+                                   ks: Optional[str] = None,
+                                   server: Optional[ServerInfo] = None,
+                                   count_tasks: bool = False) -> int:
     """
     Wait until auto-RF has no work left to do.
 
     The auto-RF system keyspaces (audit, system_traces) are on tablets, and the
     topology coordinator expands their replication on its own as racks become
     eligible. Every such change bumps the topology version and rewrites their
-    tablet maps, so a test which reads the topology twice can see the two reads
-    disagree. disable_tablet_balancing() does not help here: auto-RF is a
-    separate source of topology mutations, not balancer work.
+    tablet maps, so a test that reads the topology twice can see the two reads
+    disagree, and the changes preempt tablet balancing. disable_tablet_balancing()
+    does not help here: auto-RF is a separate source of topology mutations.
 
     Note that creating a non-auto-RF tablets keyspace is itself what makes racks
-    eligible, so the expansion is typically triggered by the test's own setup and
-    has to be waited for after it.
+    eligible, so the expansion is usually triggered by the test own setup and has
+    to be waited for after it.
+
+    Settled means no pending keyspace_rf_change request, optionally only for `ks`,
+    and needs_auto_rf_change unset. The flag has to be checked too: between two
+    steps of a multi-step expansion the request table is briefly empty while the
+    flag is still set.
+
+    With count_tasks, also require that no keyspace_rf_change task is running and
+    return how many completed while waiting, which negative tests use to assert
+    that none ran. Pass `server` to choose the node queried; it defaults to the
+    first running one.
     """
-    deadline = time.time() + timeout
+    cql = manager.get_cql()
+    servers = await manager.running_servers()
+    node = server or servers[0]
+
+    async def rf_change_tasks():
+        # Imported lazily so util.py does not depend on the tasks package.
+        from test.cluster.tasks.task_manager_client import TaskManagerClient
+        tasks = await TaskManagerClient(manager.api).list_tasks(
+            node.ip_addr, "global_topology_requests", keyspace=ks)
+        return [t for t in tasks if t.type == "keyspace_rf_change"]
+
+    initial: set = {t.task_id for t in await rf_change_tasks()} if count_tasks else set()
+
     while True:
-        pending = await cql.run_async(
-            "SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
-            "AND done=False ALLOW FILTERING")
-        # Between finishing one RF change and queueing the next the request table is
-        # empty, so the needs_auto_rf_change flag has to be checked as well.
-        rows = await cql.run_async("SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'")
+        # Make the reads below reflect committed group0 state.
+        await read_barrier(manager.api, node.ip_addr)
+        host = await get_available_host(cql, deadline)
+        query = ("SELECT id FROM system.topology_requests "
+                 "WHERE request_type='keyspace_rf_change' AND done=False")
+        if ks:
+            query += f" AND new_keyspace_rf_change_ks_name='{ks}'"
+        pending = await cql.run_async(query + " ALLOW FILTERING", host=host)
+        rows = await cql.run_async(
+            "SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'", host=host)
         needs_change = bool(rows and rows[0].needs_auto_rf_change)
-        if not pending and not needs_change:
-            return
+
+        tasks = await rf_change_tasks() if count_tasks else []
+        running = [t for t in tasks if t.state in ("created", "running", "suspended")]
+
+        if not pending and not needs_change and not running:
+            return len({t.task_id for t in tasks} - initial) if count_tasks else 0
+
         if time.time() >= deadline:
-            raise TimeoutError(f"auto-RF did not settle within {timeout}s: "
-                               f"pending={len(pending)}, needs_auto_rf_change={needs_change}")
+            scope = (" for " + ks) if ks else ""
+            raise AssertionError(
+                f"auto-RF{scope} did not settle: pending={len(pending)}, "
+                f"needs_auto_rf_change={needs_change}, running_tasks={[t.task_id for t in running]}")
         await asyncio.sleep(0.5)
 
 

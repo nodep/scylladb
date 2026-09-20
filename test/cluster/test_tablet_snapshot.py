@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import subprocess
+import time
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -103,7 +104,7 @@ async def test_tablet_snapshot_matches_live_topology(manager: ScyllaClusterManag
         # coordinator starts expanding the replication of audit and system_traces. Each
         # of those changes bumps the topology version and rewrites their tablet maps, and
         # one landing between the live read and the snapshots below makes them differ.
-        await wait_for_auto_rf_settled(cql)
+        await wait_for_auto_rf_settled(manager, time.time() + 120)
 
         # The snapshots are taken after the live topology is read, so a migration in that
         # window would move replicas and make the comparison below fail intermittently.

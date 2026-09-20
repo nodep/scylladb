@@ -30,7 +30,7 @@ from test.pylib.util import wait_for
 from test.pylib.rest_client import HTTPError
 from test.cluster.tasks.task_manager_client import TaskManagerClient
 from test.cluster.util import wait_for_token_ring_and_group0_consistency
-from test.cluster.test_tablets_lwt import wait_for_auto_rf_settled
+from test.cluster.util import wait_for_auto_rf_settled
 from test.cqlpy import nodetool
 import statistics
 

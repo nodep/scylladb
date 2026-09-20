@@ -13,7 +13,7 @@ from cassandra import Unauthorized
 
 from test.cluster.lwt.lwt_common import wait_for_tablet_count
 from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver, \
-    FeatureConfig, get_topology_coordinator
+    FeatureConfig, get_topology_coordinator, wait_for_auto_rf_settled
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for_cql_and_get_hosts, wait_for, get_available_host
 from test.pylib.internal_types import ServerInfo
@@ -656,42 +656,6 @@ async def test_lwt_coordinator_shard(manager: ScyllaClusterManager, storage_conf
         matches = await n2_log.grep("CAS\\[0\\] successful")
         assert len(matches) == 1
         assert "shard 1" in matches[0][0]
-
-
-async def wait_for_auto_rf_settled(manager, deadline: float) -> None:
-    """Wait until auto-RF has completed all pending replication changes.
-
-    Auto-RF may schedule keyspace_rf_change operations after a user tablet
-    keyspace is created (or altered) in a cluster with multiple racks. These
-    operations advance the topology fence_version and preempt tablet
-    balancing. Tests sensitive to topology stability should call this after
-    creating their test keyspace/table to ensure auto-RF has finished its work.
-
-    Waits until:
-    - needs_auto_rf_change is not set in system.topology
-    - No keyspace_rf_change transition is in progress
-      (transition_state is null or unrelated to RF change)
-    """
-    cql = manager.get_cql()
-    servers = await manager.running_servers()
-
-    async def settled():
-        host = await get_available_host(cql, deadline)
-        await read_barrier(manager.api, servers[0].ip_addr)
-        rows = await cql.run_async(
-            "SELECT needs_auto_rf_change, transition_state "
-            "FROM system.topology WHERE key = 'topology'",
-            host=host)
-        if not rows:
-            return None
-        row = rows[0]
-        if row.needs_auto_rf_change:
-            return None
-        if row.transition_state in ('write_both_read_old', 'write_both_read_new'):
-            return None
-        return True
-
-    await wait_for(settled, deadline, period=0.5, label="auto_rf_settled")
 
 
 @pytest.mark.skip_mode(mode='debug', reason='dev is enought: the test checks non-critical functionality')

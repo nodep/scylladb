@@ -14,7 +14,7 @@ from test.pylib.tablets import get_all_tablet_replicas
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.internal_types import ServerInfo, HostID
 from test.cluster.tasks.task_manager_client import TaskManagerClient
-from test.cluster.util import alter_keyspace_retry_ongoing_rf_change, create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts
+from test.cluster.util import alter_keyspace_retry_ongoing_rf_change, create_new_test_keyspace, parse_replication_options, wait_for_cql_and_get_hosts, wait_for_auto_rf_settled
 
 
 logger = logging.getLogger(__name__)
@@ -380,14 +380,6 @@ async def test_auto_rf_audit_ks_late_creation(manager: ScyllaClusterManager):
 # ---------------------------------------------------------------------------
 
 
-async def get_pending_rf_changes(cql, ks: str) -> int:
-    """Return the number of pending keyspace_rf_change requests for `ks`."""
-    rows = await cql.run_async(
-        f"SELECT id FROM system.topology_requests WHERE request_type='keyspace_rf_change' "
-        f"AND new_keyspace_rf_change_ks_name='{ks}' AND done=False ALLOW FILTERING")
-    return len(rows)
-
-
 async def needs_auto_rf_change(cql) -> bool:
     """Return whether the topology coordinator still has auto-RF work to do."""
     rows = await cql.run_async("SELECT needs_auto_rf_change FROM system.topology WHERE key = 'topology'")
@@ -403,45 +395,6 @@ async def _list_rf_change_tasks(manager: ScyllaClusterManager, server: ServerInf
     task_mgr = TaskManagerClient(manager.api)
     tasks = await task_mgr.list_tasks(server.ip_addr, "global_topology_requests", keyspace=ks)
     return [t for t in tasks if t.type == "keyspace_rf_change"]
-
-
-async def wait_for_auto_rf_to_settle(manager: ScyllaClusterManager, server: ServerInfo, cql, ks: str,
-                                     timeout: float = 120.0) -> int:
-    """
-    Wait until the topology coordinator has finished acting on `ks`:
-      * there are no pending keyspace_rf_change requests (done=False) for `ks`
-        in system.topology_requests, AND
-      * no keyspace_rf_change task for `ks` is currently running in the
-        task manager.
-
-    Returns the number of keyspace_rf_change tasks that completed during the
-    settle window (useful for negative tests that want to assert no task ran).
-    """
-    task_mgr = TaskManagerClient(manager.api)
-    start = time.time()
-
-    # First: grab the baseline count of tasks currently known.
-    initial = {t.task_id for t in await _list_rf_change_tasks(manager, server, ks)}
-
-    while True:
-        pending = await get_pending_rf_changes(cql, ks)
-        tasks = await _list_rf_change_tasks(manager, server, ks)
-        running = [t for t in tasks if t.state in ("created", "running", "suspended")]
-        # needs_auto_rf_change is what makes the coordinator revisit the auto-RF
-        # keyspaces. Between two consecutive steps of a multi-step expansion
-        # there is a window in which the flag is set but the next request has
-        # not been created yet, so checking the requests alone is not enough.
-        needs_change = await needs_auto_rf_change(cql)
-        if pending == 0 and not running and not needs_change:
-            final = {t.task_id for t in tasks}
-            new_tasks = final - initial
-            return len(new_tasks)
-        if time.time() - start > timeout:
-            raise AssertionError(
-                f"auto-RF for {ks} did not settle within {timeout}s: "
-                f"pending={pending}, needs_auto_rf_change={needs_change}, "
-                f"running_tasks={[t.task_id for t in running]}")
-        await asyncio.sleep(0.5)
 
 
 async def wait_for_rf_change_task(manager: ScyllaClusterManager, server: ServerInfo, cql, ks: str,
@@ -477,7 +430,7 @@ async def wait_for_rf_change_task(manager: ScyllaClusterManager, server: ServerI
             f"keyspace_rf_change task {task_id} for {ks} ended in state "
             f"{status.state}: {status.error}")
     # And make sure nothing else is still pending (defense in depth).
-    await wait_for_auto_rf_to_settle(manager, server, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server, count_tasks=True)
 
 
 @pytest.mark.asyncio
@@ -513,7 +466,7 @@ async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ScyllaClusterM
         cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['r1']}")
 
     logger.info("Wait for any initial auto-RF activity on audit to settle")
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
 
     logger.info("Add a node in dc1/r2 -- auto-RF must NOT schedule any task for audit")
@@ -521,11 +474,11 @@ async def test_auto_rf_expansion_gated_by_user_rack_list(manager: ScyllaClusterM
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc1", "rack": "r2"}, cfg_audit)
     # Wait for the coordinator to settle after the node-add; this also waits
     # for any (erroneously) scheduled rf_change task to finish.
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     # Give the coordinator a few additional iterations to ensure it truly
     # decided not to schedule a change.
     await asyncio.sleep(5)
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     new_tasks = after_tasks - before_tasks
     assert not new_tasks, (
@@ -564,15 +517,15 @@ async def test_auto_rf_expansion_gated_by_user_dc(manager: ScyllaClusterManager)
     logger.info("Create a user tablets keyspace restricted to dc1:['r1']")
     user_ks = await create_new_test_keyspace(
         cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': ['r1']}")
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
 
     logger.info("Add a node in a brand-new dc2/r1 -- auto-RF must NOT schedule any task for audit")
     before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     await add_server_and_update_map(manager, servers, host_to_dc_rack, {"dc": "dc2", "rack": "r1"}, cfg_audit)
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await asyncio.sleep(5)
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     new_tasks = after_tasks - before_tasks
     assert not new_tasks, (
@@ -618,7 +571,7 @@ async def test_auto_rf_numeric_user_keyspace_makes_all_racks_eligible(manager: S
     logger.info("Create a user tablets keyspace with numeric RF (dc1: 1)")
     user_ks = await create_new_test_keyspace(
         cql, "WITH replication = {'class': 'NetworkTopologyStrategy', 'dc1': 1}")
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Add a node in dc1/r2 -- all racks are eligible, so audit must expand to r2")
@@ -690,10 +643,10 @@ async def test_auto_rf_no_expansion_without_user_tablet_keyspace(manager: Scylla
     before_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     # Wait until nothing is pending/running; this returns immediately if the
     # coordinator correctly decided not to schedule anything.
-    new_completed = await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    new_completed = await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     # Give the coordinator additional iterations and recheck.
     await asyncio.sleep(10)
-    new_completed += await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    new_completed += await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     new_tasks = after_tasks - before_tasks
     assert not new_tasks, (
@@ -749,7 +702,7 @@ async def test_auto_rf_deferred_while_a_node_is_dead(manager: ScyllaClusterManag
     server0, server1, server2 = servers
 
     logger.info("Without a user tablets keyspace nothing is eligible; audit must stay at dc1:['r1']")
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=0)
 
     logger.info("Stop node 3 and wait until the other nodes see it down")
@@ -766,7 +719,7 @@ async def test_auto_rf_deferred_while_a_node_is_dead(manager: ScyllaClusterManag
 
     logger.info("Give the coordinator several iterations; it must defer, not schedule")
     await asyncio.sleep(10)
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     after_tasks = {t.task_id for t in await _list_rf_change_tasks(manager, server0, ks)}
     new_tasks = after_tasks - before_tasks
     assert not new_tasks, (
@@ -791,7 +744,7 @@ async def test_auto_rf_deferred_while_a_node_is_dead(manager: ScyllaClusterManag
     await manager.server_sees_other_server(server0.ip_addr, server2.ip_addr)
     await wait_for_cql_and_get_hosts(cql, servers, time.time() + 60)
     await wait_for_rf_change_task(manager, server0, cql, ks, after_tasks)
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1', 'r2', 'r3']}, timeout=120)
 
     await cql.run_async(f"DROP KEYSPACE {user_ks}")
@@ -857,7 +810,7 @@ async def test_auto_rf_rejected_change_is_not_rescheduled_in_a_loop(manager: Scy
 
     logger.info("Create a rack-list anchor keyspace pinned to dc1:['r1'] and let auto-RF settle")
     anchor_ks = await create_rack_anchor_keyspace(cql, {'dc1': ['r1']})
-    await wait_for_auto_rf_to_settle(manager, server0, cql, ks)
+    await wait_for_auto_rf_settled(manager, time.time() + 120, ks=ks, server=server0, count_tasks=True)
     await verify_schema(cql, manager, servers, host_to_dc_rack, ks, tables, {'dc1': ['r1']}, timeout=120)
 
     logger.info("Add a node in dc1/r2, still ineligible for auto-RF")
