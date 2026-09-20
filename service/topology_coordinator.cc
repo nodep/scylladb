@@ -1763,6 +1763,13 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 }
                 auto rf_data = locator::replication_factor_data(rf);
                 if (rf_data.is_numeric()) {
+                    if (rf_data.count() == 0) {
+                        // RF 0 places no replicas in this DC, so this keyspace cannot make
+                        // any rack there eligible. This is also the form used to drain a DC,
+                        // and treating it as "all racks eligible" would expand the auto-RF
+                        // keyspaces into the very DC the operator is emptying.
+                        continue;
+                    }
                     dc_racks_with_tablets[dc] = std::nullopt; // all racks eligible
                 } else {
                     auto& entry = dc_racks_with_tablets.try_emplace(dc, std::set<sstring>{}).first->second;
