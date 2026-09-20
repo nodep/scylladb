@@ -26,7 +26,12 @@ async def test_auth_no_quorum(manager: ScyllaClusterManager) -> None:
         'permissions_validity_in_ms': 0,
         'permissions_update_interval_in_ms': 0,
     }
-    servers = await manager.servers_add(3, config=config, auto_rack_dc="dc1")
+    # This test intermittently hangs for the whole graceful-stop timeout inside the
+    # CQL server's own stop_server(): the connection gate never closes. The remaining
+    # shutdown steps only log at debug, and the hang has never reproduced outside CI,
+    # so capture that detail where it does happen.
+    cmdline = ['--logger-log-level', 'cql_server=debug']
+    servers = await manager.servers_add(3, config=config, cmdline=cmdline, auto_rack_dc="dc1")
 
     cql, _ = await manager.get_ready_cql(servers)
 
