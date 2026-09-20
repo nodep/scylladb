@@ -218,7 +218,8 @@ future<> trace_keyspace_helper::start(cql3::query_processor& qp, service::migrat
     std::optional<db::tablet_options> per_table_tablet_options;
     sstring strategy = "org.apache.cassandra.locator.SimpleStrategy";
     auto rf = std::to_string(RF_GOAL_PER_DC);
-    if (qp.db().features().auto_replication_factor) {
+    auto use_vnodes = utils::get_local_injector().enter("auto_rf_keyspaces_use_vnodes");
+    if (qp.db().features().auto_replication_factor && !use_vnodes) {
         initial_tablets.emplace(0);
         auto& options = per_table_tablet_options.emplace();
         options.min_per_shard_tablet_count = 1;
