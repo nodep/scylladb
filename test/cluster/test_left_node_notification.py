@@ -43,7 +43,6 @@ async def test_left_node_notification(manager: ScyllaClusterManager) -> None:
     result = await cql.run_async("SELECT * FROM system_schema.keyspaces WHERE keyspace_name = 'system_traces'")
     if result:
         await cql.run_async("ALTER KEYSPACE system_traces WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'dc1': 0, 'dc2': 1}")
-    logger.info(f'dbglog altered keyspaces')
 
     # Ensure ring and group0 are consistent before operations
     await check_token_ring_and_group0_consistency(manager)

@@ -64,7 +64,6 @@ async def test_raft_recovery_user_data(manager: ScyllaClusterManager, remove_dea
     # further intervention.
     cfg['error_injections_at_startup'] = ['auto_rf_keyspaces_use_vnodes']
 
-    logging.info(f'dbglog cfg: {cfg}')
 
     property_file_dc1 = {'dc': 'dc1', 'rack': 'rack1'}
     property_file_dc2 = {'dc': 'dc2', 'rack': 'rack2'}

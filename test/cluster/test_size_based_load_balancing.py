@@ -77,7 +77,6 @@ async def test_balance_empty_tablets(manager: ScyllaClusterManager):
         replicas_per_node = defaultdict(int)
         tablets_per_shard = {}
         for row in await cql.run_async('SELECT keyspace_name, table_id, replicas FROM system.tablets'):
-            logger.info(f'dbglog row: {row}')
             if row.keyspace_name == ks:
                 table_id = row.table_id
                 for r in row.replicas:
