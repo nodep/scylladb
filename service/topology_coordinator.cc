@@ -1851,7 +1851,11 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         // knows cannot complete. Defer until every normal node is alive again;
         // the coordinator wakes up on gossip on_up() and re-evaluates then.
         if (const auto dead_nodes = get_dead_nodes(); !dead_nodes.empty()) {
-            rtlogger.debug("auto-rf: deferring RF changes for {} keyspace(s) until dead node(s) {} are alive again",
+            // Rate limited: the reconciler re-evaluates on every coordinator
+            // iteration, but an operator needs to see why auto-RF is idle.
+            static thread_local logger::rate_limit deferral_rate_limit{std::chrono::minutes(1)};
+            rtlogger.log(log_level::info, deferral_rate_limit,
+                    "auto-rf: deferring RF changes for {} keyspace(s) until dead node(s) {} are alive again",
                     auto_rf_keyspaces.size(), dead_nodes);
             if (_topo_sm._topology.needs_auto_rf_change) {
                 co_await clear_needs_auto_rf_change();
@@ -3827,12 +3831,12 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                 guard = std::move(*guard_opt);
             }
 
-            // Note: This source of work is not included in should_preempt_balancing().
-            // That's because auto-RF changes are not independent sources of work;
-            // they are triggered by other topology changes which already preempt
-            // load balancing. Additionally, auto-RF changes have higher
-            // priority than tablet load balancing, so we cannot re-enter load
-            // balancing while auto RF has work to do.
+            // should_preempt_balancing() checks needs_auto_rf_change, so a pending
+            // auto-RF change stops tablet load balancing from being re-entered:
+            // auto-RF has the higher priority of the two. The flag is therefore
+            // cleared on every path that leaves no change scheduled, including the
+            // backoff and dead-node deferral below, so that balancing is not
+            // starved while auto-RF is idle.
             if (auto guard_opt = co_await maybe_schedule_auto_rf_change(std::move(guard)); !guard_opt) {
                 // The guard is consumed, it means we scheduled an auto-RF change request.
                 co_return true;
