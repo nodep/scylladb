@@ -46,8 +46,9 @@ async def test_raft_recovery_user_data(manager: ScyllaClusterManager, remove_dea
     """
     # Workaround for flakiness from https://github.com/scylladb/scylladb/issues/23565.
     cfg = {'hinted_handoff_enabled': False}
-    # Disable auto-RF for system tablet keyspaces (system_traces, audit). After commits
-    # d2cc78f1a8 and d274616c6e those keyspaces use NetworkTopologyStrategy + auto-RF,
+    # Disable auto-RF for the system tablet keyspaces (system_traces, audit). Since the
+    # two "Migrate ... keyspace to tablets and auto-RF" commits they use
+    # NetworkTopologyStrategy + auto-RF,
     # so the topology coordinator grows their RF in every DC to a goal of 3. Later in
     # the test we kill all nodes in dc2 and remove them from topology; if those system
     # keyspaces still have a non-zero RF in dc2, removenode rejects the operation

@@ -756,7 +756,8 @@ async def test_no_uncertainty_for_reads(manager: ScyllaClusterManager, storage_c
     servers = await manager.servers_add(3, config=cfg, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
-    # After commits d2cc78f1a8 (system_traces) and d274616c6e (audit) those system
+    # Since "tracing: Migrate system_traces keyspace to tablets and auto-RF" and
+    # "audit: Migrate audit keyspace to tablets and auto-RF", those system
     # keyspaces use tablets + auto-RF. Auto-RF kicks in once tablets actually exist
     # in the racks (i.e. once the test creates its tablet keyspace+table below) and
     # then issues a sequence of single-step ALTERs to grow per-DC RF toward the
