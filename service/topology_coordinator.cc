@@ -2307,6 +2307,17 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         }
         out.emplace_back(builder.build());
 
+        // A failed RF change leaves the shortfall in place, so the reconciler
+        // re-detects it and re-issues the same request on its next iteration.
+        // Record the outcome here too, not only where the handler rejects a
+        // request outright, or a persistently failing change re-enters the
+        // unbounded loop the backoff exists to stop.
+        if (error.empty()) {
+            clear_auto_rf_change_failures(completion.ks_name);
+        } else {
+            note_auto_rf_change_failure(completion.ks_name);
+        }
+
         out.emplace_back(topology_request_tracking_mutation_builder(completion.request_id)
                 .done(error)
                 .build());
@@ -2329,6 +2340,9 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
         for (auto& m : schema_muts) {
             out.add_small(m);
         }
+
+        // Same reasoning as in generate_rf_change_completion_update().
+        note_auto_rf_change_failure(abort_info.ks_name);
 
         out.add(topology_request_tracking_mutation_builder(abort_info.request_id)
                 .abort(abort_info.error)
