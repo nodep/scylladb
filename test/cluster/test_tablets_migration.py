@@ -15,7 +15,7 @@ from test.pylib.util import start_writes, scale_timeout_by_mode
 from test.cluster.util import (
     wait_for_cql_and_get_hosts, new_test_keyspace, reconnect_driver, wait_for,
     wait_for_no_pending_topology_transition, get_topology_coordinator,
-    quiesce_and_disable_tablet_balancing,
+    quiesce_and_disable_tablet_balancing, wait_for_auto_rf_settled,
     FeatureConfig,
     feature_configs,
     FeatureConfigurations
@@ -296,6 +296,15 @@ async def test_bootstrap_starts_while_tablet_migration_is_blocked(manager: Scyll
         await make_server("r1")
         target_server = servers[-1]
         target_host = hosts_by_rack["r1"][-1]
+
+        # Creating the keyspace above is what makes the racks eligible for auto-RF,
+        # so audit/system_traces expand their replication right here. Their tablet
+        # migrations would otherwise still be in flight when the migration below is
+        # blocked, and the coordinator stays in the `tablet migration` transition
+        # state until every outstanding tablet operation resolves -- so it never
+        # gets to accept the joining node. disable_tablet_balancing() does not
+        # cover this: auto-RF is a separate source of tablet work, not balancer work.
+        await wait_for_auto_rf_settled(manager, time.time() + scale_timeout(120))
 
         replicas = await get_all_tablet_replicas(manager, servers[0], ks, 'test')
         assert len(replicas) == 1 and len(replicas[0].replicas) == 3
