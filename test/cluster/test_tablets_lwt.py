@@ -13,7 +13,7 @@ from cassandra import Unauthorized
 
 from test.cluster.lwt.lwt_common import wait_for_tablet_count
 from test.cluster.util import new_test_keyspace, unique_name, reconnect_driver, \
-    FeatureConfig, get_topology_coordinator, wait_for_auto_rf_settled
+    FeatureConfig, wait_for_auto_rf_settled, quiesce_and_disable_tablet_balancing
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.util import wait_for_cql_and_get_hosts, wait_for, get_available_host
 from test.pylib.internal_types import ServerInfo
@@ -686,11 +686,6 @@ async def test_error_message_for_timeout_due_to_write_uncertainty(manager: Scyll
     servers = await manager.servers_add(3, config=cfg, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
-    # Disable tablet balancing until #29767 is merged. This is needed because the balancer issues
-    # migrations to balance the tablets of the system tables and the user table.
-    # After #29767 is merged, quiesce_topology() will wait until the tablets are balanced.
-    await manager.disable_tablet_balancing()
-
     logger.info("Create a keyspace")
     keyspace_opts = storage_config.get_keyspace_opts(
         "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}")
@@ -698,9 +693,13 @@ async def test_error_message_for_timeout_due_to_write_uncertainty(manager: Scyll
         logger.info("Create a table")
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
 
-        # Wait for auto-rf to replicate the system tablets to all the racks
+        # The SERIAL statements below are fenced by the topology version, so nothing
+        # may bump it once we start: let auto-RF replicate the system keyspaces into
+        # the new racks, let the balancer finish (including the system keyspaces'
+        # initial tablet resize, which a disabled balancer would never finalize and
+        # which would then make quiesce_topology defer forever), then disable it.
         await wait_for_auto_rf_settled(manager, time.time() + 120)
-        await manager.api.quiesce_topology(servers[0].ip_addr)
+        await quiesce_and_disable_tablet_balancing(manager, servers[0].ip_addr)
 
         # accept on the first node returns an error
         logger.info("Inject paxos_error_before_save_proposal")
@@ -756,40 +755,6 @@ async def test_no_uncertainty_for_reads(manager: ScyllaClusterManager, storage_c
     servers = await manager.servers_add(3, config=cfg, cmdline=cmdline, auto_rack_dc="mydc")
     (cql, hosts) = await manager.get_ready_cql(servers)
 
-    # Since "tracing: Migrate system_traces keyspace to tablets and auto-RF" and
-    # "audit: Migrate audit keyspace to tablets and auto-RF", those system
-    # keyspaces use tablets + auto-RF. Auto-RF kicks in once tablets actually exist
-    # in the racks (i.e. once the test creates its tablet keyspace+table below) and
-    # then issues a sequence of single-step ALTERs to grow per-DC RF toward the
-    # goal (3 for audit, 2 for system_traces). Each ALTER triggers tablet
-    # placement on the newly added rack by the load balancer, and the load
-    # balancer also wakes up periodically (~1s) and produces additional waves of
-    # fence-version bumps for some time after auto-RF has stopped scheduling.
-    #
-    # The SERIAL read below is fenced by the topology version: any replica
-    # response that arrives after the coordinator has moved to a newer fence is
-    # rejected with "stale topology exception, caller version N, callee fence
-    # version M". The LWT counts that as a replica failure and -- combined with
-    # the second replica we deliberately fail via paxos_error_before_save_proposal
-    # -- the read crosses the failure threshold and the test fails with
-    # ReadFailure for reasons unrelated to LWT correctness.
-    #
-    # We deliberately do NOT use the auto_rf_keyspaces_use_vnodes injection here,
-    # because we want the test to exercise the production setup (tablets + auto-RF
-    # for system_traces/audit). Instead, before triggering auto-RF we disable
-    # background tablet balancing, so the post-auto-RF load-balancer ticks that
-    # would otherwise keep bumping fences during the LWT do not happen. Auto-RF
-    # itself still runs, schedules its ALTERs, and the resulting tablet placement
-    # is performed as part of those topology operations (disable_tablet_balancing
-    # only stops *background* rebalancing, not migrations driven by topology
-    # operations). After we observe that auto-RF has actually started scheduling
-    # ("Scheduling auto RF change for keyspace"), we wait for the topology to
-    # quiesce so the fence version is stable for the duration of the LWT.
-    coord_host = await get_topology_coordinator(manager)
-    coord_srv = await manager.find_server_by_host_id(servers, coord_host)
-    coord_log = await manager.server_open_log(coord_srv.server_id)
-    await manager.disable_tablet_balancing()
-
     logger.info("Create a keyspace")
     keyspace_opts = storage_config.get_keyspace_opts(
         "WITH replication = {'class': 'NetworkTopologyStrategy', 'replication_factor': 3} AND tablets = {'initial': 1}")
@@ -797,12 +762,19 @@ async def test_no_uncertainty_for_reads(manager: ScyllaClusterManager, storage_c
         logger.info("Create a table")
         await cql.run_async(f"CREATE TABLE {ks}.test (pk int PRIMARY KEY, c int);")
 
-        # Wait for auto-rf to replicate the system tablets to all the racks
+        # The SERIAL read below is fenced by the topology version: a replica response that
+        # arrives after the coordinator has moved to a newer fence is rejected with "stale
+        # topology exception", the LWT counts that as a replica failure, and together with
+        # the replica we fail on purpose via paxos_error_before_save_proposal the read would
+        # cross the failure threshold for reasons unrelated to LWT correctness.
+        #
+        # So nothing may bump the fence version once we start: let auto-RF replicate the
+        # system keyspaces into the new racks, let the balancer finish (including the
+        # system keyspaces' initial tablet resize, which a disabled balancer would never
+        # finalize and which would then make quiesce_topology defer forever), then
+        # disable it.
         await wait_for_auto_rf_settled(manager, time.time() + 120)
-        await manager.api.quiesce_topology(servers[0].ip_addr)
-
-        await coord_log.wait_for("Scheduling auto RF change for keyspace")
-        await manager.api.quiesce_topology(coord_srv.ip_addr)
+        await quiesce_and_disable_tablet_balancing(manager, servers[0].ip_addr)
 
         # accept on the first node returns an error
         logger.info("Inject paxos_error_before_save_proposal")
