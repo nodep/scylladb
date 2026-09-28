@@ -10,6 +10,7 @@
 #include <seastar/core/metrics.hh>
 #include "types/types.hh"
 #include "tracing/trace_keyspace_helper.hh"
+#include "db/config.hh"
 #include "cql3/statements/batch_statement.hh"
 #include "cql3/statements/modification_statement.hh"
 #include "cql3/query_processor.hh"
@@ -219,7 +220,8 @@ future<> trace_keyspace_helper::start(cql3::query_processor& qp, service::migrat
     sstring strategy = "org.apache.cassandra.locator.SimpleStrategy";
     auto rf = std::to_string(RF_GOAL_PER_DC);
     auto use_vnodes = utils::get_local_injector().enter("auto_rf_keyspaces_use_vnodes");
-    if (qp.db().features().auto_replication_factor && !use_vnodes) {
+    // Follow the cluster's default for new keyspaces, see audit_cf_storage_helper.
+    if (qp.db().features().auto_replication_factor && qp.db().get_config().enable_tablets_by_default() && !use_vnodes) {
         initial_tablets.emplace(0);
         auto& options = per_table_tablet_options.emplace();
         options.min_per_shard_tablet_count = 1;

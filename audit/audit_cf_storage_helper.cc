@@ -112,7 +112,11 @@ future<> audit_cf_storage_helper::start(const db::config &cfg) {
             std::optional<db::tablet_options> per_table_tablet_options;
             auto rf = std::to_string(RF_GOAL_PER_DC);
             auto use_vnodes = utils::get_local_injector().enter("auto_rf_keyspaces_use_vnodes");
-            if (_qp.db().features().auto_replication_factor && !use_vnodes) {
+            // Follow the cluster's default for new keyspaces: with
+            // tablets_mode_for_new_keyspaces=disabled (or enable_tablets=false) the
+            // operator asked for vnodes, and the system keyspaces are created as
+            // master creates them.
+            if (_qp.db().features().auto_replication_factor && cfg.enable_tablets_by_default() && !use_vnodes) {
                 initial_tablets.emplace(0);
                 auto& options = per_table_tablet_options.emplace();
                 options.min_per_shard_tablet_count = 1;
