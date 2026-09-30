@@ -9,6 +9,8 @@
 #include "storage_service.hh"
 #include "api/api.hh"
 #include "api/api-doc/column_family.json.hh"
+#include "audit/audit_cf_storage_helper.hh"
+#include "tracing/trace_keyspace_helper.hh"
 #include "api/api-doc/storage_service.json.hh"
 #include "api/api-doc/storage_proxy.json.hh"
 #include "api/api-doc/tasks.json.hh"
@@ -112,8 +114,16 @@ static void ensure_tablets_disabled(const http_context& ctx, const sstring& ks_n
 
 static bool any_of_keyspaces_use_tablets(const http_context& ctx) {
     auto& db = ctx.db.local();
-    auto uses_tablets = [&db](const auto& ks_name) {
-        return db.find_keyspace(ks_name).uses_tablets();
+    // The auto-RF system keyspaces are always on tablets, so counting them here
+    // would reject storage_service/ownership on every cluster. They carry no user
+    // data and do not affect the token ring, which is all get_ownership() reports,
+    // so the answer stays meaningful as long as everything else is on vnodes.
+    auto is_auto_rf_keyspace = [](const sstring& ks_name) {
+        return ks_name == audit::audit_cf_storage_helper::KEYSPACE_NAME
+                || ks_name == sstring(tracing::trace_keyspace_helper::KEYSPACE_NAME);
+    };
+    auto uses_tablets = [&db, &is_auto_rf_keyspace](const auto& ks_name) {
+        return !is_auto_rf_keyspace(ks_name) && db.find_keyspace(ks_name).uses_tablets();
     };
 
     auto keyspaces = db.get_all_keyspaces();
