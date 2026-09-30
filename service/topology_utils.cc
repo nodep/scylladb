@@ -13,12 +13,12 @@
 
 namespace service {
 
-future<bool> ongoing_rf_change(const topology& topology, db::system_keyspace& sys_ks, const group0_guard& guard, sstring ks) {
+future<bool> ongoing_rf_change_unguarded(const topology& topology, db::system_keyspace& sys_ks, sstring ks) {
     auto ongoing_ks_rf_change = [&] (utils::UUID request_id) -> future<bool> {
-        auto req_entry = co_await sys_ks.get_topology_request_entry(request_id);
-        co_return std::holds_alternative<global_topology_request>(req_entry.request_type) &&
-            std::get<global_topology_request>(req_entry.request_type) == global_topology_request::keyspace_rf_change &&
-            req_entry.new_keyspace_rf_change_ks_name.has_value() && req_entry.new_keyspace_rf_change_ks_name.value() == ks;
+        auto req_entry = co_await sys_ks.get_topology_request_entry_opt(request_id);
+        co_return req_entry && std::holds_alternative<global_topology_request>(req_entry->request_type) &&
+            std::get<global_topology_request>(req_entry->request_type) == global_topology_request::keyspace_rf_change &&
+            req_entry->new_keyspace_rf_change_ks_name.has_value() && req_entry->new_keyspace_rf_change_ks_name.value() == ks;
     };
     if (topology.global_request_id.has_value()) {
         auto req_id = topology.global_request_id.value();
@@ -42,6 +42,10 @@ future<bool> ongoing_rf_change(const topology& topology, db::system_keyspace& sy
         }
     }
     co_return false;
+}
+
+future<bool> ongoing_rf_change(const topology& topology, db::system_keyspace& sys_ks, const group0_guard&, sstring ks) {
+    return ongoing_rf_change_unguarded(topology, sys_ks, std::move(ks));
 }
 
 }

@@ -107,6 +107,8 @@
 #include "utils/pretty_printers.hh"
 #include "utils/stall_free.hh"
 #include "utils/error_injection.hh"
+#include "audit/audit_cf_storage_helper.hh"
+#include "tracing/trace_keyspace_helper.hh"
 #include "locator/util.hh"
 #include "idl/storage_service.dist.hh"
 #include "idl/streaming.dist.hh"
@@ -2653,10 +2655,69 @@ static size_t count_normal_token_owners(const topology& topology) {
     });
 }
 
+future<bool> storage_service::auto_rf_change_queued() {
+    // No group0 guard here on purpose (see auto_rf_may_still_fix_removal), so
+    // the unguarded variant, which tolerates a request completing meanwhile.
+    for (const sstring& ks_name : {audit::audit_cf_storage_helper::KEYSPACE_NAME, sstring(tracing::trace_keyspace_helper::KEYSPACE_NAME)}) {
+        if (co_await service::ongoing_rf_change_unguarded(_topology_state_machine._topology, _sys_ks.local(), ks_name)) {
+            co_return true;
+        }
+    }
+    co_return false;
+}
+
+// How long the reconciler gets to notice a keyspace change and queue its own
+// change, and how long queued changes get to complete.
+static constexpr std::chrono::seconds auto_rf_removal_grace{3};
+static constexpr std::chrono::seconds auto_rf_removal_max_wait{120};
+
+future<bool> storage_service::auto_rf_may_still_fix_removal(auto_rf_removal_wait& wait, locator::host_id host_id) {
+    // The caller holds no group0 guard here: the coordinator has to be able to
+    // commit the changes being waited for. The caller re-acquires it to
+    // validate again, which also keeps the "no raft quorum" failure of a
+    // cluster which cannot make progress as prompt as it was.
+    if (!wait.deadline) {
+        wait.deadline = lowres_clock::now() + auto_rf_removal_max_wait;
+        wait.grace_until = lowres_clock::now() + auto_rf_removal_grace;
+    }
+    if (lowres_clock::now() >= *wait.deadline) {
+        rtlogger.warn("removal of {}: gave up waiting for auto-RF after {}s", host_id, auto_rf_removal_max_wait.count());
+        co_return false;
+    }
+    // Only a rejection the auto-RF keyspaces alone are responsible for is worth
+    // waiting out. If some other keyspace makes the removal RF-rack-invalid too,
+    // no amount of auto-RF work changes the verdict, so reject right away.
+    {
+        auto tmptr = _db.local().get_token_metadata_ptr();
+        auto* node = tmptr->get_topology().find_node(host_id);
+        if (!node) {
+            co_return false;
+        }
+        locator::rf_rack_topology_operation op{locator::rf_rack_topology_operation::type::remove, host_id, node->dc(), node->rack()};
+        static const std::unordered_set<sstring> auto_rf_keyspaces{
+            sstring(audit::audit_cf_storage_helper::KEYSPACE_NAME), sstring(tracing::trace_keyspace_helper::KEYSPACE_NAME)};
+        if (!_db.local().check_rf_rack_validity_with_topology_change(tmptr, std::move(op), auto_rf_keyspaces)) {
+            co_return false;
+        }
+    }
+    if (_topology_state_machine._topology.needs_auto_rf_change || co_await auto_rf_change_queued()) {
+        if (!wait.waited) {
+            rtlogger.info("removal of {} would make a keyspace RF-rack-invalid; waiting for the pending auto-RF change(s) first", host_id);
+            wait.waited = true;
+        }
+        wait.grace_until = lowres_clock::now() + auto_rf_removal_grace;
+    } else if (lowres_clock::now() >= wait.grace_until) {
+        co_return false;
+    }
+    co_await sleep_abortable(std::chrono::milliseconds(200), _group0_as);
+    co_return true;
+}
+
 future<> storage_service::raft_decommission() {
     auto& raft_server = _group0->group0_server();
     auto holder = _group0->hold_group0_gate();
     utils::UUID request_id;
+    auto_rf_removal_wait rf_wait;
 
     while (true) {
         auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
@@ -2682,6 +2743,13 @@ future<> storage_service::raft_decommission() {
 
         auto validation_result = validate_removing_node(_db.local(), locator::host_id(raft_server.id().uuid()));
         if (std::holds_alternative<node_validation_failure>(validation_result)) {
+            {
+                // Drop the guard while waiting for auto-RF; the retry takes a new one.
+                auto released = std::move(guard);
+            }
+            if (co_await auto_rf_may_still_fix_removal(rf_wait, locator::host_id(raft_server.id().uuid()))) {
+                continue;
+            }
             throw std::runtime_error(fmt::format("Decommission failed: node decommission rejected: {}",
                                                  std::get<node_validation_failure>(validation_result).reason));
         }
@@ -2767,6 +2835,7 @@ future<> storage_service::decommission(sharded<db::snapshot_ctl>& snapshot_ctl) 
 future<> storage_service::raft_removenode(locator::host_id host_id, locator::host_id_or_endpoint_list ignore_nodes_params) {
     auto id = raft::server_id{host_id.uuid()};
     utils::UUID request_id;
+    auto_rf_removal_wait rf_wait;
 
     while (true) {
         auto guard = co_await _group0->client().start_operation(_group0_as, raft_timeout{});
@@ -2802,6 +2871,13 @@ future<> storage_service::raft_removenode(locator::host_id host_id, locator::hos
 
         auto validation_result = validate_removing_node(_db.local(), host_id);
         if (std::holds_alternative<node_validation_failure>(validation_result)) {
+            {
+                // Drop the guard while waiting for auto-RF; the retry takes a new one.
+                auto released = std::move(guard);
+            }
+            if (co_await auto_rf_may_still_fix_removal(rf_wait, host_id)) {
+                continue;
+            }
             throw std::runtime_error(fmt::format("Removenode failed: node remove rejected: {}",
                                                  std::get<node_validation_failure>(validation_result).reason));
         }
