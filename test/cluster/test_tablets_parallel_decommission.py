@@ -10,7 +10,8 @@ import time
 import pytest
 
 from test.cluster.tasks.task_manager_client import TaskManagerClient
-from test.cluster.util import get_coordinator_host, new_test_keyspace, ensure_group0_leader_on
+from test.cluster.util import get_coordinator_host, new_test_keyspace, ensure_group0_leader_on, \
+    wait_for_auto_rf_settled, wait_for_no_pending_topology_transition
 from test.pylib.internal_types import ServerInfo, IPAddress
 from test.pylib.scylla_cluster_manager import ScyllaClusterManager
 from test.pylib.tablets import get_replica_count_by_host
@@ -49,6 +50,15 @@ async def test_tablets_are_drained_in_parallel(manager: ScyllaClusterManager):
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy',"
                                           " 'dc1': ['rack1', 'rack2']} AND tablets = {'initial': 32};") as ks:
         await cql.run_async(f"CREATE TABLE {ks}.tab (pk int PRIMARY KEY);")
+
+        # Creating this keyspace makes its racks eligible for auto-RF, and the auto-RF
+        # keyspaces get their initial tablet splits and are spread across the rack right
+        # about now. Those migrations occupy the per-shard streaming budget of the rack
+        # they run in, and a drain planned against a saturated rack is skipped pass
+        # after pass while the other rack drains on its own -- which is precisely the
+        # sequential behaviour this test exists to rule out. Let all of it finish first.
+        await wait_for_auto_rf_settled(manager, time.time() + 120)
+        await wait_for_no_pending_topology_transition(manager, time.time() + 120)
 
         coord_srv = await get_coordinator_host(manager)
         log = await manager.server_open_log(coord_srv.server_id) # group0 leader
@@ -118,6 +128,15 @@ async def test_tablets_are_rebuilt_in_parallel(manager: ScyllaClusterManager, sa
     async with new_test_keyspace(manager, "WITH replication = {'class': 'NetworkTopologyStrategy',"
                                           " 'dc1': ['rack1', 'rack2']} AND tablets = {'initial': 32};") as ks:
         await cql.run_async(f"CREATE TABLE {ks}.tab (pk int PRIMARY KEY);")
+
+        # Creating this keyspace makes its racks eligible for auto-RF, and the auto-RF
+        # keyspaces get their initial tablet splits and are spread across the rack right
+        # about now. Those migrations occupy the per-shard streaming budget of the rack
+        # they run in, and a drain planned against a saturated rack is skipped pass
+        # after pass while the other rack drains on its own -- which is precisely the
+        # sequential behaviour this test exists to rule out. Let all of it finish first.
+        await wait_for_auto_rf_settled(manager, time.time() + 120)
+        await wait_for_no_pending_topology_transition(manager, time.time() + 120)
 
         servers_to_remove = [servers[3], servers[4]]
         host_ids_to_remove = await gather_safely(*(manager.get_host_id(s.server_id) for s in servers_to_remove))
@@ -289,6 +308,14 @@ async def test_remove_is_canceled_if_there_is_node_down(manager: ScyllaClusterMa
     cmdline = [
         '--logger-log-level', 'load_balancer=debug',
     ]
+    # The test stops nodes while a removenode request is queued. Auto-RF would
+    # meanwhile schedule an RF change for the system keyspaces (the test keyspace
+    # created below makes rack1 and rack2 eligible). The tablet migrations of such
+    # an RF change need a global token metadata barrier which requires every node
+    # to be up (see the FIXME in
+    # service::topology_coordinator::global_tablet_token_metadata_barrier()), so
+    # the coordinator would retry the barrier forever and never cancel the queued
+    # request.
     servers = await manager.servers_add(5, cmdline=cmdline, property_file=[
         {"dc": "dc1", "rack": "rack1"},
         {"dc": "dc1", "rack": "rack1"},
