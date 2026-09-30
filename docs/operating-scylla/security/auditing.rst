@@ -77,6 +77,57 @@ For details on auditing Alternator operations, see :ref:`alternator-auditing`.
 
 Note that enabling audit may negatively impact performance and audit-to-table may consume extra storage. That's especially true when auditing DML and QUERY categories, which generate a high volume of audit messages.
 
+.. _audit-table-replication:
+
+Replication of the Audit Table
+^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+The ``audit`` keyspace is created by ScyllaDB when a node starts with table auditing enabled (``audit: table``), if it does not exist yet.
+
+On a cluster where tablets are enabled by default, the keyspace uses tablets and its replication
+is managed automatically. It starts with a single replica, on one rack per data center, and from
+then on follows the other tablets keyspaces of the cluster: a rack or a data center becomes eligible
+for the audit table once some other tablets keyspace replicates to it, and the audit table is then
+extended into it, up to three racks per data center. A rack no other tablets keyspace uses any
+more is given up again, so the audit table follows an operator who shrinks their keyspaces, and
+the nodes of a lost rack can be removed once the rack was dropped from the application
+keyspaces. A data center is never given up entirely: its last rack stays until you remove it.
+Manual changes to the replication of the ``audit`` keyspace are undone where they contradict
+this: a rack or data center which no other tablets keyspace uses is removed again, and an
+eligible rack you removed is added back.
+
+The automatic management pauses while tablet load balancing is disabled (``nodetool`` or the
+``storage_service/tablets/balancing`` API), and while a node of the cluster is down, unless that
+node has been excluded. To remove the nodes of a lost rack, exclude them first, then drop the
+rack from your keyspaces, then remove the nodes; the audit table gives the rack up in between.
+
+Things to keep in mind:
+
+* Until some other tablets keyspace replicates to more than one rack, the audit table has a single
+  replica. An audit record whose replica node is down at that moment is dropped, and the node
+  reports it: ``audit - Unexpected exception when writing login log ... Cannot achieve consistency
+  level for cl ONE``. Create the application keyspaces, with the racks they are meant to use,
+  before relying on the audit table's durability.
+* The replication of the audit table is only ever as wide as the application keyspaces make it.
+  A cluster whose application keyspaces are all on vnodes leaves the audit table on a single rack.
+* Dropping a rack from your keyspaces and decommissioning its last node right away works with
+  ``rf_rack_valid_keyspaces`` enabled: the decommission waits, up to two minutes, for the audit
+  table to give the rack up. Without it the decommission is accepted and then fails while draining
+  the node if the audit table still replicates there; retry it once the rack has been given up.
+* Known limitation: when your keyspaces use a numeric replication factor rather than rack lists
+  (the default unless ``rf_rack_valid_keyspaces`` or ``enforce_rack_list`` is enabled), every rack of
+  the data center counts as eligible, so the audit table never gives a rack up on its own, and
+  decommissioning or removing all nodes of a rack is blocked for as long as the audit table
+  replicates there (the operation is rejected as RF-rack-invalid, or fails while draining the last
+  node). To remove a whole rack in such a cluster: disable tablet load balancing, which pauses the
+  automatic management; remove the rack from the rack lists of the ``audit`` and ``system_traces``
+  keyspaces with ``ALTER KEYSPACE`` (one rack per statement); remove the nodes; then enable tablet
+  load balancing again. Alternatively, leave one node of the rack in the cluster.
+
+On a cluster where tablets are not the default, the keyspace uses vnodes with
+``NetworkTopologyStrategy`` and a replication factor of 3 per data center, and its replication is
+yours to change.
+
 .. _alternator-auditing:
 
 Auditing Alternator Requests
