@@ -46,6 +46,22 @@ async def test_raft_recovery_user_data(manager: ScyllaClusterManager, remove_dea
     """
     # Workaround for flakiness from https://github.com/scylladb/scylladb/issues/23565.
     cfg = {'hinted_handoff_enabled': False}
+    # Disable auto-RF for the system tablet keyspaces (system_traces, audit). Since the
+    # two "Migrate ... keyspace to tablets and auto-RF" commits they use
+    # NetworkTopologyStrategy + auto-RF,
+    # so the topology coordinator grows their rack lists in every DC towards their goals
+    # (three racks for audit, two for system_traces). Later in the test we kill all nodes
+    # in dc2 and remove them from the topology; if those keyspaces still replicate to dc2,
+    # removenode rejects the operation (RF-rack-invalid / "zero replica after the removal").
+    #
+    # Taking them out of dc2 with an ALTER while auto-RF runs would race with the
+    # coordinator's own RF changes (one rack per change, one change in flight at a time,
+    # so the current RF is unknown at the moment of the ALTER). The
+    # `auto_rf_keyspaces_use_vnodes` injection keeps these keyspaces on vnodes instead,
+    # where auto-RF does not run, and the ALTERs below then move their replicas to dc1
+    # before dc2 is removed.
+    cfg['error_injections_at_startup'] = ['auto_rf_keyspaces_use_vnodes']
+
 
     # Add servers to dc2 first, so 3 out of 5 voters will be there.
     logging.info('Adding servers that will be killed to dc2')
@@ -66,7 +82,11 @@ async def test_raft_recovery_user_data(manager: ScyllaClusterManager, remove_dea
     # Only alter if the audit keyspace exists (it might not exist if audit is disabled).
     result = await cql.run_async("SELECT * FROM system_schema.keyspaces WHERE keyspace_name = 'audit'")
     if result:
-        await cql.run_async("ALTER KEYSPACE audit WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'dc1': 3}")
+        await cql.run_async("ALTER KEYSPACE audit WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'dc1': 3, 'dc2': 0}")
+    # Do the same for the system_traces keyspace
+    result = await cql.run_async("SELECT * FROM system_schema.keyspaces WHERE keyspace_name = 'system_traces'")
+    if result:
+        await cql.run_async("ALTER KEYSPACE system_traces WITH REPLICATION = {'class': 'NetworkTopologyStrategy', 'dc1': 2, 'dc2': 0}")
 
     first_group0_id = (await cql.run_async(
             "SELECT value FROM system.scylla_local WHERE key = 'raft_group0_id'"))[0].value
