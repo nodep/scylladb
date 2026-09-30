@@ -1295,8 +1295,20 @@ class topology_coordinator : public endpoint_lifecycle_subscriber
                     }
                 } catch (const std::exception& e) {
                     error = e.what();
-                    rtlogger.error("Couldn't process global_topology_request::keyspace_rf_change, desired new ks opts: {}, error: {}",
-                                   saved_ks_props, std::current_exception());
+                    if (is_auto_rf_keyspace(ks_name)) {
+                        // The reconciler retries its own requests with a backoff (see
+                        // note_auto_rf_change_failure), so a keyspace which cannot be
+                        // changed right now is an expected condition, not an error, and
+                        // would otherwise be reported as one every minute for as long as
+                        // it lasts.
+                        static thread_local logger::rate_limit auto_rf_reject_rate_limit{std::chrono::minutes(5)};
+                        rtlogger.log(log_level::warn, auto_rf_reject_rate_limit,
+                                     "Couldn't process global_topology_request::keyspace_rf_change for auto-RF keyspace {}, desired new ks opts: {}, error: {}",
+                                     ks_name, saved_ks_props, std::current_exception());
+                    } else {
+                        rtlogger.error("Couldn't process global_topology_request::keyspace_rf_change, desired new ks opts: {}, error: {}",
+                                       saved_ks_props, std::current_exception());
+                    }
                     updates.clear(); // remove all tablets mutations and only create mutations deleting the global req
                 }
             } else {
