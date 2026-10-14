@@ -1740,6 +1740,7 @@ public:
                         .ks_name = ks_name,
                         .error = format("Keyspace {} not found", ks_name),
                         .saved_ks_props = req_entry.new_keyspace_rf_change_data.value(),
+                        .initiating_host = req_entry.initiating_host,
                     };
                 }
                 continue;
@@ -1759,7 +1760,8 @@ public:
                         .request_id = request_id,
                         .ks_name = ks_name,
                         .error = req_entry.error,
-                        .saved_ks_props = req_entry.new_keyspace_rf_change_data.value()
+                        .saved_ks_props = req_entry.new_keyspace_rf_change_data.value(),
+                        .initiating_host = req_entry.initiating_host,
                     };
                 }
                 continue;
